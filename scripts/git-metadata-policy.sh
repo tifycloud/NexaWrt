@@ -4,18 +4,44 @@ set -euo pipefail
 nexawrt_git_metadata_is_safe() {
   local checkout="$1"
   local description="$2"
+  local system_path trusted_git trusted_python
   local git_dir common_dir metadata_root metadata_path packed_refs replace_refs grep_status
   local -a metadata_roots
+
+  system_path="$(builtin command -p getconf PATH 2>/dev/null)" || {
+    echo "$description could not determine the system default command path" >&2
+    return 1
+  }
+  [[ -n "$system_path" ]] || {
+    echo "$description system default command path is empty" >&2
+    return 1
+  }
+  trusted_git="$(hash -r; PATH="$system_path" builtin command -p -v git 2>/dev/null)" || {
+    echo "$description could not resolve Git from the system default command path" >&2
+    return 1
+  }
+  [[ "$trusted_git" == /* && -f "$trusted_git" && -x "$trusted_git" ]] || {
+    echo "$description system-default Git is not an absolute executable file: $trusted_git" >&2
+    return 1
+  }
+  trusted_python="$(hash -r; PATH="$system_path" builtin command -p -v python3 2>/dev/null)" || {
+    echo "$description could not resolve Python from the system default command path" >&2
+    return 1
+  }
+  [[ "$trusted_python" == /* && -f "$trusted_python" && -x "$trusted_python" ]] || {
+    echo "$description system-default Python is not an absolute executable file: $trusted_python" >&2
+    return 1
+  }
 
   [[ -d "$checkout/.git" && ! -L "$checkout/.git" ]] || {
     echo "$description Git metadata root is missing, unsafe, or a symlink: $checkout/.git" >&2
     return 1
   }
-  git_dir="$(git -C "$checkout" rev-parse --absolute-git-dir 2>/dev/null)" || {
+  git_dir="$("$trusted_git" -C "$checkout" rev-parse --absolute-git-dir 2>/dev/null)" || {
     echo "$description has unreadable Git metadata" >&2
     return 1
   }
-  common_dir="$(git -C "$checkout" rev-parse --path-format=absolute --git-common-dir 2>/dev/null)" || {
+  common_dir="$("$trusted_git" -C "$checkout" rev-parse --path-format=absolute --git-common-dir 2>/dev/null)" || {
     echo "$description has unreadable Git common metadata" >&2
     return 1
   }
@@ -75,13 +101,13 @@ nexawrt_git_metadata_is_safe() {
       done < <(find "$metadata_root/hooks" -mindepth 1 -maxdepth 1 -print0)
     fi
 
-    python3 - "$checkout" "$description" <<'PY' || return 1
+    "$trusted_python" -I - "$trusted_git" "$checkout" "$description" <<'PY' || return 1
 import subprocess
 import sys
 
-checkout, description = sys.argv[1:]
+trusted_git, checkout, description = sys.argv[1:]
 proc = subprocess.run(
-    ["git", "-C", checkout, "config", "--local", "--null", "--list", "--no-includes"],
+    [trusted_git, "-C", checkout, "config", "--local", "--null", "--list", "--no-includes"],
     check=True,
     stdout=subprocess.PIPE,
     stderr=subprocess.DEVNULL,
@@ -103,7 +129,6 @@ allowed_single = {
     "core.logallrefupdates": {"true", "false"},
     "core.ignorecase": {"true", "false"},
     "core.precomposeunicode": {"true", "false"},
-    "remote.origin.fetch": {"+refs/heads/*:refs/remotes/origin/*"},
 }
 required = {"core.repositoryformatversion", "core.bare", "remote.origin.url", "remote.origin.fetch"}
 counts = {}
@@ -112,6 +137,26 @@ for key, value in entries:
     if key in {"remote.origin.url", "remote.origin.pushurl", "user.name", "user.email"}:
         if not value or any(ch in value for ch in "\r\n\0"):
             raise SystemExit(f"{description} has malformed Git local config: {key}")
+        continue
+    if key == "remote.origin.fetch":
+        wildcard = "+refs/heads/*:refs/remotes/origin/*"
+        single = __import__("re").fullmatch(
+            r"\+(refs/heads/([^:]+)):(refs/remotes/origin/([^:]+))", value
+        )
+        if value != wildcard:
+            if single is None:
+                raise SystemExit(f"{description} has forbidden Git local config: {key}")
+            source_ref, source_branch, target_ref, target_branch = single.groups()
+            ref_validity = [
+                subprocess.run(
+                    [trusted_git, "check-ref-format", refname],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                ).returncode == 0
+                for refname in (source_ref, target_ref)
+            ]
+            if source_branch != target_branch or not all(ref_validity):
+                raise SystemExit(f"{description} has forbidden Git local config: {key}")
         continue
     branch_match = __import__("re").fullmatch(r"branch\.[a-z0-9._/-]+\.(remote|merge)", key)
     if branch_match:
@@ -150,7 +195,7 @@ PY
     fi
   done
 
-  replace_refs="$(git -C "$checkout" for-each-ref --format='%(refname)' refs/replace 2>/dev/null)" || {
+  replace_refs="$("$trusted_git" -C "$checkout" for-each-ref --format='%(refname)' refs/replace 2>/dev/null)" || {
     echo "$description replace refs could not be enumerated safely" >&2
     return 1
   }
