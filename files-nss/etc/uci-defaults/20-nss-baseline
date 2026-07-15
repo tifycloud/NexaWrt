@@ -1,0 +1,13 @@
+#!/bin/sh
+set -e
+
+# NSS/ECM owns the accelerated forwarding path. Keep OpenWrt's competing
+# packet steering and software/hardware flow-offload paths disabled.
+# This file is installed only by the NSS flavor overlay.
+uci -q set network.globals.packet_steering='0'
+uci -q set firewall.@defaults[0].flow_offloading='0'
+uci -q set firewall.@defaults[0].flow_offloading_hw='0'
+uci -q commit network
+uci -q commit firewall
+
+exit 0

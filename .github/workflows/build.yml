@@ -2,15 +2,26 @@ name: NexaWrt AX9000 initramfs build
 
 on:
   workflow_dispatch:
+    inputs:
+      flavor:
+        description: Build flavor (official is the default; nss is experimental)
+        required: true
+        default: official
+        type: choice
+        options:
+          - official
+          - nss
   pull_request:
     paths:
-      - '.github/workflows/build.yml'
+      - '.github/workflows/**'
       - 'README.md'
+      - 'THIRD_PARTY_NOTICES.md'
       - 'Makefile'
       - 'docs/**'
       - 'tests/**'
       - 'configs/**'
       - 'files/**'
+      - 'files-nss/**'
       - 'manifests/**'
       - 'patches/**'
       - 'scripts/**'
@@ -19,19 +30,38 @@ permissions:
   contents: read
 
 concurrency:
-  group: nexawrt-ax9000-build-${{ github.ref }}
+  group: nexawrt-ax9000-build-${{ github.ref }}-${{ github.event_name == 'workflow_dispatch' && inputs.flavor || 'official' }}
   cancel-in-progress: true
 
 jobs:
   build:
     runs-on: ubuntu-24.04
     timeout-minutes: 360
+    env:
+      # Pull requests have no workflow_dispatch input and therefore always use
+      # the official baseline. NSS must be selected explicitly by a human.
+      NEXAWRT_FLAVOR: ${{ github.event_name == 'workflow_dispatch' && inputs.flavor || 'official' }}
     steps:
       - name: Checkout project
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
 
-      - name: Run repository safety checks
+      - name: Show selected flavor
+        run: printf 'NEXAWRT_FLAVOR=%s\n' "$NEXAWRT_FLAVOR"
+
+      - name: Run repository-wide pull request checks
+        if: github.event_name == 'pull_request'
         run: ./tests/test_static.sh
+
+      - name: Run selected-flavor manual checks
+        if: github.event_name == 'workflow_dispatch'
+        run: |
+          ./scripts/validate.sh
+          ./tests/test_backup_guards.sh
+          ./tests/test_release_policy.sh
+          if [ "$NEXAWRT_FLAVOR" = nss ]; then
+            ./tests/test_feed_policy.sh
+            ./tests/test_nss_artifact_policy.sh
+          fi
 
       - name: Install OpenWrt build dependencies
         run: |
@@ -45,18 +75,30 @@ jobs:
       - name: Cache downloads
         uses: actions/cache@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
         with:
-          path: .work/openwrt/dl
-          key: openwrt-dl-${{ hashFiles('manifests/upstream.lock', 'manifests/feeds.lock', 'configs/**') }}
+          path: |
+            .work/openwrt/dl
+            .work/openwrt-nss/dl
+          key: openwrt-dl-${{ env.NEXAWRT_FLAVOR }}-${{ hashFiles('manifests/*.lock', 'configs/**') }}
           restore-keys: |
-            openwrt-dl-
+            openwrt-dl-${{ env.NEXAWRT_FLAVOR }}-
 
-      - name: Build and stage release files
+      - name: Build and stage artifact
         run: ./scripts/build.sh
 
-      - name: Upload firmware artifact
+      - name: Upload official firmware artifact
+        if: env.NEXAWRT_FLAVOR == 'official'
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          name: nexawrt-ax9000-initramfs-${{ github.sha }}
+          name: nexawrt-ax9000-initramfs-official-${{ github.sha }}
           path: dist/
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Upload experimental NSS firmware artifact
+        if: env.NEXAWRT_FLAVOR == 'nss'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: nexawrt-ax9000-initramfs-nss-${{ github.sha }}
+          path: dist-nss/
           if-no-files-found: error
           retention-days: 14

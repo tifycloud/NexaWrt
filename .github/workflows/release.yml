@@ -16,8 +16,13 @@ jobs:
       - name: Checkout project
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
 
-      - name: Run repository safety checks
-        run: ./tests/test_static.sh
+      - name: Run official release safety checks
+        env:
+          NEXAWRT_FLAVOR: official
+        run: |
+          ./scripts/validate.sh
+          ./tests/test_backup_guards.sh
+          ./tests/test_release_policy.sh
 
       - name: Install OpenWrt build dependencies
         run: |

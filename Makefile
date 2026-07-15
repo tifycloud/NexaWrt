@@ -1,18 +1,27 @@
+NEXAWRT_FLAVOR ?= official
+
+ifeq ($(NEXAWRT_FLAVOR),nss)
+DEFAULT_WORK_DIR := .work/openwrt-nss
+else
+DEFAULT_WORK_DIR := .work/openwrt
+endif
+WORK_DIR ?= $(DEFAULT_WORK_DIR)
+
 .PHONY: prepare validate build release clean
 
 prepare:
-	./scripts/prepare.sh
+	NEXAWRT_FLAVOR=$(NEXAWRT_FLAVOR) WORK_DIR=$(WORK_DIR) ./scripts/prepare.sh
 
 validate:
-	./scripts/validate.sh --source .work/openwrt
+	NEXAWRT_FLAVOR=$(NEXAWRT_FLAVOR) ./scripts/validate.sh --source $(WORK_DIR)
 
 build:
-	./scripts/build.sh
+	NEXAWRT_FLAVOR=$(NEXAWRT_FLAVOR) WORK_DIR=$(WORK_DIR) ./scripts/build.sh
 
 release:
-	./scripts/release.sh
+	NEXAWRT_FLAVOR=$(NEXAWRT_FLAVOR) WORK_DIR=$(WORK_DIR) ./scripts/release.sh
 
 clean:
-	rm -rf .work build.log dist
+	rm -rf .work build.log build-nss.log dist dist-nss
 	mkdir -p dist
 	touch dist/.gitkeep

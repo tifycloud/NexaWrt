@@ -17,7 +17,8 @@
 ## 当前支持与安全边界
 
 - 设备：Xiaomi AX9000
-- 上游基线：OpenWrt `v25.12.5`，提交前缀 `f0a60eee...`
+- 默认 `official` flavor 上游基线：OpenWrt `v25.12.5`，提交前缀 `f0a60eee...`
+- 可选 `nss` flavor 上游：`manifests/nss.lock` 锁定 `qosmio/openwrt-ipq` 的 `25.12-nss` 和固定 commit；它是实验性对照组，绝非默认
 - 当前布局：single-large-UBI v1
 - `rootfs` MTD 预期偏移：`0x01180000`（必须重新读取确认）
 - `rootfs` MTD 大小：`0x0e800000`（232 MiB）
@@ -29,7 +30,8 @@
 - NexaWrt initramfs RAM-test 必须使用的启动参数：`root=/dev/ram0`
 - NexaWrt RAM-test 内核命令行：**不得出现** `ubi.mtd=` 或 `/dev/ubiblock`
 - 持久 UBI：RAM-test 期间必须保持未附加、未挂载、未写入
-- 第三方 NSS 加速栈/ECM/NSS firmware：**禁止启用或引入**（上游目标默认依赖的 `kmod-qca-nss-dp` 除外）
+- `official` flavor 不引入第三方 NSS 加速栈/ECM/NSS firmware（上游目标默认依赖的 `kmod-qca-nss-dp` 除外）
+- `nss` flavor 才可引入锁定的 NSS/ECM 栈和专有 firmware；必须保持 flavor 身份、来源与诊断记录
 - 当前阶段唯一可能允许的启动方式：**经单独批准后，通过 U-Boot 将 initramfs 加载到 RAM 并启动**
 
 任何一项与现场设备不符，都必须停止。不要假设另一台同型号设备具有相同布局。
@@ -74,7 +76,7 @@ NexaWrt 当前阶段的目标只是证明：
 - `sysupgrade`、修改 bootcmd/启动槽、保存未经审查的 U-Boot 环境；
 - 写入 `appsbl`、`appsbl_1`、`appsblenv`、`art`、`bdata`、`bootconfig`、
   `bootconfig1` 或 `rootfs`；
-- 使用为其他分区布局、其他提交或第三方 NSS 加速栈制作的镜像。
+- 使用为其他分区布局、其他提交制作的镜像，或把 `official`/`nss` flavor 的包、overlay、缓存和产物混用。
 
 ## 开始前
 
@@ -114,13 +116,26 @@ MTD 备份包含整个 UBI 区域，可能间接包含 `rootfs_data` 中的配�
 
 - [恢复与安全边界](docs/RECOVERY.md)
 - [initramfs 测试流程](docs/TESTING.md)
+- [实验性 NSS flavor、限制与诊断](docs/NSS.md)
 
 
 ## 构建 NexaWrt
 
-NexaWrt 当前 AX9000 构建固定使用 `manifests/upstream.lock` 中的 OpenWrt tag/commit，官方 feeds 也按
-OpenWrt `v25.12.5` 自带的 commit 锁定。补丁负责 RAM-only 命令行覆盖、持久 MTD
-只读标记、独立镜像身份，以及对 AX9000 全部持久升级入口的 fail-closed 阻断。
+NexaWrt 提供两个相互隔离的构建 flavor：
+
+- `official`：默认；使用 `manifests/upstream.lock` 中的 OpenWrt `v25.12.5` / 固定 commit，
+  官方 feeds 也按该 tag 自带的 commit 锁定；
+- `nss`：实验性、可选；`manifests/nss.lock` 把 `qosmio/openwrt-ipq` 的 `25.12-nss`
+  锁定到 commit `d6848fa2ea00193b5b7d3973e3990da7f608027c`，并固定 NSS feeds、叠加仅属于
+  NSS 的配置与 overlay。它依赖侵入性的下游网络栈、ECM 和专有
+  NSS firmware，且与 OpenWrt packet steering、software/hardware flow offload 冲突。
+  首个实验 flavor 明确关闭 ath11k NSS Wi-Fi、mesh 与 NSS SQM，只验证有线基础路径。
+
+`official` 始终是默认和 Pull Request 构建 flavor。GitHub Actions 手动触发时才提供
+`official`/`nss` 选择，artifact 名会包含实际 flavor。NSS 的风险、bridge VLAN filtering、
+NSS Wi-Fi 限制和只读诊断方法见 [NSS 文档](docs/NSS.md)。两个 flavor 都必须经过同一套
+RAM-only 命令行覆盖、持久 MTD 只读标记、独立镜像身份和持久升级 fail-closed 门检；
+仓库安全补丁对 official 与 nss 两个锁定 source commit 都先校验再严格应用。
 
 先做不联网的静态检查：
 
@@ -128,22 +143,38 @@ OpenWrt `v25.12.5` 自带的 commit 锁定。补丁负责 RAM-only 命令行覆�
 ./scripts/validate.sh
 ```
 
-在 Linux 构建机上完整构建：
+在 Linux 构建机上完整构建默认 `official` flavor：
 
 ```sh
 ./scripts/build.sh
 ```
 
+NSS 不是隐式 fallback。只有明确选择 `nss` 时才允许使用 NSS 构建路径；本地 Linux
+构建使用：
+
+```sh
+NEXAWRT_FLAVOR=nss ./scripts/build.sh
+```
+
+不要通过修改 `official` 的 source、配置或 `files/` 来模拟 NSS。
+
 macOS 自带的 Bash、Make 和默认大小写不敏感文件系统通常不满足 OpenWrt 完整构建
 要求。本机建议只做静态检查和只读备份，固件通过 GitHub Actions 的
 **NexaWrt AX9000 initramfs build** 工作流手动构建。
 
-构建流程只选择 `xiaomi_ax9000_single_ubi`，输出文件名带有该 profile。当前 profile
-明确关闭 sysupgrade 和 factory 产物，发布脚本还会再次拒绝任何可刷写镜像。当前发布目录
-只包含：
+两个 flavor 的安全构建流程都只允许 AX9000 single-large-UBI initramfs profile，artifact 名
+必须能追溯到 flavor，镜像文件名必须能追溯到 profile。当前 profile 明确关闭 sysupgrade 和
+factory 产物，产物门检会拒绝任何可刷写镜像。
+
+现有 tag release workflow 保持默认 `official`，其 `dist/` 发布目录只包含：
 
 - `*-xiaomi_ax9000_single_ubi-initramfs-uImage.itb`：当前阶段 RAM 启动测试；
 - `DO-NOT-FLASH.txt`、构建清单、profile 信息和 SHA-256。
+
+实验性 `nss` 只通过手动 build workflow 上传独立的 `dist-nss/` allowlist staging 目录，
+不会上传整个 OpenWrt target 输出，也不进入现有 tag release workflow。`dist-nss/` 只包含精确的
+AX9000 single_ubi initramfs ITB、允许的构建 metadata、NSS 来源清单、第三方 notice、
+`DO-NOT-FLASH.txt` 与 SHA-256；它不应被描述成正式发布。
 
 > 当前阶段只生成和发布 initramfs 候选产物，并且只能设计为从 RAM 启动。候选镜像必须使用
 > `root=/dev/ram0`，不得包含 `ubi.mtd=` 或 `/dev/ubiblock`。若任何构建目录中出现
@@ -162,11 +193,13 @@ macOS 自带的 Bash、Make 和默认大小写不敏感文件系统通常不满�
 ## 目录结构
 
 ```text
-configs/                 单设备、最小包配置
-files/                   不含密码或订阅的基础 overlay
-manifests/               OpenWrt/feeds/layout 锁定信息
-patches/                 对官方 v25.12.5 的两个最小补丁
+configs/                 单设备、按 flavor 隔离的最小包配置
+files/                   两个 flavor 共用、不含密码或订阅的基础 overlay
+files-nss/               仅 NSS flavor 应用的运行时 overlay
+manifests/               OpenWrt/feeds/layout 与 NSS 来源锁定信息
+patches/                 对两个锁定 source commit 都严格应用的 RAM-only 安全补丁
 scripts/backup-router.sh 只读备份
+scripts/nss-diagnostics.sh NSS/ECM 只读运行时诊断
 scripts/prepare.sh       获取并校验上游
 scripts/build.sh         Linux 完整构建
 scripts/validate.sh      静态、源码和产物门检

@@ -3,7 +3,9 @@
 本流程只适用于 **NexaWrt 当前支持的 Xiaomi AX9000 single-large-UBI v1 布局**，
 并且只覆盖 **initramfs RAM 启动测试**。它不包含安装、sysupgrade、UBI 重建或任何
 闪存写入步骤；其他设备或布局必须另行制定测试流程，本文不构成未来支持承诺。
-**当前尚未完成真机 RAM 启动批准；本文是验收流程，不是执行授权。**
+默认测试对象是 `official` flavor；`nss` 只是由 `manifests/nss.lock` 锁定到
+`qosmio/openwrt-ipq` `25.12-nss` / `d6848fa2...` 的实验性可选对照组。**当前尚未完成任何 flavor 的真机 RAM 启动批准；
+本文是验收流程，不是执行授权。**
 
 ## 0. 停止条件
 
@@ -16,8 +18,12 @@
 - NexaWrt RAM-test 的 `/proc/cmdline` 出现 `ubi.mtd=` 或 `/dev/ubiblock`；
 - `/sys/class/ubi` 下出现自动附加的持久 UBI 设备；
 - U-Boot 的 MTD/UBI 可见范围尚未记录，或与 Linux 的 `rootfs` 边界不一致；
-- 镜像不是基于 OpenWrt `v25.12.5` / `f0a60eee...` 的 NexaWrt 当前 AX9000 产物；
-- 镜像包含第三方 NSS 加速/ECM/NSS firmware 补丁、包或配置；
+- 无法确认镜像 flavor，或 artifact、清单、配置与所声明 flavor 不一致；
+- `official` 镜像不是基于 OpenWrt `v25.12.5` / `f0a60eee...`，或意外包含第三方 NSS/ECM/NSS firmware；
+- `nss` 镜像不是基于 `manifests/nss.lock` 锁定的 `qosmio/openwrt-ipq` `25.12-nss` /
+  `d6848fa2ea00193b5b7d3973e3990da7f608027c`，或混入 `official` 的构建缓存/overlay；
+- NSS 测试中 `network.globals.packet_steering`、`firewall.@defaults[0].flow_offloading` 或
+  `firewall.@defaults[0].flow_offloading_hw` 不是 `0`；
 - 尚未完成关键 MTD 备份和 SHA-256 校验；
 - UART 输入不可靠、无法中断 U-Boot 或无法恢复当前启动；
 - 任何步骤要求擦除、写入、格式化或调整 MTD/UBI。
@@ -90,9 +96,12 @@ shasum -a 256 -c SHA256SUMS
 
 - 完整文件名和字节大小；
 - SHA-256；
-- OpenWrt tag `v25.12.5` 与提交前缀 `f0a60eee...`；
-- NexaWrt 当前 AX9000 补丁清单；
-- 明确的“不含第三方 NSS 加速栈/ECM/NSS firmware”检查结果；
+- flavor（`official` 或 `nss`）及对应 artifact 名；
+- `official` 的 OpenWrt tag `v25.12.5` 与提交前缀 `f0a60eee...`，或 `nss` 的
+  `qosmio/openwrt-ipq` `25.12-nss` 固定 commit `d6848fa2ea00193b5b7d3973e3990da7f608027c`；
+- NexaWrt 当前 AX9000 补丁、配置、feeds 和 overlay 清单；
+- `official` 明确不含第三方 NSS 加速栈/ECM/NSS firmware；`nss` 明确列出 NSS/ECM
+  包、firmware 来源及其许可证检查结果；
 - 构建日志和配置；
 - 候选命令行明确使用 `root=/dev/ram0`，且不含 `ubi.mtd=` 或 `/dev/ubiblock`；
 - 启动流程审查证明不会自动附加、挂载或写入持久 UBI；
@@ -154,7 +163,11 @@ cat /sys/class/thermal/thermal_zone*/temp 2>/dev/null
 - 以太网接口、交换端口和 MAC 地址映射；
 - Wi-Fi 射频是否被识别（本阶段不要求持久化配置）；
 - LED、按键、温度传感器、USB（若测试）等；
-- 构建中没有第三方 NSS 加速/ECM/NSS firmware 模块、服务或专用配置；
+- `official` 中没有第三方 NSS 加速/ECM/NSS firmware 模块、服务或专用配置；
+- `nss` 中预期的 NSS firmware/module/ECM 状态可识别，且 packet steering 与 OpenWrt
+  software/hardware flow offload 均保持关闭；
+- 涉及 bridge VLAN filtering 或 NSS Wi-Fi 时，按 [NSS 限制](NSS.md#bridge-vlan-filtering-与-nss-wi-fi-限制)
+  单独记录每个 VLAN 和转发方向，不把简单连通误当成兼容；
 - 持久 UBI 始终未附加、未挂载、未写入。
 
 不要在 initramfs 中运行 `firstboot`、`jffs2reset`、`sysupgrade`、`mount_root`、`ubiattach`
@@ -172,14 +185,80 @@ UBI volume，即使只计划只读访问也应停止并重新审查测试方案�
 
 通过标准：当前生产系统可正常启动；MTD/UBI 布局、启动环境和可观察配置没有因测试发生变化。
 
-## 7. 结果记录模板
+## 7. flavor 运行时基线
+
+### official
+
+`official` 是默认基线。除上游目标本身依赖的 `kmod-qca-nss-dp` 外，不应出现第三方
+NSS driver、ECM、NSS firmware 或 NSS 专用服务。发现后停止并检查 flavor 污染。
+
+### nss
+
+`nss` 必须使用仅 NSS overlay 中的 UCI defaults，并读取确认以下**正确 section/key**：
+
+```sh
+uci -q get network.globals.packet_steering
+uci -q get firewall.@defaults[0].flow_offloading
+uci -q get firewall.@defaults[0].flow_offloading_hw
+```
+
+三项都必须输出 `0`。本项目使用命名 section 写法 `network.globals`；upstream UCI 的
+`network.@globals[0]` 也可以访问同一个首个 `globals` section。真正不应照搬的是参考
+README 的 `network.@device[0]`，因为 packet steering 不属于该 `device` section。测试期间
+不得临时打开 OpenWrt software/hardware flow offload 来“叠加”性能。
+
+NSS/ECM 状态采集使用 `scripts/nss-diagnostics.sh`。该脚本只读并输出到 stdout，不会写闪存、
+修改 UCI、挂载 debugfs 或加载模块。若需要保存输出，应由开发机通过 SSH 捕获 stdout，或在
+已经批准的 RAM-only 环境中明确写入 `/tmp`；不要把日志写到持久 overlay。
+
+## 8. official/NSS A/B 测试方法
+
+本节只是**真机 RAM 启动获批后的验收设计**。截至目前批准尚未取得，不得因为已有 A/B
+方案就加载或启动任何候选镜像，更不得刷写。
+
+### 8.1 变量控制
+
+- A 组为默认 `official`，B 组为实验性 `nss`；除 flavor 必需的源码、包、配置和
+  `files-nss/` 外，其余 NexaWrt 安全补丁与 initramfs 约束保持一致；
+- 使用同一台 AX9000、同一电源、客户端、服务端、网线、交换机端口、MTU、测试工具版本、
+  流数量、方向、时长和环境温度范围；
+- 初始比较使用简单有线、无 bridge VLAN filtering 的隔离拓扑。VLAN 和 NSS Wi-Fi 另设
+  兼容性测试，不与基础吞吐数字混在一起；
+- 每次启动都重新验证 `/proc/cmdline`、持久 UBI 未附加，以及实际 flavor/source 清单；
+- 建议采用 A-B-B-A 或 B-A-A-B 顺序，降低温度、缓存、客户端状态和时间漂移造成的偏差。
+
+### 8.2 每轮采集
+
+在空闲、测试进行中和测试结束后分别记录：
+
+- TCP 单流与多流、两个方向的吞吐；UDP 场景同时记录发送率、接收率、丢包和抖动；
+- 空载延迟与负载下延迟，而不是只记录最高吞吐；
+- 每核 CPU、load、softirq、相关 IRQ 计数与 affinity、温度和是否发生降频；
+- firewall flow offload、packet steering、NSS firmware/module、ECM 连接状态；
+- `dmesg` 中的 crash、warning、firmware timeout、ECM accelerate/decelerate 异常；
+- bridge/VLAN/Wi-Fi 测试中的每个端口、VID、tagged/untagged、PVID、SSID、方向和隔离结果。
+
+NSS 轮次运行只读诊断脚本；official 轮次也运行同一脚本，预期它清楚显示 NSS/ECM 不存在，
+这样才能发现 flavor 污染。保存完整原始输出，不只抄录一个峰值。
+
+### 8.3 重复与判定
+
+- 每个条件至少完成 3 个有效重复；报告中位数、范围/离散度和所有异常轮次，不挑最好结果；
+- 任一轮出现 panic/oops、网络失联、firmware timeout、VLAN/防火墙隔离回归、意外启用
+  OpenWrt flow offload、持久 UBI 被附加或无法恢复生产系统，均判为失败并停止；
+- “ECM accelerated”只能证明连接进入某个加速状态，不能单独证明端到端性能提高；
+- 在数据经过复核前不得宣称“实际提速”或给出项目级性能百分比。结论必须限定设备、拓扑、
+  协议、方向、MTU、并发、镜像 revision 和测试日期。
+
+## 9. 结果记录模板
 
 ```text
 日期/操作者：
 设备标签：
 基线固件：
-源码 tag/commit：v25.12.5 / f0a60eee...
-镜像文件：
+flavor：official / nss
+源码仓库/branch/commit：
+镜像文件（artifact 名含 flavor）：
 镜像 SHA-256：
 备份目录与 SHA256SUMS 校验：PASS / FAIL
 UART 中断及生产系统恢复（至少两次）：PASS / FAIL
@@ -190,7 +269,10 @@ RAM-test 使用 root=/dev/ram0：PASS / FAIL
 命令行不含 ubi.mtd= 或 /dev/ubiblock：PASS / FAIL
 持久 UBI 未附加、未挂载、未写入：PASS / FAIL
 生产布局回归一致：PASS / FAIL
-无第三方 NSS 加速栈/ECM/NSS firmware：PASS / FAIL
+official 无第三方 NSS/ECM/firmware，或 nss 来源与组件清单匹配：PASS / FAIL
+NSS 基线三项均为 0（仅 nss）：PASS / FAIL / N/A
+NSS 只读诊断日志（仅 nss）：
+A/B 拓扑、工具版本、轮次和原始数据位置：
 无闪存写入：PASS / FAIL
 重启回当前生产系统：PASS / FAIL
 异常与日志位置：

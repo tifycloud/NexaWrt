@@ -4,6 +4,11 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 # shellcheck source=../manifests/upstream.lock
 source "$ROOT_DIR/manifests/upstream.lock"
+NEXAWRT_FLAVOR="${NEXAWRT_FLAVOR:-official}"
+if [[ "$NEXAWRT_FLAVOR" != official ]]; then
+  echo "Refusing release staging for experimental flavor: $NEXAWRT_FLAVOR" >&2
+  exit 1
+fi
 WORK_DIR="${WORK_DIR:-$ROOT_DIR/.work/openwrt}"
 BIN_DIR="$WORK_DIR/bin/targets/qualcommax/ipq807x"
 DIST_DIR="${DIST_DIR_OVERRIDE:-$ROOT_DIR/dist}"

@@ -1,0 +1,10 @@
+# shellcheck shell=sh
+NSS_OPENWRT_REPO="https://github.com/qosmio/openwrt-ipq.git"
+NSS_OPENWRT_BRANCH="25.12-nss"
+NSS_OPENWRT_COMMIT="d6848fa2ea00193b5b7d3973e3990da7f608027c"
+NSS_PACKAGES_FEED="nss_packages"
+NSS_PACKAGES_REPO="https://github.com/qosmio/nss-packages.git"
+NSS_PACKAGES_COMMIT="0d970dbf0185e3f53709bd803e8a466598023c57"
+NSS_SQM_FEED="sqm_scripts_nss"
+NSS_SQM_REPO="https://github.com/qosmio/sqm-scripts-nss.git"
+NSS_SQM_COMMIT="4b4ed8639229be5e70cf94b73cdf7dbc09e66d5d"

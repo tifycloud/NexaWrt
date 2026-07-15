@@ -1,7 +1,9 @@
 .work/
 build.log
+build-nss.log
 dist/*
 !dist/.gitkeep
+dist-nss/
 *.swp
 .DS_Store
 
