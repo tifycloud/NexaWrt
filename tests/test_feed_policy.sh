@@ -66,6 +66,12 @@ for nss_only_file in \
   mv "$backup" "$candidate"
 done
 echo 'selected-flavor script syntax isolation: OK'
+grep -Fq 'GIT_CONFIG_KEY_0=http.proxy' "$ROOT_DIR/scripts/prepare.sh" || {
+  echo 'prepare does not neutralize ambient Git proxy configuration' >&2
+  exit 1
+}
+echo 'ambient Git proxy isolation: OK'
+
 
 # Official credential scanning must not read NSS-only helpers or policy tests.
 # Build the sentinel in pieces so this test source does not contain a pattern.
@@ -101,6 +107,19 @@ while read -r feed; do
   git -C "$checkout" config user.email 'nexawrt-feed-policy@example.invalid'
   printf '%s\n' "$feed" > "$checkout/tracked.txt"
   printf 'ignored-fixture.tmp\n' > "$checkout/.gitignore"
+  if [[ "$feed" == luci ]]; then
+    cat >> "$checkout/.gitignore" <<'LUCI_BUILD_IGNORES'
+/modules/luci-base/src/contrib/lemon
+/modules/luci-base/src/jsmin
+/modules/luci-base/src/jsmin.o
+/modules/luci-base/src/lib/lmo.o
+/modules/luci-base/src/lib/plural_formula.c
+/modules/luci-base/src/lib/plural_formula.h
+/modules/luci-base/src/lib/plural_formula.o
+/modules/luci-base/src/po2lmo
+/modules/luci-base/src/po2lmo.o
+LUCI_BUILD_IGNORES
+  fi
   mkdir -p "$checkout/package-$feed"
   printf '# fixture package for %s\n' "$feed" > "$checkout/package-$feed/Makefile"
   git -C "$checkout" add .
@@ -126,6 +145,21 @@ printf 'version=1\nflavor=official\nstate=feeds-installed\n' > "$SOURCE/.nexawrt
 NEXAWRT_FLAVOR=official "$POLICY_REPO/scripts/validate.sh" \
   --source "$SOURCE" --feed-policy-only >/dev/null
 
+ln -s ../package "$SOURCE/feeds/base"
+NEXAWRT_FLAVOR=official "$POLICY_REPO/scripts/validate.sh" \
+  --source "$SOURCE" --feed-policy-only >/dev/null
+rm "$SOURCE/feeds/base"
+ln -s ../feeds "$SOURCE/feeds/base"
+expect_failure "wrong feeds/base target" "feeds/base has an unexpected symlink target" \
+  env NEXAWRT_FLAVOR=official "$POLICY_REPO/scripts/validate.sh" \
+  --source "$SOURCE" --feed-policy-only
+rm "$SOURCE/feeds/base"
+mkdir "$SOURCE/feeds/base"
+expect_failure "regular feeds/base directory" "feeds/base must be the OpenWrt package symlink" \
+  env NEXAWRT_FLAVOR=official "$POLICY_REPO/scripts/validate.sh" \
+  --source "$SOURCE" --feed-policy-only
+rmdir "$SOURCE/feeds/base"
+
 mv "$SOURCE/.nexawrt-feeds-state" "$TMP_DIR/feed-state-marker"
 expect_failure "source without feed state marker" "feed state marker is missing" \
   env NEXAWRT_FLAVOR=official "$POLICY_REPO/scripts/validate.sh" \
@@ -140,7 +174,7 @@ git -C "$SOURCE/feeds/$first_feed" reset --hard -q HEAD
 
 printf 'staged\n' >> "$SOURCE/feeds/$first_feed/tracked.txt"
 git -C "$SOURCE/feeds/$first_feed" add tracked.txt
-expect_failure "staged feed modification" "feed checkout $first_feed is not clean" \
+expect_failure "staged feed modification" "feed checkout $first_feed has staged changes" \
   env NEXAWRT_FLAVOR=official "$POLICY_REPO/scripts/validate.sh" \
   --source "$SOURCE" --feed-policy-only
 git -C "$SOURCE/feeds/$first_feed" reset --hard -q HEAD
@@ -188,6 +222,34 @@ expect_failure "ignored feed file" "feed checkout $first_feed contains ignored f
   env NEXAWRT_FLAVOR=official "$POLICY_REPO/scripts/validate.sh" \
   --source "$SOURCE" --feed-policy-only
 rm -f "$SOURCE/feeds/$first_feed/ignored-fixture.tmp"
+
+luci_checkout="$SOURCE/feeds/luci"
+for generated in \
+  modules/luci-base/src/contrib/lemon \
+  modules/luci-base/src/jsmin \
+  modules/luci-base/src/jsmin.o \
+  modules/luci-base/src/lib/lmo.o \
+  modules/luci-base/src/lib/plural_formula.c \
+  modules/luci-base/src/lib/plural_formula.h \
+  modules/luci-base/src/lib/plural_formula.o \
+  modules/luci-base/src/po2lmo \
+  modules/luci-base/src/po2lmo.o; do
+  mkdir -p "$(dirname "$luci_checkout/$generated")"
+  printf 'generated build output\n' > "$luci_checkout/$generated"
+done
+expect_failure "pre-build LuCI generated output" "feed checkout luci contains ignored files" \
+  env NEXAWRT_FLAVOR=official "$POLICY_REPO/scripts/validate.sh" \
+  --source "$SOURCE" --feed-policy-only
+NEXAWRT_FLAVOR=official "$POLICY_REPO/scripts/validate.sh" \
+  --source "$SOURCE" --feed-policy-only --artifacts >/dev/null
+touch "$luci_checkout/ignored-fixture.tmp"
+expect_failure "unexpected post-build LuCI ignored output" \
+  "feed checkout luci contains unexpected post-build ignored files" \
+  env NEXAWRT_FLAVOR=official "$POLICY_REPO/scripts/validate.sh" \
+  --source "$SOURCE" --feed-policy-only --artifacts
+rm -f "$luci_checkout/ignored-fixture.tmp"
+find "$luci_checkout/modules/luci-base/src" -type f -delete
+find "$luci_checkout/modules/luci-base/src" -depth -type d -empty -delete
 
 expected_origin="$(git -C "$SOURCE/feeds/$first_feed" remote get-url origin)"
 git -C "$SOURCE/feeds/$first_feed" remote set-url origin 'file:///unexpected-feed-origin.git'
@@ -284,4 +346,14 @@ expect_failure "unknown ATH11K NSS symbol" "enabled an ATH11K NSS feature" \
   env NEXAWRT_FLAVOR=nss "$POLICY_REPO/scripts/validate.sh"
 
 echo 'NSS config allowlist negatives: OK'
+for expected in \
+  'PKG_BUILD_DIR:=$(KERNEL_BUILD_DIR)/nss-drv-$(PKG_SOURCE_VERSION)' \
+  'PKG_BUILD_DIR:=$(KERNEL_BUILD_DIR)/qca-nss-ecm-$(PKG_SOURCE_VERSION)' \
+  'PKG_BUILD_DIR:=$(KERNEL_BUILD_DIR)/nss-clients-$(PKG_SOURCE_VERSION)'; do
+  grep -Fq "+$expected" "$ROOT_DIR/patches/nss/001-pin-codelinaro-source-archives.patch" || {
+    echo "NSS archive extraction directory is not pinned: $expected" >&2
+    exit 1
+  }
+done
+echo 'NSS archive extraction directory policy: OK'
 echo 'feed policy tests: OK'

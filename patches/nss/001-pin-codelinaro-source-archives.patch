@@ -1,0 +1,93 @@
+diff --git a/qca-nss-clients/Makefile b/qca-nss-clients/Makefile
+index f172027..f911ae3 100644
+--- a/qca-nss-clients/Makefile
++++ b/qca-nss-clients/Makefile
+@@ -3,11 +3,11 @@ include $(TOPDIR)/rules.mk
+ PKG_NAME:=qca-nss-clients
+ PKG_RELEASE:=8
+ 
+-PKG_SOURCE_URL:=https://git.codelinaro.org/clo/qsdk/oss/lklm/nss-clients.git
+-PKG_SOURCE_PROTO:=git
++PKG_SOURCE:=nss-clients-51be82d43ef85079f78aa163d014223b05baa6a2.tar.gz
++PKG_SOURCE_URL:=https://git.codelinaro.org/clo/qsdk/oss/lklm/nss-clients/-/archive/51be82d43ef85079f78aa163d014223b05baa6a2
++PKG_HASH:=fe04eec0007deb7983a42ebb77ab60753cb5aaefe3bb2120137621fed09d42c9
+ PKG_SOURCE_DATE:=2024-09-11
+-PKG_SOURCE_VERSION:=51be82d
+-PKG_MIRROR_HASH:=876c3898cb4723fccd4a1c870324724dd7c4061ac89ec88db2226fd749c18b38
++PKG_SOURCE_VERSION:=51be82d43ef85079f78aa163d014223b05baa6a2
+ QSDK_VERSION:=12.5
+ PKG_VERSION:=$(QSDK_VERSION).$(subst -,.,$(PKG_SOURCE_DATE))~$(PKG_SOURCE_VERSION)
+ 
+@@ -61,6 +61,10 @@ PKG_VERSION:=$(QSDK_VERSION).$(subst -,.,$(PKG_SOURCE_DATE))~$(PKG_SOURCE_VERSIO
+ endif
+ 
+ include $(INCLUDE_DIR)/kernel.mk
++
++# CodeLinaro release archives use this fixed top-level directory.
++PKG_BUILD_DIR:=$(KERNEL_BUILD_DIR)/nss-clients-$(PKG_SOURCE_VERSION)
++
+ include $(INCLUDE_DIR)/package.mk
+ 
+ ifeq ($(CONFIG_TARGET_SUBTARGET), "ipq807x")
+diff --git a/qca-nss-drv/Makefile b/qca-nss-drv/Makefile
+index 29a87fd..0178b96 100644
+--- a/qca-nss-drv/Makefile
++++ b/qca-nss-drv/Makefile
+@@ -3,11 +3,11 @@ include $(TOPDIR)/rules.mk
+ PKG_NAME:=qca-nss-drv
+ PKG_RELEASE:=17
+ 
+-PKG_SOURCE_URL:=https://git.codelinaro.org/clo/qsdk/oss/lklm/nss-drv.git
+-PKG_SOURCE_PROTO:=git
++PKG_SOURCE:=nss-drv-d5ee67bd84d1ee7ed81eb6758e62a6db5a0cf4c7.tar.gz
++PKG_SOURCE_URL:=https://git.codelinaro.org/clo/qsdk/oss/lklm/nss-drv/-/archive/d5ee67bd84d1ee7ed81eb6758e62a6db5a0cf4c7
++PKG_HASH:=519fea60d3394684fa13bf775c5e2654ef333495c15e2b7f3911ce290536d13b
+ PKG_SOURCE_DATE:=2024-11-13
+-PKG_SOURCE_VERSION:=d5ee67b
+-PKG_MIRROR_HASH:=4969320b2315eb07aefec4e189973800dd909c487794cc8383417fd2f97e689f
++PKG_SOURCE_VERSION:=d5ee67bd84d1ee7ed81eb6758e62a6db5a0cf4c7
+ QSDK_VERSION:=12.5
+ PKG_VERSION:=$(QSDK_VERSION).$(subst -,.,$(PKG_SOURCE_DATE))~$(PKG_SOURCE_VERSION)
+ 
+@@ -71,6 +71,10 @@ PKG_VERSION:=$(QSDK_VERSION).$(subst -,.,$(PKG_SOURCE_DATE))~$(PKG_SOURCE_VERSIO
+ endif
+ 
+ include $(INCLUDE_DIR)/kernel.mk
++
++# CodeLinaro release archives use this fixed top-level directory.
++PKG_BUILD_DIR:=$(KERNEL_BUILD_DIR)/nss-drv-$(PKG_SOURCE_VERSION)
++
+ include $(INCLUDE_DIR)/package.mk
+ 
+ NSS_CLIENTS_DIR:=$(TOPDIR)/qca/src/qca-nss-clients
+diff --git a/qca-nss-ecm/Makefile b/qca-nss-ecm/Makefile
+index d7cba36..4f9d0f7 100644
+--- a/qca-nss-ecm/Makefile
++++ b/qca-nss-ecm/Makefile
+@@ -3,11 +3,11 @@ include $(TOPDIR)/rules.mk
+ PKG_NAME:=qca-nss-ecm
+ PKG_RELEASE:=7
+ 
+-PKG_SOURCE_URL:=https://git.codelinaro.org/clo/qsdk/oss/lklm/qca-nss-ecm.git
+-PKG_SOURCE_PROTO:=git
++PKG_SOURCE:=qca-nss-ecm-30fbfa493d700270ac6c14685290f340b6ead28c.tar.gz
++PKG_SOURCE_URL:=https://git.codelinaro.org/clo/qsdk/oss/lklm/qca-nss-ecm/-/archive/30fbfa493d700270ac6c14685290f340b6ead28c
++PKG_HASH:=4e93a653fffb3da410f585e6c2a6a3292a4b80d1bd535baf1a6236c427ec6575
+ PKG_SOURCE_DATE:=2024-11-06
+-PKG_SOURCE_VERSION:=30fbfa4
+-PKG_MIRROR_HASH:=a6b508a41ae79cb579e83ea1d1f5a158c7758ab45f1d26a698677a5ec61ca03d
++PKG_SOURCE_VERSION:=30fbfa493d700270ac6c14685290f340b6ead28c
+ QSDK_VERSION:=12.5
+ PKG_VERSION:=$(QSDK_VERSION).$(subst -,.,$(PKG_SOURCE_DATE))~$(PKG_SOURCE_VERSION)
+ 
+@@ -19,6 +19,10 @@ PKG_CONFIG_DEPENDS:= \
+ 	CONFIG_NSS_DRV_PPPOE_ENABLE
+ 
+ include $(INCLUDE_DIR)/kernel.mk
++
++# CodeLinaro release archives use this fixed top-level directory.
++PKG_BUILD_DIR:=$(KERNEL_BUILD_DIR)/qca-nss-ecm-$(PKG_SOURCE_VERSION)
++
+ include $(INCLUDE_DIR)/package.mk
+ 
+ define KernelPackage/qca-nss-ecm

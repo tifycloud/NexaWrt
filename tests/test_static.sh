@@ -13,8 +13,10 @@ fi
 
 official_prepare="$(make -s -n -C "$ROOT_DIR" prepare)"
 nss_prepare="$(make -s -n -C "$ROOT_DIR" NEXAWRT_FLAVOR=nss prepare)"
-grep -Fq 'NEXAWRT_FLAVOR=official WORK_DIR=.work/openwrt ./scripts/prepare.sh' <<<"$official_prepare"
-grep -Fq 'NEXAWRT_FLAVOR=nss WORK_DIR=.work/openwrt-nss ./scripts/prepare.sh' <<<"$nss_prepare"
+grep -Fq 'env NEXAWRT_FLAVOR="official" WORK_DIR=".work/openwrt" ./scripts/prepare.sh' <<<"$official_prepare"
+grep -Fq 'env NEXAWRT_FLAVOR="nss" WORK_DIR=".work/openwrt-nss" ./scripts/prepare.sh' <<<"$nss_prepare"
+spaced_validate="$(make -s -n -C "$ROOT_DIR" WORK_DIR='build path/with spaces' validate)"
+grep -Fq 'env NEXAWRT_FLAVOR="official" ./scripts/validate.sh --source "build path/with spaces"' <<<"$spaced_validate"
 
 if NEXAWRT_FLAVOR=unknown "$ROOT_DIR/scripts/validate.sh" >/dev/null 2>&1; then
   echo 'invalid flavor unexpectedly accepted' >&2
@@ -31,4 +33,8 @@ echo 'flavor policy: official default, isolated nss work tree, and official-only
 "$ROOT_DIR/tests/test_feed_policy.sh"
 "$ROOT_DIR/tests/test_nss_artifact_policy.sh"
 "$ROOT_DIR/tests/test_backup_guards.sh"
+"$ROOT_DIR/tests/test_runtime_guards.sh"
+"$ROOT_DIR/tests/test_hardware_gate.sh"
 "$ROOT_DIR/tests/test_release_policy.sh"
+"$ROOT_DIR/tests/test_reproducibility_policy.sh"
+"$ROOT_DIR/tests/test_workflow_policy.sh"

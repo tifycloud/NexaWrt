@@ -1,29 +1,62 @@
-name: NexaWrt AX9000 initramfs release
+name: NexaWrt AX9000 reproducible RAM-test release
 
 on:
   push:
-    tags:
-      - 'ram-test-v*'
+    tags: ['ram-test-v*']
 
-permissions:
-  contents: write
+permissions: {}
+
+concurrency:
+  group: nexawrt-release-${{ github.ref_name }}
+  cancel-in-progress: false
 
 jobs:
-  release:
+  preflight:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout trusted tag
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Verify immutable release preconditions
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          test "$GITHUB_REF_TYPE" = tag
+          test "$(git cat-file -t "refs/tags/$GITHUB_REF_NAME")" = commit
+          test "$(git rev-parse "refs/tags/$GITHUB_REF_NAME")" = "$GITHUB_SHA"
+          git fetch --force origin main
+          git merge-base --is-ancestor "$GITHUB_SHA" origin/main
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            echo "Release already exists: $GITHUB_REF_NAME" >&2
+            exit 1
+          fi
+          ./tests/test_static.sh
+
+  build:
+    needs: preflight
+    strategy:
+      fail-fast: false
+      matrix:
+        replica: [a, b]
     runs-on: ubuntu-24.04
     timeout-minutes: 360
+    permissions:
+      contents: read
+    env:
+      NEXAWRT_FLAVOR: official
+      CLEAN_BUILD: '1'
+      WORK_DIR: .work/openwrt-${{ matrix.replica }}
+      DIST_DIR_OVERRIDE: ${{ github.workspace }}/release-staging/replica-${{ matrix.replica }}/dist
+      BUILD_LOG: ${{ github.workspace }}/build-${{ matrix.replica }}.log
     steps:
       - name: Checkout project
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
-
-      - name: Run official release safety checks
-        env:
-          NEXAWRT_FLAVOR: official
-        run: |
-          ./scripts/validate.sh
-          ./tests/test_backup_guards.sh
-          ./tests/test_release_policy.sh
-
+        with:
+          persist-credentials: false
       - name: Install OpenWrt build dependencies
         run: |
           sudo apt-get update
@@ -31,16 +64,104 @@ jobs:
             build-essential clang flex bison g++ gawk gcc-multilib g++-multilib \
             gettext git libncurses-dev libssl-dev python3 python3-setuptools \
             python3-pyelftools python3-packaging rsync swig unzip zlib1g-dev \
-            file wget libelf-dev subversion time xsltproc zstd
-
-      - name: Build release candidate
+            file wget libelf-dev shellcheck subversion time xsltproc zstd
+      - name: Lint shell safety policies
+        run: shellcheck -S warning scripts/*.sh tests/*.sh files/sbin/* files-nss/etc/uci-defaults/* files/etc/uci-defaults/*
+      - name: Build independent clean replica
         run: ./scripts/build.sh
+      - name: Upload replica
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: release-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.replica }}
+          path: release-staging/replica-${{ matrix.replica }}/dist/
+          if-no-files-found: error
+          retention-days: 14
 
-      - name: Publish GitHub release
+  compare:
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout comparison policy
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - name: Download replica A
+        uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5.0.0
+        with:
+          name: release-${{ github.run_id }}-${{ github.run_attempt }}-a
+          path: release-staging/replicas/a
+      - name: Download replica B
+        uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5.0.0
+        with:
+          name: release-${{ github.run_id }}-${{ github.run_attempt }}-b
+          path: release-staging/replicas/b
+      - name: Enforce reproducibility gate
+        run: ./scripts/compare-reproducible-builds.sh official release-staging/replicas/a release-staging/replicas/b release-staging/verified-dist
+      - name: Upload verified release payload
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: verified-release-${{ github.run_id }}-${{ github.run_attempt }}
+          path: release-staging/verified-dist/
+          if-no-files-found: error
+          retention-days: 30
+
+  publish:
+    needs: compare
+    runs-on: ubuntu-24.04
+    environment: ram-test-release
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    steps:
+      - name: Download verified release payload
+        uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5.0.0
+        with:
+          name: verified-release-${{ github.run_id }}-${{ github.run_attempt }}
+          path: release-staging/verified-dist
+      - name: Package nested build evidence for release assets
+        run: |
+          source_epoch="$(awk -F= '$1 == "source_date_epoch" { print $2 }' release-staging/verified-dist/BUILD-MANIFEST.txt)"
+          tar --sort=name --owner=0 --group=0 --numeric-owner --mtime="@$source_epoch" \
+            -C release-staging/verified-dist -cf - EVIDENCE | gzip -9n > release-staging/verified-dist/BUILD-EVIDENCE.tar.gz
+          (cd release-staging/verified-dist && sha256sum BUILD-EVIDENCE.tar.gz >> SHA256SUMS && sort -o SHA256SUMS SHA256SUMS && sha256sum -c SHA256SUMS >/dev/null)
+      - name: Attest firmware
+        id: firmware_attestation
+        uses: actions/attest-build-provenance@96278af6caaf10aea03fd8d33a09a777ca52d62f # v3.2.0
+        with:
+          subject-path: release-staging/verified-dist/openwrt-qualcommax-ipq807x-xiaomi_ax9000_single_ubi-initramfs-uImage.itb
+      - name: Attest SBOM
+        id: sbom_attestation
+        uses: actions/attest-build-provenance@96278af6caaf10aea03fd8d33a09a777ca52d62f # v3.2.0
+        with:
+          subject-path: release-staging/verified-dist/openwrt-qualcommax-ipq807x-xiaomi_ax9000_single_ubi.bom.cdx.json
+      - name: Attest checksums
+        id: checksums_attestation
+        uses: actions/attest-build-provenance@96278af6caaf10aea03fd8d33a09a777ca52d62f # v3.2.0
+        with:
+          subject-path: release-staging/verified-dist/SHA256SUMS
+      - name: Attach offline attestation bundles
+        run: |
+          cp '${{ steps.firmware_attestation.outputs.bundle-path }}' release-staging/verified-dist/firmware.provenance.bundle.json
+          cp '${{ steps.sbom_attestation.outputs.bundle-path }}' release-staging/verified-dist/sbom.provenance.bundle.json
+          cp '${{ steps.checksums_attestation.outputs.bundle-path }}' release-staging/verified-dist/checksums.provenance.bundle.json
+      - name: Create, verify, and publish prerelease
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release create "$GITHUB_REF_NAME" dist/* \
+          remote_type="$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$GITHUB_REF_NAME" --jq '.object.type')"
+          remote_sha="$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$GITHUB_REF_NAME" --jq '.object.sha')"
+          test "$remote_type" = commit
+          test "$remote_sha" = "$GITHUB_SHA"
+          gh release create "$GITHUB_REF_NAME" --verify-tag --draft --prerelease \
             --title "$GITHUB_REF_NAME" \
-            --prerelease \
-            --notes "NexaWrt AX9000 single-large-UBI-v1 initramfs RAM-boot candidate. This is not a flash image; backups, UART, bootloader visibility, and recovery testing remain mandatory."
+            --notes "Reproducible NexaWrt AX9000 initramfs RAM-boot candidate. NOT FOR FLASHING. Hardware, UART, recovery, and stress-test approval remain mandatory."
+          while IFS= read -r -d '' asset; do
+            gh release upload "$GITHUB_REF_NAME" "$asset"
+          done < <(find release-staging/verified-dist -maxdepth 1 -type f -print0 | sort -z)
+          expected="$(find release-staging/verified-dist -maxdepth 1 -type f -exec basename {} \; | sort)"
+          actual="$(gh api "repos/$GITHUB_REPOSITORY/releases/tags/$GITHUB_REF_NAME" --jq '.assets[].name' | sort)"
+          test "$actual" = "$expected"
+          gh release edit "$GITHUB_REF_NAME" --draft=false --prerelease

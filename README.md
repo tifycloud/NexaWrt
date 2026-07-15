@@ -1,3 +1,9 @@
+## 当前状态
+
+当前阶段是 **RAM-test release candidate**，不是可刷写固件。仓库已经加入双构建可复现性、SBOM、构建证据、GitHub attestation、内核 MTD 只读、运行时危险命令拒绝器和签名真机证据门禁；但在真实 AX9000 的 UART、恢复、回归和 24 小时压力证据完成前，仍不批准 RAM 启动，更不批准持久写入。
+
+完整门禁见 [docs/PRODUCTION-READINESS.md](docs/PRODUCTION-READINESS.md)。
+
 # NexaWrt
 
 **NexaWrt** 是一个以可重复构建、设备适配和审慎验证为目标的 OpenWrt 衍生项目。
@@ -29,7 +35,7 @@
 - 小米原厂/当前生产布局基线启动参数：`root=/dev/ubiblock0_1`（仅用于记录原系统，不是 NexaWrt RAM-test 参数）
 - NexaWrt initramfs RAM-test 必须使用的启动参数：`root=/dev/ram0`
 - NexaWrt RAM-test 内核命令行：**不得出现** `ubi.mtd=` 或 `/dev/ubiblock`
-- 持久 UBI：RAM-test 期间必须保持未附加、未挂载、未写入
+- 持久 UBI：RAM-test 期间必须保持未附加、未挂载、未写入；项目 DTS 还将 appsblenv、bdata、pstore、rootfs 与原有固件分区统一标记为内核只读
 - `official` flavor 不引入第三方 NSS 加速栈/ECM/NSS firmware（上游目标默认依赖的 `kmod-qca-nss-dp` 除外）
 - `nss` flavor 才可引入锁定的 NSS/ECM 栈和专有 firmware；必须保持 flavor 身份、来源与诊断记录
 - 当前阶段唯一可能允许的启动方式：**经单独批准后，通过 U-Boot 将 initramfs 加载到 RAM 并启动**
@@ -117,6 +123,7 @@ MTD 备份包含整个 UBI 区域，可能间接包含 `rootfs_data` 中的配�
 - [恢复与安全边界](docs/RECOVERY.md)
 - [initramfs 测试流程](docs/TESTING.md)
 - [实验性 NSS flavor、限制与诊断](docs/NSS.md)
+- [生产就绪门禁与真机证据格式](docs/PRODUCTION-READINESS.md)
 
 
 ## 构建 NexaWrt
@@ -166,15 +173,16 @@ macOS 自带的 Bash、Make 和默认大小写不敏感文件系统通常不满�
 必须能追溯到 flavor，镜像文件名必须能追溯到 profile。当前 profile 明确关闭 sysupgrade 和
 factory 产物，产物门检会拒绝任何可刷写镜像。
 
-现有 tag release workflow 保持默认 `official`，其 `dist/` 发布目录只包含：
-
-- `*-xiaomi_ax9000_single_ubi-initramfs-uImage.itb`：当前阶段 RAM 启动测试；
-- `DO-NOT-FLASH.txt`、构建清单、profile 信息和 SHA-256。
+`ram-test-v*` tag release workflow 保持默认 `official`，先执行两个无共享下载缓存的干净构建，
+再比较精确 ITB、package manifest、解析配置、buildinfo、输入摘要及规范化 CycloneDX SBOM。
+只有可复现门禁通过，受保护的 `ram-test-release` Environment 才能发布 prerelease，并为
+ITB、SBOM 和 `SHA256SUMS` 生成 GitHub provenance attestation。发布资产还包含构建证据归档、
+`BUILD-MANIFEST.txt`、`DO-NOT-FLASH.txt` 与 `REPRODUCIBILITY.json`。
 
 实验性 `nss` 只通过手动 build workflow 上传独立的 `dist-nss/` allowlist staging 目录，
-不会上传整个 OpenWrt target 输出，也不进入现有 tag release workflow。`dist-nss/` 只包含精确的
-AX9000 single_ubi initramfs ITB、允许的构建 metadata、NSS 来源清单、第三方 notice、
-`DO-NOT-FLASH.txt` 与 SHA-256；它不应被描述成正式发布。
+不会上传整个 OpenWrt target 输出，也不进入 tag release workflow。`dist-nss/` 只包含精确的
+AX9000 single_ubi initramfs ITB、package manifest、CycloneDX SBOM、允许的构建 metadata 与证据、
+NSS 第三方 notice、`DO-NOT-FLASH.txt` 和递归 SHA-256；它不应被描述成正式发布。
 
 > 当前阶段只生成和发布 initramfs 候选产物，并且只能设计为从 RAM 启动。候选镜像必须使用
 > `root=/dev/ram0`，不得包含 `ubi.mtd=` 或 `/dev/ubiblock`。若任何构建目录中出现
@@ -198,11 +206,14 @@ files/                   两个 flavor 共用、不含密码或订阅的基础 o
 files-nss/               仅 NSS flavor 应用的运行时 overlay
 manifests/               OpenWrt/feeds/layout 与 NSS 来源锁定信息
 patches/                 对两个锁定 source commit 都严格应用的 RAM-only 安全补丁
-scripts/backup-router.sh 只读备份
-scripts/nss-diagnostics.sh NSS/ECM 只读运行时诊断
-scripts/prepare.sh       获取并校验上游
-scripts/build.sh         Linux 完整构建
-scripts/validate.sh      静态、源码和产物门检
-tests/                   静态门检与只读备份保护测试
-.github/workflows/       手动构建及 tag 发布
+scripts/backup-router.sh               只读备份
+scripts/nss-diagnostics.sh             NSS/ECM 只读运行时诊断
+scripts/prepare.sh                     获取、锁定并校验上游
+scripts/build.sh                       Linux 干净构建
+scripts/collect-build-evidence.sh      构建输入、环境与日志证据
+scripts/compare-reproducible-builds.sh 双构建可复现性门禁
+scripts/verify-hardware-evidence.sh    精确产物绑定的真机证据门禁
+scripts/validate.sh                    静态、源码和产物门检
+tests/                                 fail-closed 策略回归测试
+.github/workflows/                      PR 构建与受保护 prerelease
 ```

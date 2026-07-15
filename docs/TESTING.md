@@ -138,6 +138,14 @@ root_count="$(printf '%s\n' "$cmdline" | tr ' ' '\n' | grep -cx 'root=/dev/ram0'
 [ "$root_count" -eq 1 ]
 ! printf '%s\n' "$cmdline" | tr ' ' '\n' | grep -Eq '^(ubi\.mtd=|root=/dev/ubiblock)'
 cat /proc/mtd
+# 只测试以写模式打开，不发送任何数据或擦除 ioctl。所有 MTD 分区都必须被内核拒绝写打开。
+for dev in /dev/mtd[0-9]*; do
+    [ -e "$dev" ] || continue
+    if : >"$dev" 2>/tmp/mtd-write-probe.err; then
+        echo "UNEXPECTED WRITABLE MTD: $dev" >&2
+        exit 1
+    fi
+done
 mount
 ls -la /sys/class/ubi 2>/dev/null || true
 for path in /sys/class/ubi/ubi[0-9]*; do
@@ -157,7 +165,7 @@ cat /sys/class/thermal/thermal_zone*/temp 2>/dev/null
 - 内核完整启动，无持续 panic、oops、UBI/I/O 错误；
 - `/proc/cmdline` 有且仅有一个 `root=/dev/ram0`；
 - `/proc/cmdline` 不包含 `ubi.mtd=` 或 `/dev/ubiblock`；
-- `rootfs` MTD 仍为 `0x0e800000`，但未被自动附加；
+- `rootfs` MTD 仍为 `0x0e800000`，但未被自动附加；全部 `/dev/mtd*` 的仅打开写模式探测都被内核拒绝；
 - `/sys/class/ubi` 下没有 `ubi0`、`ubi1` 等持久 UBI 设备条目；
 - `mount` 中没有来自 UBI、UBIFS、ubiblock 或原 `rootfs_data` 的挂载；
 - 以太网接口、交换端口和 MAC 地址映射；
@@ -170,9 +178,19 @@ cat /sys/class/thermal/thermal_zone*/temp 2>/dev/null
   单独记录每个 VLAN 和转发方向，不把简单连通误当成兼容；
 - 持久 UBI 始终未附加、未挂载、未写入。
 
-不要在 initramfs 中运行 `firstboot`、`jffs2reset`、`sysupgrade`、`mount_root`、`ubiattach`
-或任何可能初始化、附加、挂载、修改持久 UBI/overlay 的操作。不要主动附加或挂载原厂
-UBI volume，即使只计划只读访问也应停止并重新审查测试方案。
+先只验证危险命令拒绝器，不提供任何参数：
+
+```sh
+for command in sysupgrade factoryreset firstboot jffs2reset jffs2mark mount_root; do
+  "$command" >/tmp/"$command".out 2>&1
+  test "$?" -eq 74 || { echo "guard failed: $command"; exit 1; }
+done
+```
+
+每个命令都必须退出 74，且不得出现 UBI 附加、挂载或 MTD 写入。随后仍不得在 initramfs 中
+以真实参数运行 `firstboot`、`jffs2reset`、`sysupgrade`、`mount_root`、`ubiattach` 或任何可能
+初始化、附加、挂载、修改持久 UBI/overlay 的操作。不要主动附加或挂载原厂 UBI volume，
+即使只计划只读访问也应停止并重新审查测试方案。
 
 ## 6. RAM 启动退出与回归
 
@@ -268,6 +286,7 @@ initramfs 启动：PASS / FAIL
 RAM-test 使用 root=/dev/ram0：PASS / FAIL
 命令行不含 ubi.mtd= 或 /dev/ubiblock：PASS / FAIL
 持久 UBI 未附加、未挂载、未写入：PASS / FAIL
+全部 MTD 分区内核只读且 raw write-open 探测被拒绝：PASS / FAIL
 生产布局回归一致：PASS / FAIL
 official 无第三方 NSS/ECM/firmware，或 nss 来源与组件清单匹配：PASS / FAIL
 NSS 基线三项均为 0（仅 nss）：PASS / FAIL / N/A

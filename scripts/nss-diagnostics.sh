@@ -42,7 +42,6 @@ uci_value() {
 }
 
 dump_module_parameters() {
-    pattern="$1"
     found=0
     for module_dir in /sys/module/*; do
         [ -d "$module_dir" ] || continue
@@ -51,21 +50,17 @@ dump_module_parameters() {
             *nss*|*NSS*|*ecm*|*ECM*) ;;
             *) continue ;;
         esac
-        case "$module" in
-            $pattern)
-                found=1
-                printf '\n--- module %s ---\n' "$module"
-                if [ -d "$module_dir/parameters" ]; then
-                    for parameter in "$module_dir"/parameters/*; do
-                        [ -r "$parameter" ] || continue
-                        printf '%s=' "${parameter##*/}"
-                        cat "$parameter" 2>/dev/null || printf '<unreadable>\n'
-                    done
-                else
-                    printf '<no readable parameters>\n'
-                fi
-                ;;
-        esac
+        found=1
+        printf '\n--- module %s ---\n' "$module"
+        if [ -d "$module_dir/parameters" ]; then
+            for parameter in "$module_dir"/parameters/*; do
+                [ -r "$parameter" ] || continue
+                printf '%s=' "${parameter##*/}"
+                cat "$parameter" 2>/dev/null || printf '<unreadable>\n'
+            done
+        else
+            printf '<no readable parameters>\n'
+        fi
     done
     [ "$found" -eq 1 ] || printf '<no matching loaded modules>\n'
 }
@@ -111,7 +106,7 @@ else
     printf '<proc modules unavailable>\n'
 fi
 printf '\nNSS/ECM module parameters:\n'
-dump_module_parameters '*'
+dump_module_parameters
 
 section 'ECM and NSS debug status'
 for debug_dir in \

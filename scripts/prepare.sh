@@ -7,6 +7,13 @@ source "$ROOT_DIR/manifests/upstream.lock"
 NEXAWRT_FLAVOR="${NEXAWRT_FLAVOR:-official}"
 WITH_FEEDS=1
 CLEAN=0
+NSS_PACKAGES_SOURCE_PATCH="$ROOT_DIR/patches/nss/001-pin-codelinaro-source-archives.patch"
+
+# Do not inherit an unreviewed user/global Git proxy. A caller that needs one
+# must provide it explicitly through NEXAWRT_GIT_HTTP_PROXY or HTTPS_PROXY.
+export GIT_CONFIG_COUNT=1
+export GIT_CONFIG_KEY_0=http.proxy
+export GIT_CONFIG_VALUE_0="${NEXAWRT_GIT_HTTP_PROXY:-${HTTPS_PROXY:-${https_proxy:-}}}"
 
 case "$NEXAWRT_FLAVOR" in
   official)
@@ -114,12 +121,20 @@ top_level_names() {
 }
 
 feed_top_level_matches_locks() {
-  local expected actual feed entry
+  local expected actual feed entry base_link resolved
 
   [[ -d "$WORK_DIR/feeds" ]] || return 1
   expected="$(expected_feed_names | LC_ALL=C sort)"
-  actual="$(top_level_names "$WORK_DIR/feeds")"
+  actual="$(find "$WORK_DIR/feeds" -mindepth 1 -maxdepth 1 ! -name base -exec basename {} \; | LC_ALL=C sort)"
   [[ "$actual" == "$expected" ]] || return 1
+
+  base_link="$WORK_DIR/feeds/base"
+  if [[ -e "$base_link" || -L "$base_link" ]]; then
+    [[ -L "$base_link" && "$(readlink "$base_link")" == ../package ]] || return 1
+    resolved="$(cd -P "$base_link" 2>/dev/null && pwd -P)" || return 1
+    [[ "$resolved" == "$(cd -P "$WORK_DIR/package" && pwd -P)" ]] || return 1
+  fi
+
   while IFS= read -r feed; do
     [[ -n "$feed" ]] || continue
     entry="$WORK_DIR/feeds/$feed"
@@ -184,14 +199,22 @@ feed_checkout_is_clean() {
     return 1
   fi
 
-  git -C "$checkout" diff-files --quiet --ignore-submodules -- || {
-    echo "feed checkout $feed is not clean" >&2
-    return 1
-  }
   git -C "$checkout" diff-index --quiet --cached HEAD -- || {
-    echo "feed checkout $feed is not clean" >&2
+    echo "feed checkout $feed has staged changes" >&2
     return 1
   }
+  if [[ "$NEXAWRT_FLAVOR" == nss && "$feed" == "$NSS_PACKAGES_FEED" ]]; then
+    [[ -f "$NSS_PACKAGES_SOURCE_PATCH" ]] || return 1
+    [[ "$(git -C "$checkout" diff --binary --no-ext-diff HEAD --)" ==       "$(cat "$NSS_PACKAGES_SOURCE_PATCH")" ]] || {
+      echo "feed checkout $feed does not contain the exact NexaWrt source archive patch" >&2
+      return 1
+    }
+  else
+    git -C "$checkout" diff-files --quiet --ignore-submodules -- || {
+      echo "feed checkout $feed is not clean" >&2
+      return 1
+    }
+  fi
   untracked="$(git -C "$checkout" ls-files --others --exclude-standard)" || return 1
   if [[ -n "$untracked" ]]; then
     echo "feed checkout $feed is not clean" >&2
@@ -258,6 +281,68 @@ remove_generated_feed_metadata() {
 
 reset_feed_checkouts() {
   rm -rf "$WORK_DIR/feeds" "$WORK_DIR/package/feeds" "$WORK_DIR/.nexawrt-feeds-state"
+}
+
+reset_one_feed_checkout() {
+  local feed="$1"
+
+  rm -rf \
+    "$WORK_DIR/feeds/$feed" \
+    "$WORK_DIR/feeds/$feed.tmp" \
+    "$WORK_DIR/feeds/$feed.index" \
+    "$WORK_DIR/feeds/$feed.targetindex" \
+    "$WORK_DIR/package/feeds/$feed"
+}
+
+feed_lock_values() {
+  local wanted="$1"
+  local feed expected_repo revision
+
+  while read -r feed expected_repo revision; do
+    [[ -n "$feed" && "${feed:0:1}" != '#' ]] || continue
+    if [[ "$feed" == "$wanted" ]]; then
+      printf '%s\t%s\n' "$expected_repo" "$revision"
+      return 0
+    fi
+  done < "$ROOT_DIR/manifests/feeds.lock"
+
+  if [[ "$NEXAWRT_FLAVOR" == nss && "$wanted" == "$NSS_PACKAGES_FEED" ]]; then
+    printf '%s\t%s\n' "$NSS_PACKAGES_REPO" "$NSS_PACKAGES_COMMIT"
+    return 0
+  fi
+  if [[ "$NEXAWRT_FLAVOR" == nss && "$wanted" == "$NSS_SQM_FEED" ]]; then
+    printf '%s\t%s\n' "$NSS_SQM_REPO" "$NSS_SQM_COMMIT"
+    return 0
+  fi
+  return 1
+}
+
+update_one_pinned_feed() {
+  local feed="$1"
+  local expected_repo revision checkout remote_urls fetched_head attempt
+
+  IFS=$'\t' read -r expected_repo revision < <(feed_lock_values "$feed") || {
+    echo "No lock entry for feed $feed" >&2
+    return 1
+  }
+  checkout="$WORK_DIR/feeds/$feed"
+
+  for attempt in 1 2 3 4 5; do
+    reset_one_feed_checkout "$feed"
+    if GIT_TERMINAL_PROMPT=0 ./scripts/feeds update "$feed"; then
+      fetched_head="$(git -C "$checkout" rev-parse --verify HEAD 2>/dev/null || true)"
+      remote_urls="$(git -C "$checkout" remote get-url --all origin 2>/dev/null || true)"
+      if [[ "$fetched_head" == "$revision" && "$remote_urls" == "$expected_repo" ]]; then
+        return 0
+      fi
+      echo "Feed $feed checkout did not match its exact lock after update" >&2
+    fi
+    echo "Feed $feed update attempt $attempt failed; retrying only that feed..." >&2
+    sleep $((attempt * 3))
+  done
+
+  echo "Unable to update pinned feed $feed" >&2
+  return 1
 }
 
 write_feed_state() {
@@ -343,17 +428,21 @@ cp "$SEED_CONFIG" .config
 # feeds and package/feeds are rebuilt from the exact pins on every preparation.
 reset_feed_checkouts
 if ((WITH_FEEDS)); then
-  feeds_updated=0
-  for attempt in 1 2 3; do
-    if ./scripts/feeds update -a && feed_checkouts_match_locks; then
-      feeds_updated=1
-      break
-    fi
-    echo "Feed update attempt $attempt failed or left a non-exact checkout; retrying cleanly..." >&2
-    reset_feed_checkouts
-    sleep $((attempt * 3))
-  done
-  ((feeds_updated == 1)) || { echo "Unable to update pinned feeds" >&2; exit 1; }
+  # Update one exact-pinned feed at a time. A transient TLS failure must not
+  # discard already verified feeds and restart the entire network operation.
+  while IFS= read -r feed; do
+    [[ -n "$feed" ]] || continue
+    update_one_pinned_feed "$feed"
+  done < <(awk '$1 ~ /^src-git(-full)?$/ { print $2 }' feeds.conf.default)
+
+  if [[ "$NEXAWRT_FLAVOR" == nss ]]; then
+    git -C "feeds/$NSS_PACKAGES_FEED" apply --check "$NSS_PACKAGES_SOURCE_PATCH"
+    git -C "feeds/$NSS_PACKAGES_FEED" apply "$NSS_PACKAGES_SOURCE_PATCH"
+  fi
+  feed_checkouts_match_locks || {
+    echo "A pinned feed changed before installation" >&2
+    exit 1
+  }
   ./scripts/feeds install -a
   # Feed indexing may normalize .config while feed symbols are not yet visible.
   # Restore the locked seed after all packages are installed, then resolve it.
