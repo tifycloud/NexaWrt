@@ -14,6 +14,8 @@ fail() { echo "test_nss_artifact_policy: $*" >&2; exit 1; }
 install_harness_scripts() {
   mkdir -p "$harness/scripts" "$harness/manifests" "$harness/files-nss/usr/share/licenses/nss-firmware"
   cp "$SOURCE_STAGE_SCRIPT" "$harness/scripts/stage-nss-artifact.sh"
+  cp "$ROOT_DIR/scripts/sanitize-git-environment.sh" "$harness/scripts/sanitize-git-environment.sh"
+  cp "$ROOT_DIR/scripts/lock-file-policy.sh" "$harness/scripts/lock-file-policy.sh"
   printf 'third-party notice\n' > "$harness/THIRD_PARTY_NOTICES.md"
   printf 'firmware license\n' > "$harness/files-nss/usr/share/licenses/nss-firmware/LICENSE.md"
   cat > "$harness/scripts/validate.sh" <<'VALIDATE'
@@ -74,8 +76,10 @@ new_fixture() {
 NSS_OPENWRT_REPO="https://github.com/qosmio/openwrt-ipq.git"
 NSS_OPENWRT_BRANCH="fixture"
 NSS_OPENWRT_COMMIT="$locked_commit"
+NSS_PACKAGES_FEED="nss_packages"
 NSS_PACKAGES_REPO="https://github.com/qosmio/nss-packages.git"
 NSS_PACKAGES_COMMIT="1111111111111111111111111111111111111111"
+NSS_SQM_FEED="sqm_scripts_nss"
 NSS_SQM_REPO="https://github.com/qosmio/sqm-scripts-nss.git"
 NSS_SQM_COMMIT="2222222222222222222222222222222222222222"
 LOCK

@@ -13,3 +13,4 @@ ax9000-backup-*/
 # Hardware evidence and dumps may contain MAC addresses, serials, logs, and secrets.
 hardware-evidence/
 ax9000-hardware-evidence-*/
+release-staging/

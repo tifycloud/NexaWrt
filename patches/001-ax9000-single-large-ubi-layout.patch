@@ -113,7 +113,7 @@ index 75af3d0..46fb3b0 100644
 +	SUPPORTED_DEVICES := xiaomi,ax9000
 +	DEVICE_COMPAT_VERSION := 2.0
 +	DEVICE_COMPAT_MESSAGE := NexaWrt AX9000 RAM-test profile; persistent upgrade is unsupported
-+	DEVICE_PACKAGES += -uboot-envtools -ubi-utils -mtd
++	DEVICE_PACKAGES += -ubi-utils -mtd
 +	IMAGES :=
 +	ARTIFACTS :=
 +endef

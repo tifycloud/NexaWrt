@@ -2,7 +2,13 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
+# shellcheck source=sanitize-git-environment.sh
+source "$ROOT_DIR/scripts/sanitize-git-environment.sh"
+nexawrt_sanitize_git_environment
+# shellcheck source=lock-file-policy.sh
+source "$ROOT_DIR/scripts/lock-file-policy.sh"
 # shellcheck source=../manifests/upstream.lock
+nexawrt_validate_lock_file "$ROOT_DIR/manifests/upstream.lock" upstream
 source "$ROOT_DIR/manifests/upstream.lock"
 NEXAWRT_FLAVOR="${NEXAWRT_FLAVOR:-official}"
 [[ "$NEXAWRT_FLAVOR" == official ]] || { echo "Refusing release staging for flavor: $NEXAWRT_FLAVOR" >&2; exit 1; }

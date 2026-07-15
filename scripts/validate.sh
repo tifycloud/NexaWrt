@@ -1,27 +1,38 @@
 #!/usr/bin/env bash
 set -euo pipefail
-
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# shellcheck source=sanitize-git-environment.sh
+source "$ROOT_DIR/scripts/sanitize-git-environment.sh"
+nexawrt_sanitize_git_environment
+# shellcheck source=git-metadata-policy.sh
+source "$ROOT_DIR/scripts/git-metadata-policy.sh"
+# shellcheck source=lock-file-policy.sh
+source "$ROOT_DIR/scripts/lock-file-policy.sh"
 # shellcheck source=../manifests/upstream.lock
+nexawrt_validate_lock_file "$ROOT_DIR/manifests/upstream.lock" upstream
 source "$ROOT_DIR/manifests/upstream.lock"
+KERNEL_BUILD_IDENTITY_CHECKER="$ROOT_DIR/scripts/check-kernel-build-identity.sh"
 NEXAWRT_FLAVOR="${NEXAWRT_FLAVOR:-official}"
 SOURCE_DIR=""
 CHECK_ARTIFACTS=0
 FEED_POLICY_ONLY=0
+REVISION_POLICY_ONLY=0
 NSS_PACKAGES_SOURCE_PATCH="$ROOT_DIR/patches/nss/001-pin-codelinaro-source-archives.patch"
 
 case "$NEXAWRT_FLAVOR" in
   official)
     EXPECTED_SOURCE_REPO="${OPENWRT_REPO_OVERRIDE:-$OPENWRT_REPO}"
     EXPECTED_SOURCE_COMMIT="$OPENWRT_COMMIT"
+    EXPECTED_OPENWRT_REVISION="r0-${EXPECTED_SOURCE_COMMIT:0:8}"
     SEED_CONFIG="$ROOT_DIR/configs/ax9000-single-ubi.config"
     ;;
   nss)
-    # Keep official validation independent from the experimental NSS lock.
     # shellcheck source=../manifests/nss.lock
+    nexawrt_validate_lock_file "$ROOT_DIR/manifests/nss.lock" nss
     source "$ROOT_DIR/manifests/nss.lock"
     EXPECTED_SOURCE_REPO="${OPENWRT_REPO_OVERRIDE:-$NSS_OPENWRT_REPO}"
     EXPECTED_SOURCE_COMMIT="$NSS_OPENWRT_COMMIT"
+    EXPECTED_OPENWRT_REVISION="r0-${EXPECTED_SOURCE_COMMIT:0:8}"
     SEED_CONFIG="$ROOT_DIR/configs/ax9000-single-ubi-nss.config"
     ;;
   *)
@@ -31,7 +42,7 @@ case "$NEXAWRT_FLAVOR" in
 esac
 
 usage() {
-  echo "Usage: NEXAWRT_FLAVOR=official|nss $0 [--source PATH] [--artifacts] [--feed-policy-only]" >&2
+  echo "Usage: NEXAWRT_FLAVOR=official|nss $0 [--source PATH] [--artifacts] [--feed-policy-only] [--revision-policy-only]" >&2
 }
 
 while (($#)); do
@@ -39,6 +50,7 @@ while (($#)); do
     --source) SOURCE_DIR="${2:?missing source path}"; shift ;;
     --artifacts) CHECK_ARTIFACTS=1 ;;
     --feed-policy-only) FEED_POLICY_ONLY=1 ;;
+    --revision-policy-only) REVISION_POLICY_ONLY=1 ;;
     -h|--help) usage; exit 0 ;;
     *) echo "Unknown option: $1" >&2; usage; exit 2 ;;
   esac
@@ -47,8 +59,45 @@ done
 
 fail() { echo "validation: $*" >&2; exit 1; }
 
+
+git_history_overrides_absent() {
+  nexawrt_git_metadata_is_safe "$1" "$2"
+}
+
+assert_openwrt_revision_file() {
+  local source="$1"
+  local revision_file="$source/version"
+
+  [[ -f "$revision_file" && ! -L "$revision_file" ]] ||
+    fail "OpenWrt source version is missing or is not a non-symlink regular file"
+  cmp -s -- "$revision_file" <(printf '%s\n' "$EXPECTED_OPENWRT_REVISION") ||
+    fail "OpenWrt source version must be exactly one line: $EXPECTED_OPENWRT_REVISION"
+}
+
 patch_added_lines() {
   sed -n -e '/^+++ /d' -e 's/^+//p' "$1"
+}
+
+patch_removed_lines() {
+  sed -n -e '/^--- /d' -e 's/^-//p' "$1"
+}
+
+assert_uboot_defaults_read_only() {
+  local defaults_file="$1"
+  local description="$2"
+
+  [[ -f "$defaults_file" && ! -L "$defaults_file" ]] ||
+    fail "$description is missing or is not a regular file"
+  grep -Fq 'xiaomi,ax9000' "$defaults_file" ||
+    fail "$description lost the AX9000 target mapping"
+  grep -Fq 'ubootenv_add_mtd "0:appsblenv"' "$defaults_file" ||
+    fail "$description does not configure read access to AX9000 appsblenv"
+  if grep -Eq '(^|[;&|()[:space:]])(fw_setenv|fw_setsys|fw_loadenv|saveenv|mtd|ubiformat|ubiupdatevol|nandwrite|flash_erase|flash_eraseall|flashcp)([;&|()[:space:]]|$)' "$defaults_file"; then
+    fail "$description invokes an environment or flash write tool"
+  fi
+  if grep -Eq '(^|[[:space:]])(>|>>)[[:space:]]*/dev/(mtd|ubi|ubiblock)|(^|[[:space:]])dd([[:space:]].*)?[[:space:]]of=/dev/(mtd|ubi|ubiblock)' "$defaults_file"; then
+    fail "$description writes directly to a persistent flash device"
+  fi
 }
 
 assert_patch_has_context() {
@@ -330,15 +379,22 @@ assert_feed_checkout() {
   local revision="$3"
   local expected_repo="$4"
   local checkout="$source/feeds/$feed"
-  local remote_urls
+  local remote_urls remote_status
 
-  [[ -d "$checkout/.git" ]] || fail "feed checkout missing Git metadata: $feed"
-  [[ "$(git -C "$checkout" rev-parse --verify HEAD 2>/dev/null)" == "$revision" ]] ||
+  [[ -d "$checkout/.git" && ! -L "$checkout/.git" ]] || fail "feed checkout missing Git metadata: $feed"
+  git_history_overrides_absent "$checkout" "feed checkout $feed" || exit 1
+  [[ "$(git -C "$checkout" rev-parse --verify 'HEAD^{commit}' 2>/dev/null)" == "$revision" ]] ||
     fail "feed checkout $feed is not at $revision"
-  remote_urls="$(git -C "$checkout" remote get-url --all origin 2>/dev/null)" ||
+  remote_urls="$(git -C "$checkout" config --get-all remote.origin.url 2>/dev/null)" ||
     fail "feed checkout $feed has no origin remote"
   [[ "$remote_urls" == "$expected_repo" ]] ||
     fail "feed checkout $feed uses an unexpected origin"
+  if git -C "$checkout" config --get-all remote.origin.pushurl >/dev/null 2>&1; then
+    fail "feed checkout $feed has a forbidden pushurl"
+  else
+    remote_status=$?
+  fi
+  [[ "$remote_status" == 1 ]] || fail "feed checkout $feed pushurl state is unreadable"
   assert_feed_checkout_clean "$feed" "$checkout"
 }
 
@@ -479,6 +535,12 @@ assert_common_config() {
   local selected_targets=()
   local package
 
+  [[ -x "$KERNEL_BUILD_IDENTITY_CHECKER" ]] ||
+    fail "kernel build identity checker is missing or not executable"
+  "$KERNEL_BUILD_IDENTITY_CHECKER" \
+    "$config" "$EXPECTED_SOURCE_COMMIT" "$description" ||
+    fail "$description has a non-deterministic kernel build identity"
+
   while IFS= read -r target; do
     selected_targets+=("$target")
   done < <(grep -E '^CONFIG_TARGET_.*_DEVICE_.*=y$' "$config" || true)
@@ -500,8 +562,10 @@ assert_common_config() {
       fail "$description lost required package: $package"
   done
 
-  if grep -Eq '^CONFIG_PACKAGE_(mtd|uboot-envtools|ubi-utils)=[ym]$' "$config"; then
-    fail "$description enabled a persistent flash/environment tool"
+  grep -Fq 'CONFIG_PACKAGE_uboot-envtools=y' "$config" ||
+    fail "$description lost the read-only fw_printenv/fw_printsys package"
+  if grep -Eq '^CONFIG_PACKAGE_(mtd|ubi-utils)=[ym]$' "$config"; then
+    fail "$description enabled a persistent flash/UBI tool"
   fi
   for command in sysupgrade firstboot jffs2reset jffs2mark factoryreset mount_root; do
     guard="$ROOT_DIR/files/sbin/$command"
@@ -574,6 +638,22 @@ fi
 [[ "$ROOTFS_MTD_OFFSET_HEX" == 0x01180000 ]] || fail "unexpected rootfs offset lock"
 [[ "$ROOTFS_MTD_SIZE_HEX" == 0x0e800000 ]] || fail "unexpected rootfs size lock"
 
+if [[ -n "$SOURCE_DIR" && ( -e "$SOURCE_DIR/.git" || -L "$SOURCE_DIR/.git" ) ]]; then
+  git_history_overrides_absent "$SOURCE_DIR" "$NEXAWRT_FLAVOR source checkout" || exit 1
+fi
+
+if ((REVISION_POLICY_ONLY)); then
+  [[ -n "$SOURCE_DIR" ]] || fail "--revision-policy-only requires --source"
+  assert_openwrt_revision_file "$SOURCE_DIR"
+  assert_flavor_config "$SEED_CONFIG" "$NEXAWRT_FLAVOR seed config"
+  resolved_config="$SOURCE_DIR/.config"
+  [[ -f "$resolved_config" && ! -L "$resolved_config" ]] ||
+    fail "$NEXAWRT_FLAVOR resolved config is missing or is not a regular file"
+  assert_flavor_config "$resolved_config" "$NEXAWRT_FLAVOR resolved config"
+  echo "OpenWrt revision policy validation ($NEXAWRT_FLAVOR): OK"
+  exit 0
+fi
+
 if ((FEED_POLICY_ONLY)); then
   [[ -n "$SOURCE_DIR" ]] || fail "--feed-policy-only requires --source"
   validate_feed_policy "$SOURCE_DIR"
@@ -583,9 +663,11 @@ fi
 
 patch_001="$ROOT_DIR/patches/001-ax9000-single-large-ubi-layout.patch"
 patch_002="$ROOT_DIR/patches/002-ax9000-block-persistent-upgrade.patch"
+patch_003="$ROOT_DIR/patches/003-uboot-envtools-read-only.patch"
 
 assert_patch_has_context "$patch_001"
 assert_patch_has_context "$patch_002"
+assert_patch_has_context "$patch_003"
 if [[ "$NEXAWRT_FLAVOR" == nss ]]; then
   [[ -f "$NSS_PACKAGES_SOURCE_PATCH" ]] || fail "NSS source archive patch is missing"
   assert_patch_has_context "$NSS_PACKAGES_SOURCE_PATCH"
@@ -613,8 +695,12 @@ grep -Fq 'bootargs-override = "root=/dev/ram0";' <<<"$patch_001_added" ||
 if grep -Eq 'ubi\.mtd=|root=/dev/ubiblock' <<<"$patch_001_added"; then
   fail "001 patch adds a persistent UBI root command line"
 fi
-grep -Fq $'DEVICE_PACKAGES += -uboot-envtools -ubi-utils -mtd' <<<"$patch_001_added" ||
-  fail "custom AX9000 profile does not remove dangerous packages"
+[[ "$(grep -Ec '^[[:space:]]*DEVICE_PACKAGES \+= -ubi-utils -mtd[[:space:]]*$' <<<"$patch_001_added")" == 1 &&
+   "$(grep -Ec '^[[:space:]]*DEVICE_PACKAGES[[:space:]]*\+=' <<<"$patch_001_added")" == 1 ]] ||
+  fail "custom AX9000 profile must exclude exactly ubi-utils and mtd"
+if grep -Eq '^[[:space:]]*DEVICE_PACKAGES .*-[[:space:]]*uboot-envtools([[:space:]]|$)|(^|[[:space:]])-uboot-envtools([[:space:]]|$)' <<<"$patch_001_added"; then
+  fail "custom AX9000 profile must not exclude uboot-envtools via merge_packages"
+fi
 readonly_additions="$(grep -Fxc $'				read-only;' <<<"$patch_001_added" || true)"
 ((readonly_additions >= 4)) ||
   fail "project patch must make appsblenv, bdata, pstore, and rootfs MTD partitions read-only"
@@ -634,6 +720,39 @@ if grep -Eq '(^|[^[:alnum:]_])(nand_do_upgrade|fw_setenv|ubiformat)([^[:alnum:]_
   fail "002 patch adds a dangerous persistent-upgrade command"
 fi
 
+patch_003_removed="$(patch_removed_lines "$patch_003")"
+for removed_entry in \
+  '$(LN) fw_printenv $(1)/usr/sbin/fw_setenv' \
+  '$(INSTALL_BIN) ./uboot-envtools/files/fw_setsys $(1)/usr/sbin' \
+  '$(INSTALL_BIN) ./uboot-envtools/files/fw_loadenv $(1)/usr/sbin' \
+  '$(INSTALL_DATA) ./uboot-envtools/files/fw_defaults $(1)/etc/board.d/05_fw_defaults'; do
+  grep -Fq "$removed_entry" <<<"$patch_003_removed" ||
+    fail "003 patch does not remove U-Boot environment write entry: $removed_entry"
+done
+grep -Fq '$(INSTALL_BIN) $(PKG_BUILD_DIR)/tools/env/fw_printenv $(1)/usr/sbin' "$patch_003" ||
+  fail "003 patch lost the read-only fw_printenv install context"
+grep -Fq '$(INSTALL_BIN) ./uboot-envtools/files/fw_printsys $(1)/usr/sbin' "$patch_003" ||
+  fail "003 patch lost the read-only fw_printsys install context"
+if grep -Fq '30_uboot-envtools' <<<"$patch_003_removed"; then
+  fail "003 patch removes the target-specific read configuration needed by fw_printenv"
+fi
+patch_003_added="$(patch_added_lines "$patch_003")"
+if grep -Eq 'fw_(setenv|setsys|loadenv)|fw_defaults|05_fw_defaults' <<<"$patch_003_added"; then
+  fail "003 patch adds a U-Boot environment write entry"
+fi
+
+for deterministic_kernel_identity in \
+  'export KBUILD_BUILD_USER=nexawrt' \
+  'export KBUILD_BUILD_HOST=builder' \
+  'export KBUILD_BUILD_VERSION=0'; do
+  [[ "$(grep -Fxc "$deterministic_kernel_identity" "$ROOT_DIR/scripts/build.sh")" == 1 ]] ||
+    fail "deterministic kernel build identity is missing or duplicated: $deterministic_kernel_identity"
+done
+grep -Fq "grep -Eq '(^|[^[:alnum:]_])(gh[pousr]_" "$ROOT_DIR/scripts/collect-build-evidence.sh" ||
+  fail "build evidence GitHub token scan is missing or not case-sensitive"
+! grep -Fq "grep -Eiq '(^|[^[:alnum:]_])(gh[pousr]_" "$ROOT_DIR/scripts/collect-build-evidence.sh" ||
+  fail "build evidence GitHub token scan must remain case-sensitive"
+
 credential_scan_paths=(
   "$ROOT_DIR/.github"
   "$ROOT_DIR/configs"
@@ -644,13 +763,34 @@ credential_scan_paths=(
   "$ROOT_DIR/patches"
   "$ROOT_DIR/scripts/backup-router.sh"
   "$ROOT_DIR/scripts/build.sh"
+  "$ROOT_DIR/scripts/check-kernel-build-identity.sh"
   "$ROOT_DIR/scripts/collect-build-evidence.sh"
+  "$ROOT_DIR/scripts/collect-production-state.sh"
+  "$ROOT_DIR/scripts/collect-runtime-evidence.sh"
+  "$ROOT_DIR/scripts/create-hardware-session.sh"
   "$ROOT_DIR/scripts/compare-reproducible-builds.sh"
+  "$ROOT_DIR/scripts/ax9000-runtime-probe.sh"
+  "$ROOT_DIR/scripts/run-ax9000-stress-gate.sh"
   "$ROOT_DIR/scripts/verify-hardware-evidence.sh"
+  "$ROOT_DIR/scripts/verify-post-reboot-state.sh"
+  "$ROOT_DIR/scripts/verify-stress-evidence.sh"
   "$ROOT_DIR/scripts/prepare.sh"
   "$ROOT_DIR/scripts/release.sh"
+  "$ROOT_DIR/scripts/list-build-inputs.sh"
+  "$ROOT_DIR/scripts/sanitize-git-environment.sh"
   "$ROOT_DIR/tests/test_backup_guards.sh"
+  "$ROOT_DIR/tests/test_git_environment_policy.sh"
+  "$ROOT_DIR/tests/test_build_evidence_policy.sh"
+  "$ROOT_DIR/tests/test_kernel_build_identity_policy.sh"
+  "$ROOT_DIR/tests/test_openwrt_revision_policy.sh"
+  "$ROOT_DIR/tests/test_openwrt_defconfig_version.sh"
+  "$ROOT_DIR/tests/test_create_hardware_session.sh"
   "$ROOT_DIR/tests/test_hardware_gate.sh"
+  "$ROOT_DIR/tests/test_evidence_collectors.sh"
+  "$ROOT_DIR/tests/test_post_reboot_gate.sh"
+  "$ROOT_DIR/tests/test_readonly_envtools_policy.sh"
+  "$ROOT_DIR/tests/test_runtime_probe.sh"
+  "$ROOT_DIR/tests/test_stress_gate.sh"
   "$ROOT_DIR/tests/test_release_policy.sh"
   "$ROOT_DIR/tests/test_reproducibility_policy.sh"
   "$ROOT_DIR/tests/test_runtime_guards.sh"
@@ -691,18 +831,29 @@ for script in "$ROOT_DIR"/scripts/*.sh "$ROOT_DIR"/tests/*.sh; do
 done
 
 if [[ -n "$SOURCE_DIR" ]]; then
-  [[ -d "$SOURCE_DIR/.git" ]] || fail "source is not a Git checkout: $SOURCE_DIR"
-  [[ "$(git -C "$SOURCE_DIR" rev-parse HEAD)" == "$EXPECTED_SOURCE_COMMIT" ]] ||
+  [[ -d "$SOURCE_DIR/.git" && ! -L "$SOURCE_DIR/.git" ]] || fail "source is not a safe Git checkout: $SOURCE_DIR"
+  git_history_overrides_absent "$SOURCE_DIR" "$NEXAWRT_FLAVOR source checkout" || exit 1
+  [[ "$(git -C "$SOURCE_DIR" rev-parse --verify 'HEAD^{commit}')" == "$EXPECTED_SOURCE_COMMIT" ]] ||
     fail "$NEXAWRT_FLAVOR source checkout is not at locked commit"
-  [[ "$(git -C "$SOURCE_DIR" remote get-url origin)" == "$EXPECTED_SOURCE_REPO" ]] ||
+  source_origin_urls="$(git -C "$SOURCE_DIR" config --get-all remote.origin.url 2>/dev/null)" ||
+    fail "$NEXAWRT_FLAVOR source checkout has no origin"
+  [[ "$source_origin_urls" == "$EXPECTED_SOURCE_REPO" ]] ||
     fail "$NEXAWRT_FLAVOR source checkout uses an unexpected origin"
+  if git -C "$SOURCE_DIR" config --get-all remote.origin.pushurl >/dev/null 2>&1; then
+    fail "$NEXAWRT_FLAVOR source checkout has a forbidden pushurl"
+  else
+    source_push_status=$?
+  fi
+  [[ "$source_push_status" == 1 ]] || fail "$NEXAWRT_FLAVOR source pushurl state is unreadable"
+  assert_openwrt_revision_file "$SOURCE_DIR"
 
   platform="$SOURCE_DIR/target/linux/qualcommax/ipq807x/base-files/lib/upgrade/platform.sh"
   dts="$SOURCE_DIR/target/linux/qualcommax/files/arch/arm64/boot/dts/qcom/ipq8072-ax9000.dts"
   image_mk="$SOURCE_DIR/target/linux/qualcommax/image/ipq807x.mk"
   base_files_mk="$SOURCE_DIR/package/base-files/Makefile"
   fstools_mk="$SOURCE_DIR/package/system/fstools/Makefile"
-  [[ -f "$platform" && -f "$dts" && -f "$image_mk" && -f "$base_files_mk" && -f "$fstools_mk" ]] ||
+  uboot_tools_mk="$SOURCE_DIR/package/boot/uboot-tools/Makefile"
+  [[ -f "$platform" && -f "$dts" && -f "$image_mk" && -f "$base_files_mk" && -f "$fstools_mk" && -f "$uboot_tools_mk" ]] ||
     fail "patched source files missing"
 
   sh -n "$platform"
@@ -758,8 +909,12 @@ PY
     in_profile && /^endef$/ { exit }
   ' "$image_mk")"
   [[ -n "$image_profile" ]] || fail "custom image profile missing"
-  grep -Fq 'DEVICE_PACKAGES += -uboot-envtools -ubi-utils -mtd' <<<"$image_profile" ||
-    fail "custom image profile does not remove dangerous packages"
+  [[ "$(grep -Ec '^[[:space:]]*DEVICE_PACKAGES \+= -ubi-utils -mtd[[:space:]]*$' <<<"$image_profile")" == 1 &&
+     "$(grep -Ec '^[[:space:]]*DEVICE_PACKAGES[[:space:]]*\+=' <<<"$image_profile")" == 1 ]] ||
+    fail "custom image profile must exclude exactly ubi-utils and mtd"
+  if grep -Eq '(^|[[:space:]])-uboot-envtools([[:space:]]|$)' <<<"$image_profile"; then
+    fail "custom image profile excludes uboot-envtools, so merge_packages would remove fw_printenv"
+  fi
   grep -Eq '^[[:space:]]*IMAGES :=[[:space:]]*$' <<<"$image_profile" ||
     fail "custom image profile does not clear IMAGES"
   grep -Eq '^[[:space:]]*ARTIFACTS :=[[:space:]]*$' <<<"$image_profile" ||
@@ -773,6 +928,25 @@ PY
   if grep -Fq 'NAND_SUPPORT:ubi-utils' "$base_files_mk" "$fstools_mk"; then
     fail "RAM-only source still forces the ubi-utils package"
   fi
+
+  uboot_envtools_install="$(awk '
+    /^define Package\/uboot-envtools\/install$/ { in_block=1 }
+    in_block { print }
+    in_block && /^endef$/ { exit }
+  ' "$uboot_tools_mk")"
+  [[ -n "$uboot_envtools_install" ]] || fail "patched uboot-envtools install block is missing"
+  grep -Fq 'fw_printenv $(1)/usr/sbin' <<<"$uboot_envtools_install" ||
+    fail "patched source lost fw_printenv"
+  grep -Fq 'fw_printsys $(1)/usr/sbin' <<<"$uboot_envtools_install" ||
+    fail "patched source lost fw_printsys"
+  grep -Fq '$(1)/etc/uci-defaults/30_uboot-envtools' <<<"$uboot_envtools_install" ||
+    fail "patched source lost the target-specific U-Boot read configuration"
+  if grep -Eq 'fw_(setenv|setsys|loadenv)|fw_defaults|05_fw_defaults|/etc/board.d' <<<"$uboot_envtools_install"; then
+    fail "patched uboot-envtools still installs an environment write entry"
+  fi
+  assert_uboot_defaults_read_only \
+    "$SOURCE_DIR/package/boot/uboot-tools/uboot-envtools/files/qualcommax_ipq807x" \
+    "target-specific 30_uboot-envtools source"
 
   validate_feed_policy "$SOURCE_DIR"
 
@@ -796,9 +970,10 @@ PY
     fail "official flavor contains the NSS-only runtime overlay"
   fi
 
-  if [[ -f "$SOURCE_DIR/.config" ]]; then
-    assert_flavor_config "$SOURCE_DIR/.config" "$NEXAWRT_FLAVOR resolved config"
-  fi
+  resolved_config="$SOURCE_DIR/.config"
+  [[ -f "$resolved_config" && ! -L "$resolved_config" ]] ||
+    fail "$NEXAWRT_FLAVOR resolved config is missing or is not a regular file"
+  assert_flavor_config "$resolved_config" "$NEXAWRT_FLAVOR resolved config"
 fi
 
 if ((CHECK_ARTIFACTS)); then
@@ -834,7 +1009,18 @@ PY
     cmp -s "$ROOT_DIR/files/sbin/$command" "$rootfs_dir/sbin/$command" ||
       fail "final rootfs runtime guard was overwritten: $command"
   done
-  for command in mtd flash_erase flash_eraseall flashcp nandwrite nandtest ubiattach ubidetach ubiformat ubimkvol ubirmvol ubirsvol ubirename ubiupdatevol fw_setenv; do
+  for reader in fw_printenv fw_printsys; do
+    [[ -x "$rootfs_dir/usr/sbin/$reader" ]] || fail "final rootfs lost read-only U-Boot environment reader: $reader"
+  done
+  actual_fw_tools="$(find "$rootfs_dir/usr/sbin" -mindepth 1 -maxdepth 1 \( -type f -o -type l \) -name 'fw_*' -exec basename {} \; | LC_ALL=C sort)"
+  [[ "$actual_fw_tools" == $'fw_printenv\nfw_printsys' ]] ||
+    fail "final rootfs U-Boot environment tool set is not read-only: ${actual_fw_tools:-empty}"
+  [[ ! -e "$rootfs_dir/etc/board.d/05_fw_defaults" ]] ||
+    fail "final rootfs contains the automatic U-Boot environment defaults writer"
+  assert_uboot_defaults_read_only \
+    "$rootfs_dir/etc/uci-defaults/30_uboot-envtools" \
+    "final rootfs 30_uboot-envtools"
+  for command in mtd flash_erase flash_eraseall flashcp nandwrite nandtest ubiattach ubidetach ubiformat ubimkvol ubirmvol ubirsvol ubirename ubiupdatevol fw_setenv fw_setsys fw_loadenv; do
     if find "$rootfs_dir" -type f -o -type l | grep -Eq "/${command//./\.}$"; then
       fail "final rootfs contains a persistent flash utility: $command"
     fi

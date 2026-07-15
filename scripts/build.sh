@@ -1,7 +1,11 @@
 #!/usr/bin/env bash
 set -euo pipefail
-
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# shellcheck source=sanitize-git-environment.sh
+source "$ROOT_DIR/scripts/sanitize-git-environment.sh"
+nexawrt_sanitize_git_environment
+# shellcheck source=git-metadata-policy.sh
+source "$ROOT_DIR/scripts/git-metadata-policy.sh"
 NEXAWRT_FLAVOR="${NEXAWRT_FLAVOR:-official}"
 case "$NEXAWRT_FLAVOR" in
   official)
@@ -21,6 +25,11 @@ WORK_DIR="${WORK_DIR:-$DEFAULT_WORK_DIR}"
 JOBS="${JOBS:-}"
 BUILD_LOG="${BUILD_LOG:-$DEFAULT_BUILD_LOG}"
 CLEAN_BUILD="${CLEAN_BUILD:-1}"
+
+
+git_history_overrides_absent() {
+  nexawrt_git_metadata_is_safe "$1" "$2"
+}
 
 canonicalize_output_path() {
   python3 - "$ROOT_DIR" "$1" "$2" <<'PY_CANONICAL'
@@ -99,9 +108,37 @@ if [[ -z "$JOBS" ]]; then
 fi
 
 NEXAWRT_FLAVOR="$NEXAWRT_FLAVOR" WORK_DIR="$WORK_DIR" "$ROOT_DIR/scripts/prepare.sh"
+git_history_overrides_absent "$WORK_DIR" "prepared OpenWrt source checkout" || exit 1
 cd "$WORK_DIR"
-SOURCE_DATE_EPOCH="$(git show -s --format=%ct HEAD)"
+SOURCE_COMMIT="$(git rev-parse --verify 'HEAD^{commit}')" || {
+  echo "Prepared OpenWrt source commit could not be resolved" >&2
+  exit 1
+}
+[[ "$SOURCE_COMMIT" =~ ^[0-9a-f]{40}$ ]] || {
+  echo "Prepared OpenWrt source commit is not a full object ID" >&2
+  exit 1
+}
+SOURCE_DATE_EPOCH="$(git show -s --format=%ct "$SOURCE_COMMIT")" || {
+  echo "Unable to derive SOURCE_DATE_EPOCH from the prepared source commit" >&2
+  exit 1
+}
+[[ "$SOURCE_DATE_EPOCH" =~ ^[0-9]+$ ]] || {
+  echo "Prepared source commit has an invalid SOURCE_DATE_EPOCH" >&2
+  exit 1
+}
 export SOURCE_DATE_EPOCH
+OPENWRT_REVISION="r0-${SOURCE_COMMIT:0:8}"
+[[ -f version && ! -L version ]] &&
+  cmp -s -- version <(printf '%s\n' "$OPENWRT_REVISION") || {
+  echo "Prepared OpenWrt revision seed is missing, unsafe, or stale" >&2
+  exit 1
+}
+# OpenWrt's resolved CONFIG_KERNEL_BUILD_USER/DOMAIN locks are authoritative.
+# Keep matching exports as defense for direct/ancillary kernel make paths, and
+# prevent KBUILD_BUILD_VERSION from auto-incrementing between clean builds.
+export KBUILD_BUILD_USER=nexawrt
+export KBUILD_BUILD_HOST=builder
+export KBUILD_BUILD_VERSION=0
 
 case "$CLEAN_BUILD" in
   1) rm -rf build_dir staging_dir tmp bin logs ;;
@@ -111,8 +148,9 @@ esac
 
 {
   printf 'NexaWrt build start\n'
-  printf 'flavor=%s\nsource_date_epoch=%s\njobs=%s\nclean_build=%s\n' \
-    "$NEXAWRT_FLAVOR" "$SOURCE_DATE_EPOCH" "$JOBS" "$CLEAN_BUILD"
+  printf 'flavor=%s\nsource_commit=%s\nopenwrt_revision=%s\nsource_date_epoch=%s\njobs=%s\nclean_build=%s\n' \
+    "$NEXAWRT_FLAVOR" "$SOURCE_COMMIT" "$OPENWRT_REVISION" \
+    "$SOURCE_DATE_EPOCH" "$JOBS" "$CLEAN_BUILD"
   uname -a
 } > "$BUILD_LOG"
 

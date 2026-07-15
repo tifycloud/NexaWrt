@@ -36,6 +36,7 @@
 - NexaWrt initramfs RAM-test 必须使用的启动参数：`root=/dev/ram0`
 - NexaWrt RAM-test 内核命令行：**不得出现** `ubi.mtd=` 或 `/dev/ubiblock`
 - 持久 UBI：RAM-test 期间必须保持未附加、未挂载、未写入；项目 DTS 还将 appsblenv、bdata、pstore、rootfs 与原有固件分区统一标记为内核只读
+- 两个 flavor 都启用裁剪后的只读 `uboot-envtools`：仅保留 `fw_printenv`、`fw_printsys` 与在 RAM/tmpfs 生成 AX9000 `appsblenv` 读取配置的 `30_uboot-envtools`；AX9000 profile 只能排除 `-ubi-utils -mtd`，不得出现 `-uboot-envtools`，否则 OpenWrt `merge_packages` 会覆盖 seed config 并把读工具移出镜像；仍禁止 `fw_setenv`、`fw_setsys`、`fw_loadenv` 和 `05_fw_defaults`
 - `official` flavor 不引入第三方 NSS 加速栈/ECM/NSS firmware（上游目标默认依赖的 `kmod-qca-nss-dp` 除外）
 - `nss` flavor 才可引入锁定的 NSS/ECM 栈和专有 firmware；必须保持 flavor 身份、来源与诊断记录
 - 当前阶段唯一可能允许的启动方式：**经单独批准后，通过 U-Boot 将 initramfs 加载到 RAM 并启动**
@@ -144,6 +145,15 @@ NSS Wi-Fi 限制和只读诊断方法见 [NSS 文档](docs/NSS.md)。两个 flav
 RAM-only 命令行覆盖、持久 MTD 只读标记、独立镜像身份和持久升级 fail-closed 门检；
 仓库安全补丁对 official 与 nss 两个锁定 source commit 都先校验再严格应用。
 
+`uboot-envtools` 不是被笼统禁用的包。两个 flavor 都需要它提供 `fw_printenv`，以只读取得
+`ethaddr` 并绑定真机证据。`patches/003-uboot-envtools-read-only.patch` 删除所有随包安装的环境
+写入口和 `05_fw_defaults`，但刻意保留 target-specific `30_uboot-envtools`；后者只在 initramfs
+RAM/tmpfs 中生成读取定位配置。源码门禁和最终 rootfs 门禁都会要求该脚本存在并扫描其内容，同时
+确保镜像内 `fw_*` 工具恰好只有 `fw_printenv`、`fw_printsys`。此外，AX9000 image profile 的
+`DEVICE_PACKAGES` 必须恰好为 `-ubi-utils -mtd`：不能加入 `-uboot-envtools`，因为 OpenWrt
+`merge_packages` 的显式负包会压过 `CONFIG_PACKAGE_uboot-envtools=y`。任何 `saveenv` 或 flash
+写入仍被禁止。
+
 先做不联网的静态检查：
 
 ```sh
@@ -173,16 +183,24 @@ macOS 自带的 Bash、Make 和默认大小写不敏感文件系统通常不满�
 必须能追溯到 flavor，镜像文件名必须能追溯到 profile。当前 profile 明确关闭 sysupgrade 和
 factory 产物，产物门检会拒绝任何可刷写镜像。
 
-`ram-test-v*` tag release workflow 保持默认 `official`，先执行两个无共享下载缓存的干净构建，
-再比较精确 ITB、package manifest、解析配置、buildinfo、输入摘要及规范化 CycloneDX SBOM。
-只有可复现门禁通过，受保护的 `ram-test-release` Environment 才能发布 prerelease，并为
-ITB、SBOM 和 `SHA256SUMS` 生成 GitHub provenance attestation。发布资产还包含构建证据归档、
-`BUILD-MANIFEST.txt`、`DO-NOT-FLASH.txt` 与 `REPRODUCIBILITY.json`。
+候选发布有两个互不重叠的 tag 家族：`ram-test-v*` 只对应 `official`，
+`ram-test-nss-v*` 只对应实验性 `nss`。preflight 会从严格受信任的 tag 名 fail-closed 派生
+flavor，不允许未知 tag 回退到默认构建。每个 flavor 都执行两个无共享下载缓存、使用独立
+flavor/replica `WORK_DIR`、构建日志和 staging 目录的干净构建，再把正确 flavor 传给比较器，
+比较精确 ITB、package manifest、解析配置、buildinfo、输入摘要及规范化 CycloneDX SBOM。
 
-实验性 `nss` 只通过手动 build workflow 上传独立的 `dist-nss/` allowlist staging 目录，
-不会上传整个 OpenWrt target 输出，也不进入 tag release workflow。`dist-nss/` 只包含精确的
-AX9000 single_ubi initramfs ITB、package manifest、CycloneDX SBOM、允许的构建 metadata 与证据、
-NSS 第三方 notice、`DO-NOT-FLASH.txt` 和递归 SHA-256；它不应被描述成正式发布。
+每个副本 job 上传后都生成 canonical producer descriptor，绑定 run、replica、artifact ID/name 和
+`SHA256SUMS` 摘要，并以 descriptor 作为 GitHub provenance attestation subject；compare job 从本次 workflow
+run 的 API 取得两个不同 artifact ID，离线验证两份 descriptor bundle 的仓库和 signer workflow，把外部
+producer identity 写入 schema-4 `REPRODUCIBILITY.json`，并将 descriptor 与 bundle 一同固化进 verified dist。
+后续复验只接受显式绝对路径且 SHA-256 已绑定的 GitHub CLI，不从通用 `PATH` 搜索 verifier。本地 `local-unattested` 比较结果只能预检，不能
+进入真机生产批准。只有可复现门禁通过，受保护的 `ram-test-release` Environment 才能发布 prerelease，
+并继续为 ITB、SBOM、最终 `SHA256SUMS` 和精确 verified-dist archive 生成 GitHub provenance attestation。
+Actions artifact 与 replica 路径包含 flavor，避免 official/NSS 候选混淆。发布资产还包含构建证据归档、
+`BUILD-MANIFEST.txt`、`DO-NOT-FLASH.txt` 与 `REPRODUCIBILITY.json`；NSS 候选另外包含第三方
+notice 和锁定 NSS firmware 的许可证副本。两条 tag 发布路径都只发布 AX9000 `single_ubi`
+initramfs RAM-boot 候选，不上传整个 OpenWrt target 输出，也不开放 sysupgrade/factory 或任何
+刷写路径。
 
 > 当前阶段只生成和发布 initramfs 候选产物，并且只能设计为从 RAM 启动。候选镜像必须使用
 > `root=/dev/ram0`，不得包含 `ubi.mtd=` 或 `/dev/ubiblock`。若任何构建目录中出现
@@ -205,14 +223,23 @@ configs/                 单设备、按 flavor 隔离的最小包配置
 files/                   两个 flavor 共用、不含密码或订阅的基础 overlay
 files-nss/               仅 NSS flavor 应用的运行时 overlay
 manifests/               OpenWrt/feeds/layout 与 NSS 来源锁定信息
-patches/                 对两个锁定 source commit 都严格应用的 RAM-only 安全补丁
+patches/                 RAM-only 安全补丁（含只读 uboot-envtools patch 003）
 scripts/backup-router.sh               只读备份
 scripts/nss-diagnostics.sh             NSS/ECM 只读运行时诊断
 scripts/prepare.sh                     获取、锁定并校验上游
 scripts/build.sh                       Linux 干净构建
+scripts/check-kernel-build-identity.sh Kconfig 构建身份与带产品前缀的 source-lock revision 门禁
+tests/test_openwrt_defconfig_version.sh 锁定 OpenWrt Kconfig defconfig 保留测试
 scripts/collect-build-evidence.sh      构建输入、环境与日志证据
 scripts/compare-reproducible-builds.sh 双构建可复现性门禁
-scripts/verify-hardware-evidence.sh    精确产物绑定的真机证据门禁
+scripts/create-hardware-session.sh     创建严格真机测试会话与临时 U-Boot 命令
+scripts/ax9000-runtime-probe.sh        真机 RAM-only/flavor 运行时探针
+scripts/collect-runtime-evidence.sh    从 RAM 系统安全采集运行时证据
+scripts/collect-production-state.sh    重启前后只读采集生产系统状态
+scripts/run-ax9000-stress-gate.sh      至少 24 小时双向吞吐/温度/内核压力门禁
+scripts/verify-post-reboot-state.sh    生产系统恢复状态原始对比
+scripts/verify-stress-evidence.sh      压力测试结构化证据复验
+scripts/verify-hardware-evidence.sh    精确产物绑定的真机证据与独立签名门禁
 scripts/validate.sh                    静态、源码和产物门检
 tests/                                 fail-closed 策略回归测试
 .github/workflows/                      PR 构建与受保护 prerelease

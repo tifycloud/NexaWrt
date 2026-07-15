@@ -35,7 +35,7 @@ NEXAWRT_FLAVOR=official "$POLICY_REPO/scripts/prepare.sh" --help >/dev/null
 printf 'this is deliberately not valid shell (\n' > "$POLICY_REPO/manifests/nss.lock"
 NEXAWRT_FLAVOR=official "$POLICY_REPO/scripts/validate.sh" >/dev/null
 NEXAWRT_FLAVOR=official "$POLICY_REPO/scripts/prepare.sh" --help >/dev/null
-expect_failure "NSS validation with malformed NSS lock" "syntax error" \
+expect_failure "NSS validation with malformed NSS lock" "lock file contains non-declarative syntax" \
   env NEXAWRT_FLAVOR=nss "$POLICY_REPO/scripts/validate.sh"
 mv "$TMP_DIR/nss.lock.good" "$POLICY_REPO/manifests/nss.lock"
 
@@ -199,14 +199,14 @@ git -C "$SOURCE/feeds/$first_feed" reset --hard -q HEAD
 
 git -C "$SOURCE/feeds/$first_feed" config core.sparseCheckout true
 expect_failure "sparse checkout feed state" \
-  "feed checkout $first_feed uses sparse checkout or a sparse index" \
+  "feed checkout $first_feed has forbidden Git local config: core.sparsecheckout" \
   env NEXAWRT_FLAVOR=official "$POLICY_REPO/scripts/validate.sh" \
   --source "$SOURCE" --feed-policy-only
 git -C "$SOURCE/feeds/$first_feed" config --unset core.sparseCheckout
 
 git -C "$SOURCE/feeds/$first_feed" config index.sparse true
 expect_failure "sparse index feed state" \
-  "feed checkout $first_feed uses sparse checkout or a sparse index" \
+  "feed checkout $first_feed has forbidden Git local config: index.sparse" \
   env NEXAWRT_FLAVOR=official "$POLICY_REPO/scripts/validate.sh" \
   --source "$SOURCE" --feed-policy-only
 git -C "$SOURCE/feeds/$first_feed" config --unset index.sparse

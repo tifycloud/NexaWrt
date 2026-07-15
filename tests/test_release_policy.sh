@@ -14,6 +14,8 @@ fail() { echo "test_release_policy: $*" >&2; exit 1; }
 install_harness_scripts() {
   mkdir -p "$harness/scripts" "$harness/manifests"
   cp "$SOURCE_STAGE_SCRIPT" "$harness/scripts/release.sh"
+  cp "$ROOT_DIR/scripts/sanitize-git-environment.sh" "$harness/scripts/sanitize-git-environment.sh"
+  cp "$ROOT_DIR/scripts/lock-file-policy.sh" "$harness/scripts/lock-file-policy.sh"
   cat > "$harness/scripts/validate.sh" <<'VALIDATE'
 #!/usr/bin/env bash
 set -euo pipefail
@@ -69,8 +71,9 @@ OPENWRT_REPO="https://git.openwrt.org/openwrt/openwrt.git"
 OPENWRT_TAG="fixture"
 OPENWRT_COMMIT="$locked_commit"
 LAYOUT_ID="fixture-layout"
-ROOTFS_MTD_OFFSET_HEX="0x1"
-ROOTFS_MTD_SIZE_HEX="0x2"
+ROOTFS_MTD_OFFSET_HEX="0x00000001"
+ROOTFS_MTD_SIZE_HEX="0x00000002"
+ROOTFS_MTD_ERASE_SIZE_HEX="0x00000001"
 LOCK
 }
 
