@@ -1,0 +1,10 @@
+#!/bin/sh
+
+uci -q batch <<'UCI'
+set system.@system[0].hostname='NexaWrt-AX9000'
+set network.lan.ipaddr='192.168.2.1'
+commit system
+commit network
+UCI
+
+exit 0

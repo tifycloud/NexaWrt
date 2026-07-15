@@ -1,0 +1,10 @@
+.work/
+build.log
+dist/*
+!dist/.gitkeep
+*.swp
+.DS_Store
+
+# Raw router backups can contain credentials and must never enter Git.
+ax9000-backup-*/
+.ax9000-backup-*.tmp.*/

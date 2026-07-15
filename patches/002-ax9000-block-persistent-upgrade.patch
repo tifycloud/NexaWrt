@@ -1,0 +1,61 @@
+diff --git a/target/linux/qualcommax/ipq807x/base-files/lib/upgrade/platform.sh b/target/linux/qualcommax/ipq807x/base-files/lib/upgrade/platform.sh
+index 1ddc73f..da3f628 100644
+--- a/target/linux/qualcommax/ipq807x/base-files/lib/upgrade/platform.sh
++++ b/target/linux/qualcommax/ipq807x/base-files/lib/upgrade/platform.sh
+@@ -4,6 +4,11 @@ REQUIRE_IMAGE_METADATA=1
+ RAMFS_COPY_BIN='fw_printenv fw_setenv head'
+ RAMFS_COPY_DATA='/etc/fw_env.config /var/lock/fw_printenv.lock'
+ 
++ax9000_persistent_upgrade_blocked() {
++	echo "NexaWrt AX9000 RAM-test image: persistent upgrade is disabled" >&2
++	return 1
++}
++
+ xiaomi_initramfs_prepare() {
+ 	# Wipe UBI if running initramfs
+ 	[ "$(rootfs_type)" = "tmpfs" ] || return 0
+@@ -147,7 +152,14 @@ linksys_mx_pre_upgrade() {
+ }
+ 
+ platform_check_image() {
+-	return 0;
++	case "$(board_name)" in
++	xiaomi,ax9000)
++		ax9000_persistent_upgrade_blocked
++		;;
++	*)
++		return 0
++		;;
++	esac
+ }
+ 
+ platform_pre_upgrade() {
+@@ -155,9 +167,11 @@ platform_pre_upgrade() {
+ 	asus,rt-ax89x)
+ 		asus_initial_setup
+ 		;;
+-	redmi,ax6|\
+-	xiaomi,ax3600|\
+ 	xiaomi,ax9000)
++		ax9000_persistent_upgrade_blocked
++		;;
++	redmi,ax6|\
++	xiaomi,ax3600)
+ 		xiaomi_initramfs_prepare
+ 		;;
+ 	esac
+@@ -238,9 +252,12 @@ platform_do_upgrade() {
+ 		CI_ROOTPART="rootfs"
+ 		emmc_do_upgrade "$1"
+ 		;;
+-	redmi,ax6|\
+-	xiaomi,ax3600|\
+ 	xiaomi,ax9000)
++		ax9000_persistent_upgrade_blocked
++		return 1
++		;;
++	redmi,ax6|\
++	xiaomi,ax3600)
+ 		# Make sure that UART is enabled
+ 		fw_setenv boot_wait on
+ 		fw_setenv uart_en 1

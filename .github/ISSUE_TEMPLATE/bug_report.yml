@@ -1,0 +1,60 @@
+name: Bug report
+description: Report a reproducible NexaWrt build or RAM-test issue
+title: "[Bug]: "
+labels:
+  - bug
+body:
+  - type: markdown
+    attributes:
+      value: |
+        NexaWrt currently supports only the documented Xiaomi AX9000 RAM-only validation path. Never upload raw router backups, credentials, MAC addresses, serial numbers, or private configuration.
+  - type: input
+    id: revision
+    attributes:
+      label: NexaWrt revision
+      description: Commit SHA or release name.
+    validations:
+      required: true
+  - type: input
+    id: device
+    attributes:
+      label: Device and layout
+      description: Device model and non-sensitive layout identifier.
+      placeholder: Xiaomi AX9000, single-large-UBI-v1
+    validations:
+      required: true
+  - type: dropdown
+    id: phase
+    attributes:
+      label: Failure phase
+      options:
+        - Static validation
+        - Source preparation
+        - Build
+        - Artifact validation
+        - U-Boot RAM loading
+        - Initramfs runtime
+        - Return to production firmware
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Reproduction steps
+      description: Include exact commands, with secrets and identifying data removed.
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant logs
+      render: shell
+  - type: checkboxes
+    id: safety
+    attributes:
+      label: Safety confirmation
+      options:
+        - label: I did not upload credentials or raw router backups.
+          required: true
+        - label: I did not perform a persistent flash operation as part of this report.
+          required: true

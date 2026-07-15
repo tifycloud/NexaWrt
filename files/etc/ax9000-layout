@@ -1,0 +1,6 @@
+layout=xiaomi-ax9000-single-large-ubi-v1
+rootfs_mtd_offset=0x01180000
+rootfs_mtd_size=0x0e800000
+kernel_ubi_volume_id=0
+rootfs_ubi_volume_id=1
+rootfs_data_ubi_volume_id=2

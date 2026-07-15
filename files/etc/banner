@@ -1,0 +1,10 @@
+ _   _                 __        __    _
+| \ | | _____  ____ _  \ \      / / __| |_
+|  \| |/ _ \ \/ / _` |  \ \ /\ / / '__| __|
+| |\  |  __/>  < (_| |   \ V  V /| |  | |_
+|_| \_|\___/_/\_\__,_|    \_/\_/ |_|   \__|
+
+NexaWrt — Xiaomi AX9000 initramfs RAM-test only
+ROOT MUST BE /dev/ram0 — DO NOT FLASH OR SYSUPGRADE
+PERSISTENT UBI MUST REMAIN DETACHED, UNMOUNTED, AND UNWRITTEN.
+REAL-DEVICE RAM BOOT IS NOT YET APPROVED.

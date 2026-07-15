@@ -1,0 +1,8 @@
+# shellcheck shell=sh
+OPENWRT_REPO="https://git.openwrt.org/openwrt/openwrt.git"
+OPENWRT_TAG="v25.12.5"
+OPENWRT_COMMIT="f0a60eee2fe051741c643ea6118718aae1ef17fb"
+LAYOUT_ID="xiaomi-ax9000-single-large-ubi-v1"
+ROOTFS_MTD_OFFSET_HEX="0x01180000"
+ROOTFS_MTD_SIZE_HEX="0x0e800000"
+ROOTFS_MTD_ERASE_SIZE_HEX="0x00020000"
