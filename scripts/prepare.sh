@@ -549,7 +549,21 @@ if [[ "$(git rev-parse HEAD)" != "$SOURCE_COMMIT" ]]; then
 fi
 git diff-index --quiet --cached HEAD -- || { echo "$NEXAWRT_FLAVOR source index differs from pinned commit" >&2; exit 1; }
 git diff-files --quiet --no-ext-diff --ignore-submodules -- || { echo "$NEXAWRT_FLAVOR source worktree differs from pinned commit" >&2; exit 1; }
-[[ -z "$(git ls-files --others --exclude-standard)" ]] || { echo "$NEXAWRT_FLAVOR source has untracked files after reset" >&2; exit 1; }
+python3 - "$WORK_DIR" <<'PY_UNTRACKED' || { echo "$NEXAWRT_FLAVOR source has non-whitelisted untracked files after reset" >&2; exit 1; }
+import os
+import pathlib
+import subprocess
+import sys
+root = pathlib.Path(sys.argv[1]).resolve(strict=True)
+raw = subprocess.check_output(["git", "-C", str(root), "ls-files", "--others", "--exclude-standard", "-z"])
+for encoded in raw.split(b"\0"):
+    if not encoded:
+        continue
+    path = os.fsdecode(encoded)
+    if path == ".nexawrt-feeds-state":
+        continue
+    raise SystemExit(f"unexpected untracked source path: {path}")
+PY_UNTRACKED
 python3 - "$WORK_DIR" <<'PY_IGNORED' || { echo "$NEXAWRT_FLAVOR source has non-whitelisted ignored files after reset" >&2; exit 1; }
 import os
 import pathlib

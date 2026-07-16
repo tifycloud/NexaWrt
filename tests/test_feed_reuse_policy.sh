@@ -36,7 +36,8 @@ mkdir -p "$SOURCE_REPO/scripts" "$SOURCE_REPO/package"
 "$REAL_GIT" -C "$SOURCE_REPO" config user.email 'fixture@example.invalid'
 cat > "$SOURCE_REPO/.gitignore" <<'IGNORE'
 /.config
-/.nexawrt-feeds-state
+# Match the real NSS source: the NexaWrt feed-state marker is preserved but
+# is not covered by the upstream source ignore rules.
 /feeds/
 /files/
 /package/feeds/
