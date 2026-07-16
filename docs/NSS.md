@@ -3,8 +3,9 @@
 ## 状态与来源
 
 NSS 是 NexaWrt 的**实验性、可选 flavor**，不是默认构建，也不是 official flavor 的替代品。
-默认和 Pull Request 构建始终使用 `official`；只有 GitHub Actions 手动触发时明确选择
-`nss`，或在本地显式选择 NSS flavor，才应进入 NSS 构建路径。
+默认本地构建使用 `official`；Pull Request、main push 和 merge queue 只运行 official/NSS 双静态策略，
+不会自动消耗完整固件构建资源。只有 GitHub Actions 手动触发时明确选择 `nss`，或在本地显式选择
+NSS flavor，才应进入 NSS 完整构建路径。
 
 | flavor | 上游来源 | 定位 |
 | --- | --- | --- |
@@ -28,8 +29,9 @@ NSS flavor 仍受项目现有的 AX9000 single-large-UBI v1、initramfs-only、�
 NEXAWRT_FLAVOR=nss ./scripts/build.sh
 ```
 
-手动 GitHub Actions artifact 名包含 `nss`；Pull Request 不接受 NSS input，始终构建
-`official`。实验性 NSS 输出不进入现有 tag release workflow。
+手动 GitHub Actions verified artifact 名包含 `nss`；Pull Request 不接受 flavor input，只执行
+仓库静态策略。实验性 NSS 仍可通过独立的 `ram-test-nss-v*` prerelease tag 路径发布，但在真机门禁
+完成前只属于 RAM-only 候选。
 
 ## NSS 与 ECM 可能带来的价值
 

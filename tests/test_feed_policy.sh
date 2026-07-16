@@ -35,7 +35,7 @@ NEXAWRT_FLAVOR=official "$POLICY_REPO/scripts/prepare.sh" --help >/dev/null
 printf 'this is deliberately not valid shell (\n' > "$POLICY_REPO/manifests/nss.lock"
 NEXAWRT_FLAVOR=official "$POLICY_REPO/scripts/validate.sh" >/dev/null
 NEXAWRT_FLAVOR=official "$POLICY_REPO/scripts/prepare.sh" --help >/dev/null
-expect_failure "NSS validation with malformed NSS lock" "syntax error" \
+expect_failure "NSS validation with malformed NSS lock" "lock file contains non-declarative syntax" \
   env NEXAWRT_FLAVOR=nss "$POLICY_REPO/scripts/validate.sh"
 mv "$TMP_DIR/nss.lock.good" "$POLICY_REPO/manifests/nss.lock"
 
@@ -66,6 +66,12 @@ for nss_only_file in \
   mv "$backup" "$candidate"
 done
 echo 'selected-flavor script syntax isolation: OK'
+grep -Fq 'GIT_CONFIG_KEY_0=http.proxy' "$ROOT_DIR/scripts/prepare.sh" || {
+  echo 'prepare does not neutralize ambient Git proxy configuration' >&2
+  exit 1
+}
+echo 'ambient Git proxy isolation: OK'
+
 
 # Official credential scanning must not read NSS-only helpers or policy tests.
 # Build the sentinel in pieces so this test source does not contain a pattern.
@@ -90,8 +96,10 @@ SOURCE="$TMP_DIR/source"
 mkdir -p "$SOURCE/feeds" "$SOURCE/package/feeds" "$TMP_DIR/origins"
 : > "$SOURCE/feeds.conf.default"
 : > "$POLICY_REPO/manifests/feeds.lock"
+PACKAGES_POLICY_PATCH="$POLICY_REPO/patches/packages/001-iperf3-avoid-libtool-absolute-rpath.patch"
 
 first_feed=""
+packages_checkout=""
 while read -r feed; do
   [[ -n "$feed" ]] || continue
   checkout="$SOURCE/feeds/$feed"
@@ -101,8 +109,34 @@ while read -r feed; do
   git -C "$checkout" config user.email 'nexawrt-feed-policy@example.invalid'
   printf '%s\n' "$feed" > "$checkout/tracked.txt"
   printf 'ignored-fixture.tmp\n' > "$checkout/.gitignore"
+  if [[ "$feed" == luci ]]; then
+    cat >> "$checkout/.gitignore" <<'LUCI_BUILD_IGNORES'
+/modules/luci-base/src/contrib/lemon
+/modules/luci-base/src/jsmin
+/modules/luci-base/src/jsmin.o
+/modules/luci-base/src/lib/lmo.o
+/modules/luci-base/src/lib/plural_formula.c
+/modules/luci-base/src/lib/plural_formula.h
+/modules/luci-base/src/lib/plural_formula.o
+/modules/luci-base/src/po2lmo
+/modules/luci-base/src/po2lmo.o
+LUCI_BUILD_IGNORES
+  fi
   mkdir -p "$checkout/package-$feed"
   printf '# fixture package for %s\n' "$feed" > "$checkout/package-$feed/Makefile"
+  if [[ "$feed" == packages ]]; then
+    mkdir -p "$checkout/net/iperf3"
+    cat > "$checkout/net/iperf3/Makefile" <<'IPERF_FIXTURE'
+TARGET_CFLAGS += -D_GNU_SOURCE
+TARGET_LDFLAGS += -latomic
+
+ifeq ($(BUILD_VARIANT),ssl)
+	CONFIGURE_ARGS += --with-openssl
+else
+	CONFIGURE_ARGS += --without-openssl
+endif
+IPERF_FIXTURE
+  fi
   git -C "$checkout" add .
   git -C "$checkout" commit -qm "fixture: $feed"
   revision="$(git -C "$checkout" rev-parse HEAD)"
@@ -113,7 +147,18 @@ while read -r feed; do
   mkdir -p "$SOURCE/package/feeds/$feed"
   ln -s "../../../feeds/$feed/package-$feed" \
     "$SOURCE/package/feeds/$feed/package-$feed"
-  [[ -n "$first_feed" ]] || first_feed="$feed"
+  if [[ "$feed" == packages ]]; then
+    sed 's/TARGET_LDFLAGS += -latomic/TARGET_LDFLAGS += -Wl,-latomic/' \
+      "$checkout/net/iperf3/Makefile" > "$checkout/net/iperf3/Makefile.tmp"
+    mv "$checkout/net/iperf3/Makefile.tmp" "$checkout/net/iperf3/Makefile"
+    git -C "$checkout" diff --binary --no-ext-diff -- net/iperf3/Makefile \
+      > "$PACKAGES_POLICY_PATCH"
+    git -C "$checkout" reset --hard -q HEAD
+    git -C "$checkout" apply "$PACKAGES_POLICY_PATCH"
+    packages_checkout="$checkout"
+  elif [[ -z "$first_feed" ]]; then
+    first_feed="$feed"
+  fi
 done <<'FEEDS'
 packages
 luci
@@ -125,6 +170,51 @@ FEEDS
 printf 'version=1\nflavor=official\nstate=feeds-installed\n' > "$SOURCE/.nexawrt-feeds-state"
 NEXAWRT_FLAVOR=official "$POLICY_REPO/scripts/validate.sh" \
   --source "$SOURCE" --feed-policy-only >/dev/null
+
+# The standard packages feed is intentionally dirty by exactly one reviewed
+# patch. Missing, altered, or additional worktree changes must all fail closed.
+git -C "$packages_checkout" apply --reverse "$PACKAGES_POLICY_PATCH"
+expect_failure "missing packages iperf3 patch diff" \
+  "feed checkout packages does not contain the exact NexaWrt iperf3 link-stage RPATH patch" \
+  env NEXAWRT_FLAVOR=official "$POLICY_REPO/scripts/validate.sh" \
+  --source "$SOURCE" --feed-policy-only
+git -C "$packages_checkout" apply "$PACKAGES_POLICY_PATCH"
+
+sed 's/TARGET_LDFLAGS += -Wl,-latomic/TARGET_LDFLAGS += -Wl,--no-as-needed,-latomic/' \
+  "$packages_checkout/net/iperf3/Makefile" > \
+  "$packages_checkout/net/iperf3/Makefile.tmp"
+mv "$packages_checkout/net/iperf3/Makefile.tmp" \
+  "$packages_checkout/net/iperf3/Makefile"
+expect_failure "tampered packages iperf3 patch diff" \
+  "feed checkout packages does not contain the exact NexaWrt iperf3 link-stage RPATH patch" \
+  env NEXAWRT_FLAVOR=official "$POLICY_REPO/scripts/validate.sh" \
+  --source "$SOURCE" --feed-policy-only
+git -C "$packages_checkout" checkout -q -- net/iperf3/Makefile
+git -C "$packages_checkout" apply "$PACKAGES_POLICY_PATCH"
+
+printf 'extra packages diff\n' >> "$packages_checkout/tracked.txt"
+expect_failure "extra packages feed diff" \
+  "feed checkout packages does not contain the exact NexaWrt iperf3 link-stage RPATH patch" \
+  env NEXAWRT_FLAVOR=official "$POLICY_REPO/scripts/validate.sh" \
+  --source "$SOURCE" --feed-policy-only
+git -C "$packages_checkout" checkout -q -- tracked.txt
+
+echo 'exact packages iperf3 worktree diff negatives: OK'
+
+ln -s ../package "$SOURCE/feeds/base"
+NEXAWRT_FLAVOR=official "$POLICY_REPO/scripts/validate.sh" \
+  --source "$SOURCE" --feed-policy-only >/dev/null
+rm "$SOURCE/feeds/base"
+ln -s ../feeds "$SOURCE/feeds/base"
+expect_failure "wrong feeds/base target" "feeds/base has an unexpected symlink target" \
+  env NEXAWRT_FLAVOR=official "$POLICY_REPO/scripts/validate.sh" \
+  --source "$SOURCE" --feed-policy-only
+rm "$SOURCE/feeds/base"
+mkdir "$SOURCE/feeds/base"
+expect_failure "regular feeds/base directory" "feeds/base must be the OpenWrt package symlink" \
+  env NEXAWRT_FLAVOR=official "$POLICY_REPO/scripts/validate.sh" \
+  --source "$SOURCE" --feed-policy-only
+rmdir "$SOURCE/feeds/base"
 
 mv "$SOURCE/.nexawrt-feeds-state" "$TMP_DIR/feed-state-marker"
 expect_failure "source without feed state marker" "feed state marker is missing" \
@@ -140,7 +230,7 @@ git -C "$SOURCE/feeds/$first_feed" reset --hard -q HEAD
 
 printf 'staged\n' >> "$SOURCE/feeds/$first_feed/tracked.txt"
 git -C "$SOURCE/feeds/$first_feed" add tracked.txt
-expect_failure "staged feed modification" "feed checkout $first_feed is not clean" \
+expect_failure "staged feed modification" "feed checkout $first_feed has staged changes" \
   env NEXAWRT_FLAVOR=official "$POLICY_REPO/scripts/validate.sh" \
   --source "$SOURCE" --feed-policy-only
 git -C "$SOURCE/feeds/$first_feed" reset --hard -q HEAD
@@ -165,14 +255,14 @@ git -C "$SOURCE/feeds/$first_feed" reset --hard -q HEAD
 
 git -C "$SOURCE/feeds/$first_feed" config core.sparseCheckout true
 expect_failure "sparse checkout feed state" \
-  "feed checkout $first_feed uses sparse checkout or a sparse index" \
+  "feed checkout $first_feed has forbidden Git local config: core.sparsecheckout" \
   env NEXAWRT_FLAVOR=official "$POLICY_REPO/scripts/validate.sh" \
   --source "$SOURCE" --feed-policy-only
 git -C "$SOURCE/feeds/$first_feed" config --unset core.sparseCheckout
 
 git -C "$SOURCE/feeds/$first_feed" config index.sparse true
 expect_failure "sparse index feed state" \
-  "feed checkout $first_feed uses sparse checkout or a sparse index" \
+  "feed checkout $first_feed has forbidden Git local config: index.sparse" \
   env NEXAWRT_FLAVOR=official "$POLICY_REPO/scripts/validate.sh" \
   --source "$SOURCE" --feed-policy-only
 git -C "$SOURCE/feeds/$first_feed" config --unset index.sparse
@@ -188,6 +278,34 @@ expect_failure "ignored feed file" "feed checkout $first_feed contains ignored f
   env NEXAWRT_FLAVOR=official "$POLICY_REPO/scripts/validate.sh" \
   --source "$SOURCE" --feed-policy-only
 rm -f "$SOURCE/feeds/$first_feed/ignored-fixture.tmp"
+
+luci_checkout="$SOURCE/feeds/luci"
+for generated in \
+  modules/luci-base/src/contrib/lemon \
+  modules/luci-base/src/jsmin \
+  modules/luci-base/src/jsmin.o \
+  modules/luci-base/src/lib/lmo.o \
+  modules/luci-base/src/lib/plural_formula.c \
+  modules/luci-base/src/lib/plural_formula.h \
+  modules/luci-base/src/lib/plural_formula.o \
+  modules/luci-base/src/po2lmo \
+  modules/luci-base/src/po2lmo.o; do
+  mkdir -p "$(dirname "$luci_checkout/$generated")"
+  printf 'generated build output\n' > "$luci_checkout/$generated"
+done
+expect_failure "pre-build LuCI generated output" "feed checkout luci contains ignored files" \
+  env NEXAWRT_FLAVOR=official "$POLICY_REPO/scripts/validate.sh" \
+  --source "$SOURCE" --feed-policy-only
+NEXAWRT_FLAVOR=official "$POLICY_REPO/scripts/validate.sh" \
+  --source "$SOURCE" --feed-policy-only --artifacts >/dev/null
+touch "$luci_checkout/ignored-fixture.tmp"
+expect_failure "unexpected post-build LuCI ignored output" \
+  "feed checkout luci contains unexpected post-build ignored files" \
+  env NEXAWRT_FLAVOR=official "$POLICY_REPO/scripts/validate.sh" \
+  --source "$SOURCE" --feed-policy-only --artifacts
+rm -f "$luci_checkout/ignored-fixture.tmp"
+find "$luci_checkout/modules/luci-base/src" -type f -delete
+find "$luci_checkout/modules/luci-base/src" -depth -type d -empty -delete
 
 expected_origin="$(git -C "$SOURCE/feeds/$first_feed" remote get-url origin)"
 git -C "$SOURCE/feeds/$first_feed" remote set-url origin 'file:///unexpected-feed-origin.git'
@@ -255,7 +373,7 @@ for checkout in "$SOURCE"/feeds/*; do
   feed="$(basename "$checkout")"
   mv "$checkout/.git" "$TMP_DIR/feed-git-metadata/$feed"
 done
-expect_failure "feeds directory without Git metadata" "feed checkout missing Git metadata: $first_feed" \
+expect_failure "feeds directory without Git metadata" "feed checkout missing Git metadata: packages" \
   env NEXAWRT_FLAVOR=official "$POLICY_REPO/scripts/validate.sh" \
   --source "$SOURCE" --feed-policy-only
 for checkout in "$SOURCE"/feeds/*; do
@@ -284,4 +402,58 @@ expect_failure "unknown ATH11K NSS symbol" "enabled an ATH11K NSS feature" \
   env NEXAWRT_FLAVOR=nss "$POLICY_REPO/scripts/validate.sh"
 
 echo 'NSS config allowlist negatives: OK'
+for expected in \
+  'PKG_BUILD_DIR:=$(KERNEL_BUILD_DIR)/nss-drv-$(PKG_SOURCE_VERSION)' \
+  'PKG_BUILD_DIR:=$(KERNEL_BUILD_DIR)/qca-nss-ecm-$(PKG_SOURCE_VERSION)' \
+  'PKG_BUILD_DIR:=$(KERNEL_BUILD_DIR)/nss-clients-$(PKG_SOURCE_VERSION)'; do
+  grep -Fq "+$expected" "$ROOT_DIR/patches/nss/001-pin-codelinaro-source-archives.patch" || {
+    echo "NSS archive extraction directory is not pinned: $expected" >&2
+    exit 1
+  }
+done
+echo 'NSS archive extraction directory policy: OK'
+[[ "$(grep -c '^diff --git a/net/iperf3/Makefile b/net/iperf3/Makefile$' \
+  "$ROOT_DIR/patches/packages/001-iperf3-avoid-libtool-absolute-rpath.patch")" == 1 ]]
+grep -Fq -- '-TARGET_LDFLAGS += -latomic' \
+  "$ROOT_DIR/patches/packages/001-iperf3-avoid-libtool-absolute-rpath.patch"
+grep -Fq -- '+TARGET_LDFLAGS += -Wl,-latomic' \
+  "$ROOT_DIR/patches/packages/001-iperf3-avoid-libtool-absolute-rpath.patch"
+if grep -Fqi patchelf \
+  "$ROOT_DIR/patches/packages/001-iperf3-avoid-libtool-absolute-rpath.patch"; then
+  echo 'iperf3 packages patch must not use install-time patchelf' >&2
+  exit 1
+fi
+echo 'iperf3 link-stage RPATH patch intent: OK'
+
+# Ordinary git diff omits untracked additions, but the NSS feed patch creates a
+# package-local source patch. The complete-diff helper must bind both tracked
+# edits and new files without changing the checkout's real index.
+COMPLETE_DIFF_FIXTURE="$TMP_DIR/complete-diff-fixture"
+mkdir -p "$COMPLETE_DIFF_FIXTURE"
+git -C "$COMPLETE_DIFF_FIXTURE" init -q
+git -C "$COMPLETE_DIFF_FIXTURE" config user.name 'NexaWrt complete diff fixture'
+git -C "$COMPLETE_DIFF_FIXTURE" config user.email fixture@example.invalid
+printf 'before\n' > "$COMPLETE_DIFF_FIXTURE/tracked.txt"
+git -C "$COMPLETE_DIFF_FIXTURE" add tracked.txt
+git -C "$COMPLETE_DIFF_FIXTURE" commit -qm initial
+printf 'after\n' > "$COMPLETE_DIFF_FIXTURE/tracked.txt"
+printf 'new file\n' > "$COMPLETE_DIFF_FIXTURE/added.txt"
+if git -C "$COMPLETE_DIFF_FIXTURE" diff --binary --no-ext-diff HEAD -- | grep -Fq 'added.txt'; then
+  echo 'ordinary Git diff unexpectedly included the untracked fixture' >&2
+  exit 1
+fi
+git -C "$COMPLETE_DIFF_FIXTURE" add -A -- .
+EXPECTED_COMPLETE_DIFF="$(git -C "$COMPLETE_DIFF_FIXTURE" diff --cached --binary --no-ext-diff HEAD --)"
+git -C "$COMPLETE_DIFF_FIXTURE" reset -q HEAD --
+ACTUAL_COMPLETE_DIFF="$("$ROOT_DIR/scripts/complete-git-worktree-diff.sh" "$COMPLETE_DIFF_FIXTURE")"
+[[ "$ACTUAL_COMPLETE_DIFF" == "$EXPECTED_COMPLETE_DIFF" ]] || {
+  echo 'complete Git worktree diff omitted or changed a tracked/untracked edit' >&2
+  exit 1
+}
+git -C "$COMPLETE_DIFF_FIXTURE" diff-index --quiet --cached HEAD -- || {
+  echo 'complete Git worktree diff changed the real checkout index' >&2
+  exit 1
+}
+echo 'complete Git worktree diff includes untracked patch additions without index mutation: OK'
+
 echo 'feed policy tests: OK'

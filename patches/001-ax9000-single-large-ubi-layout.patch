@@ -43,10 +43,10 @@ index 4763e82..241c144 100644
   	if (p != NULL && l > 0)
   		strscpy(cmdline, p, min(l, COMMAND_LINE_SIZE));
 diff --git a/target/linux/qualcommax/files/arch/arm64/boot/dts/qcom/ipq8072-ax9000.dts b/target/linux/qualcommax/files/arch/arm64/boot/dts/qcom/ipq8072-ax9000.dts
-index 54c1388..8e33f77 100644
+index ea0fa07..12573e7 100644
 --- a/target/linux/qualcommax/files/arch/arm64/boot/dts/qcom/ipq8072-ax9000.dts
 +++ b/target/linux/qualcommax/files/arch/arm64/boot/dts/qcom/ipq8072-ax9000.dts
-@@ -25,7 +25,7 @@
+@@ -26,7 +26,7 @@
  
  	chosen {
  		stdout-path = "serial0:115200n8";
@@ -55,8 +55,26 @@ index 54c1388..8e33f77 100644
  	};
  
  	keys {
-@@ -315,14 +315,14 @@
+@@ -255,6 +255,7 @@
+ 			partition@d00000 {
+ 				label = "0:appsblenv";
+ 				reg = <0xd00000 0x80000>;
++				read-only;
+ 			};
+ 
+ 			partition@d80000 {
+@@ -308,22 +309,24 @@
+ 			partition@1000000 {
+ 				label = "bdata";
+ 				reg = <0x1000000 0x80000>;
++				read-only;
+ 			};
+ 
+ 			partition@1080000 {
+ 				/* This is crash + crash_syslog parts combined */
+ 				label = "pstore";
  				reg = <0x1080000 0x100000>;
++				read-only;
  			};
  
 +			/*
@@ -77,7 +95,7 @@ index 54c1388..8e33f77 100644
  		};
  	};
 diff --git a/target/linux/qualcommax/image/ipq807x.mk b/target/linux/qualcommax/image/ipq807x.mk
-index f356bbb..1668ee5 100644
+index 75af3d0..46fb3b0 100644
 --- a/target/linux/qualcommax/image/ipq807x.mk
 +++ b/target/linux/qualcommax/image/ipq807x.mk
 @@ -491,7 +491,21 @@ ifneq ($(CONFIG_TARGET_ROOTFS_INITRAMFS),)
@@ -95,7 +113,7 @@ index f356bbb..1668ee5 100644
 +	SUPPORTED_DEVICES := xiaomi,ax9000
 +	DEVICE_COMPAT_VERSION := 2.0
 +	DEVICE_COMPAT_MESSAGE := NexaWrt AX9000 RAM-test profile; persistent upgrade is unsupported
-+	DEVICE_PACKAGES += -uboot-envtools -ubi-utils -mtd
++	DEVICE_PACKAGES += -ubi-utils -mtd
 +	IMAGES :=
 +	ARTIFACTS :=
 +endef

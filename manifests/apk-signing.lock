@@ -1,0 +1,3 @@
+# shellcheck shell=sh
+# SHA-256 of the canonical SubjectPublicKeyInfo DER for the production P-256 key.
+NEXAWRT_APK_SIGNING_PRODUCTION_PUBLIC_SHA256="2ee999b4f530013c280110d08dab558af557f02e18aa3e681e30545b873139ac"

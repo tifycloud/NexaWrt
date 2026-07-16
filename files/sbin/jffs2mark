@@ -1,0 +1,3 @@
+#!/bin/sh
+echo "NexaWrt AX9000 RAM-test image: jffs2mark is disabled; persistent storage must remain untouched" >&2
+exit 74

@@ -1,0 +1,3 @@
+#!/bin/sh
+echo "NexaWrt AX9000 RAM-test image: mount_root is disabled; persistent storage must remain untouched" >&2
+exit 74

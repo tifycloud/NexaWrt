@@ -1,29 +1,131 @@
-name: NexaWrt AX9000 initramfs release
+name: NexaWrt AX9000 reproducible RAM-test release
 
 on:
   push:
     tags:
       - 'ram-test-v*'
+      - 'ram-test-nss-v*'
 
-permissions:
-  contents: write
+permissions: {}
+
+concurrency:
+  group: nexawrt-release-${{ github.ref_name }}
+  cancel-in-progress: false
 
 jobs:
-  release:
+  preflight:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    outputs:
+      flavor: ${{ steps.release_identity.outputs.flavor }}
+      work_basename: ${{ steps.release_identity.outputs.work_basename }}
+      staging_basename: ${{ steps.release_identity.outputs.staging_basename }}
+    steps:
+      - name: Checkout trusted tag
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Verify immutable release preconditions and derive flavor
+        id: release_identity
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          test "$GITHUB_REF_TYPE" = tag
+          test "$GITHUB_REF" = "refs/tags/$GITHUB_REF_NAME"
+          test "$GITHUB_WORKFLOW_REF" = "tifycloud/NexaWrt/.github/workflows/release.yml@$GITHUB_REF"
+          test "$GITHUB_WORKFLOW_SHA" = "$GITHUB_SHA"
+          if [[ "$GITHUB_REF_NAME" =~ ^ram-test-v[0-9][0-9A-Za-z._-]*$ ]]; then
+            flavor=official
+            work_basename=openwrt
+            staging_basename=dist
+          elif [[ "$GITHUB_REF_NAME" =~ ^ram-test-nss-v[0-9][0-9A-Za-z._-]*$ ]]; then
+            flavor=nss
+            work_basename=openwrt-nss
+            staging_basename=dist-nss
+          else
+            echo "Untrusted release tag name: $GITHUB_REF_NAME" >&2
+            exit 1
+          fi
+          test "$(git cat-file -t "refs/tags/$GITHUB_REF_NAME")" = commit
+          test "$(git rev-parse "refs/tags/$GITHUB_REF_NAME")" = "$GITHUB_SHA"
+          git fetch --force origin main:refs/remotes/origin/main
+          git merge-base --is-ancestor "$GITHUB_SHA" origin/main
+          release_tag_is_absent() {
+            local tag="$1" output status
+            if output="$(gh release view "$tag" 2>&1)"; then
+              echo "Release already exists: $tag" >&2
+              return 1
+            else
+              status=$?
+            fi
+            if printf '%s\n' "$output" | grep -Eiq \
+              '(^|[^[:alnum:]])(HTTP[[:space:]]+404|404[[:space:]]+Not[[:space:]]+Found|release[[:space:]]+not[[:space:]]+found)([^[:alnum:]]|$)'; then
+              return 0
+            fi
+            echo "Unable to determine whether release exists: $tag" >&2
+            printf '%s\n' "$output" >&2
+            return "$status"
+          }
+          release_tag_is_absent "$GITHUB_REF_NAME"
+          printf 'flavor=%s\nwork_basename=%s\nstaging_basename=%s\n' \
+            "$flavor" "$work_basename" "$staging_basename" >> "$GITHUB_OUTPUT"
+          NEXAWRT_FLAVOR="$flavor" ./tests/test_static.sh
+
+  build:
+    needs: preflight
+    strategy:
+      fail-fast: false
+      matrix:
+        replica: [a, b]
     runs-on: ubuntu-24.04
     timeout-minutes: 360
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+      artifact-metadata: write
+    env:
+      NEXAWRT_FLAVOR: ${{ needs.preflight.outputs.flavor }}
+      NEXAWRT_BUILD_REPLICA: ${{ matrix.replica }}
+      CLEAN_BUILD: '1'
+      WORK_DIR: .work/${{ needs.preflight.outputs.work_basename }}-${{ matrix.replica }}
+      DIST_DIR_OVERRIDE: ${{ github.workspace }}/release-staging/replica-${{ needs.preflight.outputs.flavor }}-${{ matrix.replica }}/${{ needs.preflight.outputs.staging_basename }}
+      DIST_NSS_DIR_OVERRIDE: ${{ github.workspace }}/release-staging/replica-${{ needs.preflight.outputs.flavor }}-${{ matrix.replica }}/${{ needs.preflight.outputs.staging_basename }}
+      BUILD_LOG: ${{ github.workspace }}/build-${{ needs.preflight.outputs.flavor }}-${{ matrix.replica }}.log
     steps:
       - name: Checkout project
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
-
-      - name: Run official release safety checks
-        env:
-          NEXAWRT_FLAVOR: official
+        with:
+          persist-credentials: false
+      - name: Require committed production APK public trust identity
         run: |
-          ./scripts/validate.sh
-          ./tests/test_backup_guards.sh
-          ./tests/test_release_policy.sh
-
+          set -euo pipefail
+          source ./scripts/lock-file-policy.sh
+          nexawrt_validate_lock_file manifests/apk-signing.lock apk-signing
+          # The validated lock grammar permits only one quoted declarative assignment.
+          source manifests/apk-signing.lock
+          production_anchor="$NEXAWRT_APK_SIGNING_PRODUCTION_PUBLIC_SHA256"
+          [[ "$production_anchor" =~ ^[0-9a-f]{64}$ ]] || { echo 'production APK signing trust anchor is not provisioned' >&2; exit 1; }
+          public_key="$(pwd -P)/manifests/apk-signing-public.pem"
+          [[ -f "$public_key" && ! -L "$public_key" ]] || { echo 'committed production APK public key is missing or unsafe' >&2; exit 1; }
+          policy_topdir="$RUNNER_TEMP/nexawrt-apk-policy-topdir-${{ matrix.replica }}"
+          mkdir -m 0700 "$policy_topdir"
+          prepared="$(NEXAWRT_APK_SIGNING_PROFILE=production \
+            NEXAWRT_APK_SIGNING_PUBLIC_SHA256="$production_anchor" \
+            NEXAWRT_APK_SIGNING_PUBLIC_KEY_FILE="$public_key" \
+            ./scripts/apk-signing-key.sh prepare "$policy_topdir")"
+          IFS=$'\t' read -r prepared_profile prepared_sha256 prepared_public_key <<<"$prepared"
+          [[ "$prepared_profile" == production && "$prepared_sha256" == "$production_anchor" && -f "$prepared_public_key" ]] || {
+            echo 'committed production APK public key did not satisfy the repository trust anchor' >&2
+            exit 1
+          }
+          {
+            printf 'NEXAWRT_APK_SIGNING_PROFILE=production\n'
+            printf 'NEXAWRT_APK_SIGNING_PUBLIC_KEY_FILE=%s\n' "$public_key"
+            printf 'NEXAWRT_APK_SIGNING_PUBLIC_SHA256=%s\n' "$production_anchor"
+          } >> "$GITHUB_ENV"
       - name: Install OpenWrt build dependencies
         run: |
           sudo apt-get update
@@ -31,16 +133,274 @@ jobs:
             build-essential clang flex bison g++ gawk gcc-multilib g++-multilib \
             gettext git libncurses-dev libssl-dev python3 python3-setuptools \
             python3-pyelftools python3-packaging rsync swig unzip zlib1g-dev \
-            file wget libelf-dev subversion time xsltproc zstd
-
-      - name: Build release candidate
+            file wget libelf-dev shellcheck subversion time xsltproc zstd
+      - name: Lint shell safety policies
+        run: shellcheck -S warning scripts/*.sh tests/*.sh files/sbin/* files-nss/etc/uci-defaults/* files/etc/uci-defaults/*
+      - name: Build independent clean replica
         run: ./scripts/build.sh
+      - name: Upload replica
+        id: replica_artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: release-${{ github.run_id }}-${{ github.run_attempt }}-${{ needs.preflight.outputs.flavor }}-${{ matrix.replica }}
+          path: release-staging/replica-${{ needs.preflight.outputs.flavor }}-${{ matrix.replica }}/${{ needs.preflight.outputs.staging_basename }}/
+          if-no-files-found: error
+          retention-days: 14
+      - name: Create strict producer descriptor
+        env:
+          RELEASE_FLAVOR: ${{ needs.preflight.outputs.flavor }}
+          REPLICA_ID: ${{ matrix.replica }}
+          ARTIFACT_ID: ${{ steps.replica_artifact.outputs.artifact-id }}
+          ARTIFACT_NAME: release-${{ github.run_id }}-${{ github.run_attempt }}-${{ needs.preflight.outputs.flavor }}-${{ matrix.replica }}
+          RECEIPT_PATH: release-staging/replica-${{ needs.preflight.outputs.flavor }}-${{ matrix.replica }}/${{ needs.preflight.outputs.staging_basename }}/SHA256SUMS
+          DESCRIPTOR_PATH: release-staging/replica-provenance-${{ matrix.replica }}/producer-descriptor.json
+        run: |
+          test -n "$ARTIFACT_ID"
+          mkdir -p "$(dirname "$DESCRIPTOR_PATH")"
+          test "$GITHUB_REF" = "refs/tags/$GITHUB_REF_NAME"
+          test "$GITHUB_WORKFLOW_REF" = "tifycloud/NexaWrt/.github/workflows/release.yml@$GITHUB_REF"
+          test "$GITHUB_WORKFLOW_SHA" = "$GITHUB_SHA"
+          python3 - "$DESCRIPTOR_PATH" "$RECEIPT_PATH" "$ARTIFACT_ID" "$ARTIFACT_NAME" \
+            "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" "$RELEASE_FLAVOR" "$REPLICA_ID" \
+            "$GITHUB_REF" "$GITHUB_SHA" "$GITHUB_WORKFLOW_REF" "$GITHUB_WORKFLOW_SHA" <<'PY'
+          import hashlib
+          import json
+          import pathlib
+          import re
+          import sys
 
-      - name: Publish GitHub release
+          (
+              descriptor_path, receipt_path, artifact_id, artifact_name, run_id, run_attempt, flavor, replica_id,
+              source_ref, source_digest, workflow_ref, signer_digest,
+          ) = sys.argv[1:]
+          if not re.fullmatch(r"[1-9][0-9]*", artifact_id):
+              raise SystemExit("artifact-id is invalid")
+          if flavor not in {"official", "nss"} or replica_id not in {"a", "b"}:
+              raise SystemExit("producer coordinates are invalid")
+          expected_name = f"release-{run_id}-{run_attempt}-{flavor}-{replica_id}"
+          if artifact_name != expected_name:
+              raise SystemExit("artifact name is not canonical")
+          receipt = pathlib.Path(receipt_path)
+          receipt_sha256 = hashlib.sha256(receipt.read_bytes()).hexdigest()
+          descriptor = {
+              "artifact_id": artifact_id,
+              "artifact_name": artifact_name,
+              "flavor": flavor,
+              "receipt_filename": "SHA256SUMS",
+              "receipt_sha256": receipt_sha256,
+              "replica_id": replica_id,
+              "repository": "tifycloud/NexaWrt",
+              "run_attempt": run_attempt,
+              "run_id": run_id,
+              "schema": 2,
+              "signer_digest": signer_digest,
+              "source_digest": source_digest,
+              "source_ref": source_ref,
+              "workflow": "tifycloud/NexaWrt/.github/workflows/release.yml",
+              "workflow_ref": workflow_ref,
+          }
+          pathlib.Path(descriptor_path).write_text(
+              json.dumps(descriptor, sort_keys=True, separators=(",", ":")) + "\n",
+              encoding="utf-8",
+          )
+          PY
+      - name: Attest strict producer descriptor
+        id: replica_attestation
+        uses: actions/attest-build-provenance@96278af6caaf10aea03fd8d33a09a777ca52d62f # v3.2.0
+        with:
+          subject-path: release-staging/replica-provenance-${{ matrix.replica }}/producer-descriptor.json
+      - name: Stage offline replica provenance
+        run: |
+          cp '${{ steps.replica_attestation.outputs.bundle-path }}' \
+            release-staging/replica-provenance-${{ matrix.replica }}/producer-descriptor.provenance.bundle.json
+      - name: Upload offline replica provenance
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: replica-provenance-${{ github.run_id }}-${{ github.run_attempt }}-${{ needs.preflight.outputs.flavor }}-${{ matrix.replica }}
+          path: release-staging/replica-provenance-${{ matrix.replica }}/
+          if-no-files-found: error
+          retention-days: 14
+
+  compare:
+    needs: [preflight, build]
+    runs-on: ubuntu-24.04
+    permissions:
+      actions: read
+      contents: read
+      attestations: read
+    steps:
+      - name: Checkout comparison policy
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - name: Pin attestation verifier executable
+        run: |
+          test -x /usr/bin/gh
+          test ! -L /usr/bin/gh
+          printf 'NEXAWRT_ATTESTATION_VERIFIER=/usr/bin/gh\n' >> "$GITHUB_ENV"
+          printf 'NEXAWRT_ATTESTATION_VERIFIER_SHA256=%s\n' "$(sha256sum /usr/bin/gh | awk '{print $1}')" >> "$GITHUB_ENV"
+      - name: Download replica A
+        uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5.0.0
+        with:
+          name: release-${{ github.run_id }}-${{ github.run_attempt }}-${{ needs.preflight.outputs.flavor }}-a
+          path: release-staging/replicas/${{ needs.preflight.outputs.flavor }}/a
+      - name: Download replica B
+        uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5.0.0
+        with:
+          name: release-${{ github.run_id }}-${{ github.run_attempt }}-${{ needs.preflight.outputs.flavor }}-b
+          path: release-staging/replicas/${{ needs.preflight.outputs.flavor }}/b
+      - name: Download replica A provenance
+        uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5.0.0
+        with:
+          name: replica-provenance-${{ github.run_id }}-${{ github.run_attempt }}-${{ needs.preflight.outputs.flavor }}-a
+          path: release-staging/provenance/${{ needs.preflight.outputs.flavor }}/a
+      - name: Download replica B provenance
+        uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5.0.0
+        with:
+          name: replica-provenance-${{ github.run_id }}-${{ github.run_attempt }}-${{ needs.preflight.outputs.flavor }}-b
+          path: release-staging/provenance/${{ needs.preflight.outputs.flavor }}/b
+      - name: Resolve platform artifact identities
+        id: producer_identity
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_FLAVOR: ${{ needs.preflight.outputs.flavor }}
+        run: |
+          artifact_json="$(mktemp)"
+          trap 'rm -f "$artifact_json"' EXIT
+          /usr/bin/gh api "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/artifacts?per_page=100" > "$artifact_json"
+          python3 - "$artifact_json" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" "$RELEASE_FLAVOR" "$GITHUB_OUTPUT" <<'PY'
+          import json
+          import pathlib
+          import sys
+
+          path, run_id, run_attempt, flavor, output_path = sys.argv[1:]
+          value = json.loads(pathlib.Path(path).read_text(encoding="utf-8"))
+          artifacts = value.get("artifacts")
+          if not isinstance(artifacts, list):
+              raise SystemExit("workflow artifact response is invalid")
+          resolved = {}
+          for replica in ("a", "b"):
+              name = f"release-{run_id}-{run_attempt}-{flavor}-{replica}"
+              matches = [item for item in artifacts if item.get("name") == name and item.get("expired") is False]
+              if len(matches) != 1 or not isinstance(matches[0].get("id"), int) or matches[0]["id"] <= 0:
+                  raise SystemExit(f"expected exactly one live artifact named {name}")
+              resolved[replica] = (str(matches[0]["id"]), name)
+          if resolved["a"][0] == resolved["b"][0]:
+              raise SystemExit("workflow artifact identities are not distinct")
+          with pathlib.Path(output_path).open("a", encoding="utf-8") as stream:
+              for slot, replica in (("left", "a"), ("right", "b")):
+                  artifact_id, artifact_name = resolved[replica]
+                  stream.write(f"{slot}_artifact_id={artifact_id}\n")
+                  stream.write(f"{slot}_artifact_name={artifact_name}\n")
+          PY
+      - name: Enforce reproducibility gate
+        env:
+          RELEASE_FLAVOR: ${{ needs.preflight.outputs.flavor }}
+          NEXAWRT_LEFT_ARTIFACT_ID: ${{ steps.producer_identity.outputs.left_artifact_id }}
+          NEXAWRT_RIGHT_ARTIFACT_ID: ${{ steps.producer_identity.outputs.right_artifact_id }}
+          NEXAWRT_LEFT_ARTIFACT_NAME: ${{ steps.producer_identity.outputs.left_artifact_name }}
+          NEXAWRT_RIGHT_ARTIFACT_NAME: ${{ steps.producer_identity.outputs.right_artifact_name }}
+          NEXAWRT_LEFT_PRODUCER_DESCRIPTOR: release-staging/provenance/${{ needs.preflight.outputs.flavor }}/a/producer-descriptor.json
+          NEXAWRT_RIGHT_PRODUCER_DESCRIPTOR: release-staging/provenance/${{ needs.preflight.outputs.flavor }}/b/producer-descriptor.json
+          NEXAWRT_LEFT_PROVENANCE_BUNDLE: release-staging/provenance/${{ needs.preflight.outputs.flavor }}/a/producer-descriptor.provenance.bundle.json
+          NEXAWRT_RIGHT_PROVENANCE_BUNDLE: release-staging/provenance/${{ needs.preflight.outputs.flavor }}/b/producer-descriptor.provenance.bundle.json
+        run: ./scripts/compare-reproducible-builds.sh "$RELEASE_FLAVOR" release-staging/replicas/"$RELEASE_FLAVOR"/a release-staging/replicas/"$RELEASE_FLAVOR"/b release-staging/"$RELEASE_FLAVOR"/verified-dist
+      - name: Upload verified release payload
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: verified-release-${{ github.run_id }}-${{ github.run_attempt }}-${{ needs.preflight.outputs.flavor }}
+          path: release-staging/${{ needs.preflight.outputs.flavor }}/verified-dist/
+          if-no-files-found: error
+          retention-days: 30
+
+  publish:
+    needs: [preflight, compare]
+    runs-on: ubuntu-24.04
+    environment: ram-test-release
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+      artifact-metadata: write
+    env:
+      RELEASE_FLAVOR: ${{ needs.preflight.outputs.flavor }}
+    steps:
+      - name: Checkout verification policy
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - name: Pin attestation verifier executable
+        run: |
+          test -x /usr/bin/gh
+          test ! -L /usr/bin/gh
+          printf 'NEXAWRT_ATTESTATION_VERIFIER=/usr/bin/gh\n' >> "$GITHUB_ENV"
+          printf 'NEXAWRT_ATTESTATION_VERIFIER_SHA256=%s\n' "$(sha256sum /usr/bin/gh | awk '{print $1}')" >> "$GITHUB_ENV"
+      - name: Download verified release payload
+        uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5.0.0
+        with:
+          name: verified-release-${{ github.run_id }}-${{ github.run_attempt }}-${{ needs.preflight.outputs.flavor }}
+          path: release-staging/verified-dist
+      - name: Verify immutable payload and package exact verified-dist archive
+        run: |
+          ./scripts/compare-reproducible-builds.sh --verify-verified-dist release-staging/verified-dist
+          grep -Fxq "flavor=$RELEASE_FLAVOR" release-staging/verified-dist/BUILD-MANIFEST.txt
+          grep -Fq 'initramfs RAM-boot candidate only.' release-staging/verified-dist/DO-NOT-FLASH.txt
+          source_epoch="$(awk -F= '$1 == "source_date_epoch" { count++; value=$2 } END { if (count != 1 || value !~ /^[1-9][0-9]*$/) exit 1; print value }' release-staging/verified-dist/BUILD-MANIFEST.txt)"
+          archive_basename="NexaWrt-AX9000-${RELEASE_FLAVOR}-verified-dist.tar.gz"
+          mkdir release-staging/publish
+          tar --sort=name --owner=0 --group=0 --numeric-owner --mtime="@$source_epoch" \
+            -C release-staging -cf - verified-dist | gzip -9n > "release-staging/publish/$archive_basename"
+          (
+            cd release-staging/publish
+            sha256sum "$archive_basename" > "$archive_basename.sha256"
+            sha256sum -c "$archive_basename.sha256"
+          )
+          extract_dir="$(mktemp -d)"
+          trap 'rm -rf "$extract_dir"' EXIT
+          tar -xzf "release-staging/publish/$archive_basename" -C "$extract_dir"
+          ./scripts/compare-reproducible-builds.sh --verify-verified-dist "$extract_dir/verified-dist"
+      - name: Attest firmware
+        id: firmware_attestation
+        uses: actions/attest-build-provenance@96278af6caaf10aea03fd8d33a09a777ca52d62f # v3.2.0
+        with:
+          subject-path: release-staging/verified-dist/openwrt-qualcommax-ipq807x-xiaomi_ax9000_single_ubi-initramfs-uImage.itb
+      - name: Attest SBOM
+        id: sbom_attestation
+        uses: actions/attest-build-provenance@96278af6caaf10aea03fd8d33a09a777ca52d62f # v3.2.0
+        with:
+          subject-path: release-staging/verified-dist/openwrt-qualcommax-ipq807x-xiaomi_ax9000_single_ubi.bom.cdx.json
+      - name: Attest checksums
+        id: checksums_attestation
+        uses: actions/attest-build-provenance@96278af6caaf10aea03fd8d33a09a777ca52d62f # v3.2.0
+        with:
+          subject-path: release-staging/verified-dist/SHA256SUMS
+      - name: Attest exact verified-dist archive
+        id: archive_attestation
+        uses: actions/attest-build-provenance@96278af6caaf10aea03fd8d33a09a777ca52d62f # v3.2.0
+        with:
+          subject-path: release-staging/publish/NexaWrt-AX9000-${{ needs.preflight.outputs.flavor }}-verified-dist.tar.gz
+      - name: Attach offline attestation bundles outside verified-dist
+        run: |
+          cp '${{ steps.firmware_attestation.outputs.bundle-path }}' release-staging/publish/firmware.provenance.bundle.json
+          cp '${{ steps.sbom_attestation.outputs.bundle-path }}' release-staging/publish/sbom.provenance.bundle.json
+          cp '${{ steps.checksums_attestation.outputs.bundle-path }}' release-staging/publish/checksums.provenance.bundle.json
+          cp '${{ steps.archive_attestation.outputs.bundle-path }}' release-staging/publish/archive.provenance.bundle.json
+      - name: Create, verify, and publish prerelease
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release create "$GITHUB_REF_NAME" dist/* \
+          ./scripts/compare-reproducible-builds.sh --verify-verified-dist release-staging/verified-dist
+          remote_type="$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$GITHUB_REF_NAME" --jq '.object.type')"
+          remote_sha="$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$GITHUB_REF_NAME" --jq '.object.sha')"
+          test "$remote_type" = commit
+          test "$remote_sha" = "$GITHUB_SHA"
+          gh release create "$GITHUB_REF_NAME" --verify-tag --draft --prerelease \
             --title "$GITHUB_REF_NAME" \
-            --prerelease \
-            --notes "NexaWrt AX9000 single-large-UBI-v1 initramfs RAM-boot candidate. This is not a flash image; backups, UART, bootloader visibility, and recovery testing remain mandatory."
+            --notes "Reproducible NexaWrt AX9000 $RELEASE_FLAVOR initramfs RAM-boot candidate. NOT FOR FLASHING. Hardware, UART, recovery, and stress-test approval remain mandatory."
+          while IFS= read -r -d '' asset; do
+            gh release upload "$GITHUB_REF_NAME" "$asset"
+          done < <(find release-staging/publish -maxdepth 1 -type f -print0 | sort -z)
+          expected="$(find release-staging/publish -maxdepth 1 -type f -exec basename {} \; | sort)"
+          actual="$(gh api "repos/$GITHUB_REPOSITORY/releases/tags/$GITHUB_REF_NAME" --jq '.assets[].name' | sort)"
+          test "$actual" = "$expected"
+          gh release edit "$GITHUB_REF_NAME" --draft=false --prerelease

@@ -1,6 +1,7 @@
 .work/
 build.log
 build-nss.log
+/build-*.log
 dist/*
 !dist/.gitkeep
 dist-nss/
@@ -10,3 +11,7 @@ dist-nss/
 # Raw router backups can contain credentials and must never enter Git.
 ax9000-backup-*/
 .ax9000-backup-*.tmp.*/
+# Hardware evidence and dumps may contain MAC addresses, serials, logs, and secrets.
+hardware-evidence/
+ax9000-hardware-evidence-*/
+release-staging/
