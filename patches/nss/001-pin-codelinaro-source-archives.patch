@@ -29,6 +29,63 @@ index f172027..f911ae3 100644
  include $(INCLUDE_DIR)/package.mk
  
  ifeq ($(CONFIG_TARGET_SUBTARGET), "ipq807x")
+diff --git a/qca-nss-clients/patches/0033-reproducible-build-id.patch b/qca-nss-clients/patches/0033-reproducible-build-id.patch
+new file mode 100644
+index 0000000..1a231b1
+--- /dev/null
++++ b/qca-nss-clients/patches/0033-reproducible-build-id.patch
+@@ -0,0 +1,51 @@
++diff --git a/Makefile b/Makefile
++index b2815ba..5841f9f 100644
++--- a/Makefile
+++++ b/Makefile
++@@ -2,7 +2,11 @@
++ 
++ ccflags-y := -I$(obj) -I$(obj)/..
++ 
++-export BUILD_ID = \"Build Id: $(shell date +'%m/%d/%y, %H:%M:%S')\"
+++ifeq ($(strip $(SOURCE_DATE_EPOCH)),)
+++$(error SOURCE_DATE_EPOCH is required for reproducible NSS client builds)
+++endif
+++NSS_CLIENT_BUILD_DATE := $(shell date -u -d "@$(SOURCE_DATE_EPOCH)" +'%m/%d/%y, %H:%M:%S')
+++export BUILD_ID := \"Build Id: $(NSS_CLIENT_BUILD_DATE)\"
++ ccflags-y += -DNSS_CLIENT_BUILD_ID="$(BUILD_ID)"
++ 
++ qca-nss-tun6rd-objs := nss_connmgr_tun6rd.o
++diff --git a/dtls/v2.0/Makefile b/dtls/v2.0/Makefile
++index adf87de..2d1c8e8 100644
++--- a/dtls/v2.0/Makefile
+++++ b/dtls/v2.0/Makefile
++@@ -2,7 +2,11 @@
++ 
++ ccflags-y += $(NSS_CCFLAGS) -I$(obj)/../../exports
++ ccflags-y += -DNSS_DTLSMGR_DEBUG_LEVEL=0
++-ccflags-y += -DNSS_DTLSMGR_BUILD_ID=\"'Build_ID - $(shell date +'%m/%d/%y, %H:%M:%S') SoC=$(SoC)'\"
+++ifeq ($(strip $(SOURCE_DATE_EPOCH)),)
+++$(error SOURCE_DATE_EPOCH is required for reproducible NSS DTLS builds)
+++endif
+++NSS_DTLSMGR_BUILD_DATE := $(shell date -u -d "@$(SOURCE_DATE_EPOCH)" +'%m/%d/%y, %H:%M:%S')
+++ccflags-y += -DNSS_DTLSMGR_BUILD_ID=\"'Build_ID - $(NSS_DTLSMGR_BUILD_DATE) SoC=$(SoC)'\"
++ ccflags-y += -Wall -Werror
++ 
++ obj-m += qca-nss-dtlsmgr.o
++diff --git a/tls/Makefile b/tls/Makefile
++index b60a79f..c5b274d 100644
++--- a/tls/Makefile
+++++ b/tls/Makefile
++@@ -3,7 +3,11 @@
++ ccflags-y += $(NSS_CCFLAGS) -I$(obj)/../exports
++ #ccflags-y += -DNSS_TLSMGR_DEBUG_DUMP
++ ccflags-y += -DNSS_TLSMGR_DEBUG_LEVEL=3
++-ccflags-y += -DNSS_TLSMGR_BUILD_ID=\"'Build_ID - $(shell date +'%m/%d/%y, %H:%M:%S') SoC=$(SoC)'\"
+++ifeq ($(strip $(SOURCE_DATE_EPOCH)),)
+++$(error SOURCE_DATE_EPOCH is required for reproducible NSS TLS builds)
+++endif
+++NSS_TLSMGR_BUILD_DATE := $(shell date -u -d "@$(SOURCE_DATE_EPOCH)" +'%m/%d/%y, %H:%M:%S')
+++ccflags-y += -DNSS_TLSMGR_BUILD_ID=\"'Build_ID - $(NSS_TLSMGR_BUILD_DATE) SoC=$(SoC)'\"
++ ccflags-y += -Wall -Werror
++ 
++ obj-m += qca-nss-tlsmgr.o
 diff --git a/qca-nss-drv/Makefile b/qca-nss-drv/Makefile
 index 29a87fd..0178b96 100644
 --- a/qca-nss-drv/Makefile

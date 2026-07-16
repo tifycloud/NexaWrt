@@ -15,6 +15,8 @@ NEXAWRT_FLAVOR="${NEXAWRT_FLAVOR:-official}"
 WITH_FEEDS=1
 CLEAN=0
 NSS_PACKAGES_SOURCE_PATCH="$ROOT_DIR/patches/nss/001-pin-codelinaro-source-archives.patch"
+APK_REPRO_SOURCE_PATCH="package/system/apk/patches/0011-genhelp-reproducible-gzip.patch"
+APK_REPRO_UPSTREAM_SHA256="a338662ccbef6b916b7cb2e32c91ef981b9f8e69fe056ad0513fd384ee152d1c"
 
 # Do not inherit an unreviewed user/global Git proxy. A caller that needs one
 # must provide it explicitly through NEXAWRT_GIT_HTTP_PROXY or HTTPS_PROXY.
@@ -565,6 +567,22 @@ for encoded in raw.split(b"\0"):
     raise SystemExit(f"unexpected ignored source path: {path}")
 PY_IGNORED
 write_openwrt_revision
+
+# The official lock already contains the reviewed apk gzip fix while the NSS
+# lock does not. Normalize only that exact known file so root patch 004 can add
+# one canonical package-local source patch on both source lines.
+if [[ -e "$APK_REPRO_SOURCE_PATCH" || -L "$APK_REPRO_SOURCE_PATCH" ]]; then
+  [[ -f "$APK_REPRO_SOURCE_PATCH" && ! -L "$APK_REPRO_SOURCE_PATCH" ]] || {
+    echo "Existing apk reproducibility patch is unsafe" >&2
+    exit 1
+  }
+  apk_repro_hash="$(if command -v sha256sum >/dev/null 2>&1; then sha256sum -- "$APK_REPRO_SOURCE_PATCH"; else shasum -a 256 -- "$APK_REPRO_SOURCE_PATCH"; fi | awk '{print $1}')"
+  [[ "$apk_repro_hash" == "$APK_REPRO_UPSTREAM_SHA256" ]] || {
+    echo "Existing apk reproducibility patch differs from the reviewed upstream copy" >&2
+    exit 1
+  }
+  rm -- "$APK_REPRO_SOURCE_PATCH"
+fi
 
 for patch in "$ROOT_DIR"/patches/[0-9][0-9][0-9]-*.patch; do
   git apply --check "$patch"

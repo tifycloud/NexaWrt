@@ -72,6 +72,9 @@ actual_source_origin="$(git -C "$WORK_DIR" remote get-url origin 2>/dev/null)" |
 [[ "$actual_source_commit" == "$OPENWRT_COMMIT" ]] || fail "official source checkout is not at locked commit"
 [[ "$actual_source_origin" == "$OPENWRT_REPO" ]] || fail "official source checkout uses an unexpected origin"
 
+/bin/bash "$ROOT_DIR/scripts/apk-signing-key.sh" verify-public ||
+  fail "APK signing identity is missing or invalid"
+
 NEXAWRT_FLAVOR=official "$ROOT_DIR/scripts/validate.sh" --source "$WORK_DIR" --artifacts ||
   fail "official source/artifact validation failed"
 
@@ -128,6 +131,8 @@ source_repository=$actual_source_origin
 source_tag=$OPENWRT_TAG
 source_commit=$actual_source_commit
 source_date_epoch=$source_date_epoch
+apk_signing_profile=$NEXAWRT_APK_SIGNING_PROFILE
+apk_signing_public_sha256=$NEXAWRT_APK_SIGNING_PUBLIC_SHA256
 stage=initramfs-ram-boot-only
 real_device_boot_approved=no
 image=$EXPECTED_IMAGE

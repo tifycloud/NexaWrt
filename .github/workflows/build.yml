@@ -1,10 +1,10 @@
-name: NexaWrt AX9000 initramfs build
+name: NexaWrt AX9000 browser verified build
 
 on:
   workflow_dispatch:
     inputs:
       flavor:
-        description: Build flavor (official is the default; nss is experimental)
+        description: AX9000 build flavor (official is default; nss is experimental)
         required: true
         default: official
         type: choice
@@ -27,29 +27,132 @@ on:
     branches: [main]
   merge_group:
 
-permissions:
-  contents: read
+permissions: {}
 
 concurrency:
-  group: nexawrt-ax9000-build-${{ github.ref }}-${{ github.event_name == 'workflow_dispatch' && inputs.flavor || 'official' }}
+  group: nexawrt-browser-build-${{ github.ref }}-${{ github.event_name == 'workflow_dispatch' && inputs.flavor || 'policy' }}
   cancel-in-progress: true
 
 jobs:
-  build:
+  policy:
     runs-on: ubuntu-24.04
-    timeout-minutes: 360
-    env:
-      NEXAWRT_FLAVOR: ${{ github.event_name == 'workflow_dispatch' && inputs.flavor || 'official' }}
-      CLEAN_BUILD: '1'
+    permissions:
+      contents: read
     steps:
       - name: Checkout project
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           persist-credentials: false
-
       - name: Run repository policy checks
-        run: ./tests/test_static.sh
+        run: |
+          NEXAWRT_FLAVOR=official ./tests/test_static.sh
+          NEXAWRT_FLAVOR=nss ./tests/test_static.sh
+      - name: Lint shell safety policies
+        run: shellcheck -S warning scripts/*.sh tests/*.sh files/sbin/* files-nss/etc/uci-defaults/* files/etc/uci-defaults/*
 
+  preflight:
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    outputs:
+      flavor: ${{ steps.identity.outputs.flavor }}
+      work_basename: ${{ steps.identity.outputs.work_basename }}
+      staging_basename: ${{ steps.identity.outputs.staging_basename }}
+    steps:
+      - name: Checkout requested commit
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - name: Derive strict browser build identity
+        id: identity
+        env:
+          REQUESTED_FLAVOR: ${{ inputs.flavor }}
+        run: |
+          set -euo pipefail
+          test "$GITHUB_EVENT_NAME" = workflow_dispatch
+          test "$GITHUB_REF" = refs/heads/main
+          test "$GITHUB_REF_TYPE" = branch
+          test "$GITHUB_REF_NAME" = main
+          test "$GITHUB_WORKFLOW_REF" = 'tifycloud/NexaWrt/.github/workflows/build.yml@refs/heads/main'
+          test "$GITHUB_WORKFLOW_SHA" = "$GITHUB_SHA"
+          case "$REQUESTED_FLAVOR" in
+            official)
+              work_basename=openwrt-browser
+              staging_basename=dist
+              ;;
+            nss)
+              work_basename=openwrt-nss-browser
+              staging_basename=dist-nss
+              ;;
+            *)
+              echo "Unsupported build flavor: $REQUESTED_FLAVOR" >&2
+              exit 1
+              ;;
+          esac
+          printf 'flavor=%s\nwork_basename=%s\nstaging_basename=%s\n' \
+            "$REQUESTED_FLAVOR" "$work_basename" "$staging_basename" >> "$GITHUB_OUTPUT"
+
+  build:
+    if: github.event_name == 'workflow_dispatch'
+    needs: [policy, preflight]
+    strategy:
+      fail-fast: false
+      matrix:
+        replica: [a, b]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+      artifact-metadata: write
+    env:
+      NEXAWRT_FLAVOR: ${{ needs.preflight.outputs.flavor }}
+      NEXAWRT_BUILD_REPLICA: ${{ matrix.replica }}
+      NEXAWRT_APK_SIGNING_PROFILE: production
+      CLEAN_BUILD: '1'
+      WORK_DIR: .work/${{ needs.preflight.outputs.work_basename }}-${{ matrix.replica }}
+      DIST_DIR_OVERRIDE: ${{ github.workspace }}/release-staging/browser-replica-${{ needs.preflight.outputs.flavor }}-${{ matrix.replica }}/${{ needs.preflight.outputs.staging_basename }}
+      DIST_NSS_DIR_OVERRIDE: ${{ github.workspace }}/release-staging/browser-replica-${{ needs.preflight.outputs.flavor }}-${{ matrix.replica }}/${{ needs.preflight.outputs.staging_basename }}
+      BUILD_LOG: ${{ github.workspace }}/build-browser-${{ needs.preflight.outputs.flavor }}-${{ matrix.replica }}.log
+    steps:
+      - name: Checkout project
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - name: Require committed production APK public identity
+        run: |
+          set -euo pipefail
+          source ./scripts/lock-file-policy.sh
+          nexawrt_validate_lock_file manifests/apk-signing.lock apk-signing
+          source manifests/apk-signing.lock
+          production_anchor="$NEXAWRT_APK_SIGNING_PRODUCTION_PUBLIC_SHA256"
+          [[ "$production_anchor" =~ ^[0-9a-f]{64}$ ]] || {
+            echo 'production APK signing trust anchor is not provisioned' >&2
+            exit 1
+          }
+          public_key="$(pwd -P)/manifests/apk-signing-public.pem"
+          [[ -f "$public_key" && ! -L "$public_key" ]] || {
+            echo 'committed production APK public key is missing or unsafe' >&2
+            exit 1
+          }
+          policy_topdir="$RUNNER_TEMP/nexawrt-browser-apk-policy-${{ matrix.replica }}"
+          mkdir -m 0700 "$policy_topdir"
+          prepared="$(NEXAWRT_APK_SIGNING_PROFILE=production \
+            NEXAWRT_APK_SIGNING_PUBLIC_SHA256="$production_anchor" \
+            NEXAWRT_APK_SIGNING_PUBLIC_KEY_FILE="$public_key" \
+            ./scripts/apk-signing-key.sh prepare "$policy_topdir")"
+          IFS=$'\t' read -r prepared_profile prepared_sha256 prepared_public_key <<<"$prepared"
+          [[ "$prepared_profile" == production && "$prepared_sha256" == "$production_anchor" && -f "$prepared_public_key" ]] || {
+            echo 'committed production APK public key did not satisfy the repository trust anchor' >&2
+            exit 1
+          }
+          {
+            printf 'NEXAWRT_APK_SIGNING_PROFILE=production\n'
+            printf 'NEXAWRT_APK_SIGNING_PUBLIC_KEY_FILE=%s\n' "$public_key"
+            printf 'NEXAWRT_APK_SIGNING_PUBLIC_SHA256=%s\n' "$production_anchor"
+          } >> "$GITHUB_ENV"
       - name: Install OpenWrt build dependencies
         run: |
           sudo apt-get update
@@ -58,38 +161,202 @@ jobs:
             gettext git libncurses-dev libssl-dev python3 python3-setuptools \
             python3-pyelftools python3-packaging rsync swig unzip zlib1g-dev \
             file wget libelf-dev shellcheck subversion time xsltproc zstd
-      - name: Lint shell safety policies
-        run: shellcheck -S warning scripts/*.sh tests/*.sh files/sbin/* files-nss/etc/uci-defaults/* files/etc/uci-defaults/*
-
-      - name: Cache public source downloads
-        uses: actions/cache@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
-        with:
-          path: |
-            .work/openwrt/dl
-            .work/openwrt-nss/dl
-          key: openwrt-dl-${{ env.NEXAWRT_FLAVOR }}-${{ hashFiles('manifests/*.lock', 'configs/**', 'patches/**') }}
-          restore-keys: |
-            openwrt-dl-${{ env.NEXAWRT_FLAVOR }}-
-
-      - name: Build and stage artifact
-        env:
-          BUILD_LOG: ${{ github.workspace }}/build-${{ env.NEXAWRT_FLAVOR }}.log
+      - name: Build isolated clean replica
         run: ./scripts/build.sh
-
-      - name: Upload official firmware and evidence
-        if: env.NEXAWRT_FLAVOR == 'official'
+      - name: Upload isolated replica
+        id: replica_artifact
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          name: nexawrt-ax9000-initramfs-official-${{ github.sha }}
-          path: dist/
+          name: browser-build-${{ github.run_id }}-${{ github.run_attempt }}-${{ needs.preflight.outputs.flavor }}-${{ matrix.replica }}
+          path: release-staging/browser-replica-${{ needs.preflight.outputs.flavor }}-${{ matrix.replica }}/${{ needs.preflight.outputs.staging_basename }}/
           if-no-files-found: error
-          retention-days: 30
+          retention-days: 14
+      - name: Create strict browser producer descriptor
+        env:
+          BUILD_FLAVOR: ${{ needs.preflight.outputs.flavor }}
+          REPLICA_ID: ${{ matrix.replica }}
+          ARTIFACT_ID: ${{ steps.replica_artifact.outputs.artifact-id }}
+          ARTIFACT_NAME: browser-build-${{ github.run_id }}-${{ github.run_attempt }}-${{ needs.preflight.outputs.flavor }}-${{ matrix.replica }}
+          RECEIPT_PATH: release-staging/browser-replica-${{ needs.preflight.outputs.flavor }}-${{ matrix.replica }}/${{ needs.preflight.outputs.staging_basename }}/SHA256SUMS
+          DESCRIPTOR_PATH: release-staging/browser-provenance-${{ matrix.replica }}/producer-descriptor.json
+        run: |
+          set -euo pipefail
+          test -n "$ARTIFACT_ID"
+          mkdir -p "$(dirname "$DESCRIPTOR_PATH")"
+          test "$GITHUB_REF" = refs/heads/main
+          test "$GITHUB_WORKFLOW_REF" = 'tifycloud/NexaWrt/.github/workflows/build.yml@refs/heads/main'
+          test "$GITHUB_WORKFLOW_SHA" = "$GITHUB_SHA"
+          python3 - "$DESCRIPTOR_PATH" "$RECEIPT_PATH" "$ARTIFACT_ID" "$ARTIFACT_NAME" \
+            "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" "$BUILD_FLAVOR" "$REPLICA_ID" \
+            "$GITHUB_REF" "$GITHUB_SHA" "$GITHUB_WORKFLOW_REF" "$GITHUB_WORKFLOW_SHA" <<'PY'
+          import hashlib
+          import json
+          import pathlib
+          import re
+          import sys
 
-      - name: Upload experimental NSS firmware and evidence
-        if: env.NEXAWRT_FLAVOR == 'nss'
+          (
+              descriptor_path, receipt_path, artifact_id, artifact_name, run_id, run_attempt, flavor, replica_id,
+              source_ref, source_digest, workflow_ref, signer_digest,
+          ) = sys.argv[1:]
+          if not re.fullmatch(r"[1-9][0-9]*", artifact_id):
+              raise SystemExit("artifact-id is invalid")
+          if flavor not in {"official", "nss"} or replica_id not in {"a", "b"}:
+              raise SystemExit("producer coordinates are invalid")
+          expected_name = f"browser-build-{run_id}-{run_attempt}-{flavor}-{replica_id}"
+          if artifact_name != expected_name:
+              raise SystemExit("artifact name is not canonical")
+          receipt = pathlib.Path(receipt_path)
+          descriptor = {
+              "artifact_id": artifact_id,
+              "artifact_name": artifact_name,
+              "flavor": flavor,
+              "receipt_filename": "SHA256SUMS",
+              "receipt_sha256": hashlib.sha256(receipt.read_bytes()).hexdigest(),
+              "replica_id": replica_id,
+              "repository": "tifycloud/NexaWrt",
+              "run_attempt": run_attempt,
+              "run_id": run_id,
+              "schema": 2,
+              "signer_digest": signer_digest,
+              "source_digest": source_digest,
+              "source_ref": source_ref,
+              "workflow": "tifycloud/NexaWrt/.github/workflows/build.yml",
+              "workflow_ref": workflow_ref,
+          }
+          pathlib.Path(descriptor_path).write_text(
+              json.dumps(descriptor, sort_keys=True, separators=(",", ":")) + "\n",
+              encoding="utf-8",
+          )
+          PY
+      - name: Attest strict browser producer descriptor
+        id: replica_attestation
+        uses: actions/attest-build-provenance@96278af6caaf10aea03fd8d33a09a777ca52d62f # v3.2.0
+        with:
+          subject-path: release-staging/browser-provenance-${{ matrix.replica }}/producer-descriptor.json
+      - name: Stage offline browser provenance
+        run: |
+          cp '${{ steps.replica_attestation.outputs.bundle-path }}' \
+            release-staging/browser-provenance-${{ matrix.replica }}/producer-descriptor.provenance.bundle.json
+      - name: Upload offline browser provenance
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          name: nexawrt-ax9000-initramfs-nss-${{ github.sha }}
-          path: dist-nss/
+          name: browser-provenance-${{ github.run_id }}-${{ github.run_attempt }}-${{ needs.preflight.outputs.flavor }}-${{ matrix.replica }}
+          path: release-staging/browser-provenance-${{ matrix.replica }}/
+          if-no-files-found: error
+          retention-days: 14
+
+  compare:
+    if: github.event_name == 'workflow_dispatch'
+    needs: [preflight, build]
+    runs-on: ubuntu-24.04
+    permissions:
+      actions: read
+      contents: read
+      attestations: read
+    steps:
+      - name: Checkout comparison policy
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - name: Pin attestation verifier executable
+        run: |
+          set -euo pipefail
+          test -x /usr/bin/gh
+          test ! -L /usr/bin/gh
+          printf 'NEXAWRT_ATTESTATION_VERIFIER=/usr/bin/gh\n' >> "$GITHUB_ENV"
+          printf 'NEXAWRT_ATTESTATION_VERIFIER_SHA256=%s\n' "$(sha256sum /usr/bin/gh | awk '{print $1}')" >> "$GITHUB_ENV"
+      - name: Download browser replica A
+        uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5.0.0
+        with:
+          name: browser-build-${{ github.run_id }}-${{ github.run_attempt }}-${{ needs.preflight.outputs.flavor }}-a
+          path: release-staging/browser-replicas/${{ needs.preflight.outputs.flavor }}/a
+      - name: Download browser replica B
+        uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5.0.0
+        with:
+          name: browser-build-${{ github.run_id }}-${{ github.run_attempt }}-${{ needs.preflight.outputs.flavor }}-b
+          path: release-staging/browser-replicas/${{ needs.preflight.outputs.flavor }}/b
+      - name: Download browser replica A provenance
+        uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5.0.0
+        with:
+          name: browser-provenance-${{ github.run_id }}-${{ github.run_attempt }}-${{ needs.preflight.outputs.flavor }}-a
+          path: release-staging/browser-provenance/${{ needs.preflight.outputs.flavor }}/a
+      - name: Download browser replica B provenance
+        uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5.0.0
+        with:
+          name: browser-provenance-${{ github.run_id }}-${{ github.run_attempt }}-${{ needs.preflight.outputs.flavor }}-b
+          path: release-staging/browser-provenance/${{ needs.preflight.outputs.flavor }}/b
+      - name: Resolve browser artifact identities
+        id: producer_identity
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BUILD_FLAVOR: ${{ needs.preflight.outputs.flavor }}
+        run: |
+          set -euo pipefail
+          artifact_json="$(mktemp)"
+          trap 'rm -f "$artifact_json"' EXIT
+          /usr/bin/gh api "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/artifacts?per_page=100" > "$artifact_json"
+          python3 - "$artifact_json" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" "$BUILD_FLAVOR" "$GITHUB_OUTPUT" <<'PY'
+          import json
+          import pathlib
+          import sys
+
+          path, run_id, run_attempt, flavor, output_path = sys.argv[1:]
+          value = json.loads(pathlib.Path(path).read_text(encoding="utf-8"))
+          artifacts = value.get("artifacts")
+          if not isinstance(artifacts, list):
+              raise SystemExit("workflow artifact response is invalid")
+          resolved = {}
+          for replica in ("a", "b"):
+              name = f"browser-build-{run_id}-{run_attempt}-{flavor}-{replica}"
+              matches = [item for item in artifacts if item.get("name") == name and item.get("expired") is False]
+              if len(matches) != 1 or not isinstance(matches[0].get("id"), int) or matches[0]["id"] <= 0:
+                  raise SystemExit(f"expected exactly one live artifact named {name}")
+              resolved[replica] = (str(matches[0]["id"]), name)
+          if resolved["a"][0] == resolved["b"][0]:
+              raise SystemExit("workflow artifact identities are not distinct")
+          with pathlib.Path(output_path).open("a", encoding="utf-8") as stream:
+              for slot, replica in (("left", "a"), ("right", "b")):
+                  artifact_id, artifact_name = resolved[replica]
+                  stream.write(f"{slot}_artifact_id={artifact_id}\n")
+                  stream.write(f"{slot}_artifact_name={artifact_name}\n")
+          PY
+      - name: Enforce browser reproducibility gate
+        env:
+          BUILD_FLAVOR: ${{ needs.preflight.outputs.flavor }}
+          NEXAWRT_LEFT_ARTIFACT_ID: ${{ steps.producer_identity.outputs.left_artifact_id }}
+          NEXAWRT_RIGHT_ARTIFACT_ID: ${{ steps.producer_identity.outputs.right_artifact_id }}
+          NEXAWRT_LEFT_ARTIFACT_NAME: ${{ steps.producer_identity.outputs.left_artifact_name }}
+          NEXAWRT_RIGHT_ARTIFACT_NAME: ${{ steps.producer_identity.outputs.right_artifact_name }}
+          NEXAWRT_LEFT_PRODUCER_DESCRIPTOR: release-staging/browser-provenance/${{ needs.preflight.outputs.flavor }}/a/producer-descriptor.json
+          NEXAWRT_RIGHT_PRODUCER_DESCRIPTOR: release-staging/browser-provenance/${{ needs.preflight.outputs.flavor }}/b/producer-descriptor.json
+          NEXAWRT_LEFT_PROVENANCE_BUNDLE: release-staging/browser-provenance/${{ needs.preflight.outputs.flavor }}/a/producer-descriptor.provenance.bundle.json
+          NEXAWRT_RIGHT_PROVENANCE_BUNDLE: release-staging/browser-provenance/${{ needs.preflight.outputs.flavor }}/b/producer-descriptor.provenance.bundle.json
+        run: |
+          set -euo pipefail
+          ./scripts/compare-reproducible-builds.sh "$BUILD_FLAVOR" \
+            release-staging/browser-replicas/"$BUILD_FLAVOR"/a \
+            release-staging/browser-replicas/"$BUILD_FLAVOR"/b \
+            release-staging/"$BUILD_FLAVOR"/verified-dist
+          ./scripts/compare-reproducible-builds.sh --verify-verified-dist \
+            release-staging/"$BUILD_FLAVOR"/verified-dist
+      - name: Upload browser-downloadable verified AX9000 image
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: NexaWrt-AX9000-${{ needs.preflight.outputs.flavor }}-verified-dist-${{ github.sha }}
+          path: release-staging/${{ needs.preflight.outputs.flavor }}/verified-dist/
           if-no-files-found: error
           retention-days: 30
+      - name: Publish browser download guidance
+        env:
+          BUILD_FLAVOR: ${{ needs.preflight.outputs.flavor }}
+        run: |
+          {
+            echo '## NexaWrt AX9000 软件候选已验证'
+            echo
+            echo "- Flavor: \`$BUILD_FLAVOR\`"
+            echo "- Commit: \`$GITHUB_SHA\`"
+            echo '- 两个隔离、干净构建副本的 verified-dist 已通过字节级一致性和 GitHub provenance 验证。'
+            echo "- 请在本次 Actions 运行页面的 **Artifacts** 区域下载 \`NexaWrt-AX9000-*-verified-dist-*\`。"
+            echo '- **仍需 AX9000 真机 RAM 启动、UART、恢复路径、重启与压力验收；当前不要直接刷写到闪存。**'
+          } >> "$GITHUB_STEP_SUMMARY"

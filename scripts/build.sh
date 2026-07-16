@@ -25,6 +25,7 @@ WORK_DIR="${WORK_DIR:-$DEFAULT_WORK_DIR}"
 JOBS="${JOBS:-}"
 BUILD_LOG="${BUILD_LOG:-$DEFAULT_BUILD_LOG}"
 CLEAN_BUILD="${CLEAN_BUILD:-1}"
+APK_SIGNING_TOOL="$ROOT_DIR/scripts/apk-signing-key.sh"
 
 
 git_history_overrides_absent() {
@@ -140,22 +141,60 @@ export KBUILD_BUILD_USER=nexawrt
 export KBUILD_BUILD_HOST=builder
 export KBUILD_BUILD_VERSION=0
 
+if [[ -e private-key.pem || -L private-key.pem ]]; then
+  echo "Refusing APK private key inside OpenWrt TOPDIR" >&2
+  exit 1
+fi
+
 case "$CLEAN_BUILD" in
-  1) rm -rf build_dir staging_dir tmp bin logs ;;
+  1)
+    rm -rf build_dir staging_dir tmp bin logs
+    rm -f -- public-key.pem
+    ;;
   0) ;;
   *) echo "CLEAN_BUILD must be 0 or 1" >&2; exit 2 ;;
 esac
+
+IFS=$'\t' read -r APK_SIGNING_PROFILE APK_SIGNING_PUBLIC_SHA256 APK_SIGNING_PUBLIC_KEY < <(
+  /bin/bash "$APK_SIGNING_TOOL" prepare "$WORK_DIR"
+) || {
+  echo "APK signing public key preparation failed" >&2
+  exit 1
+}
+[[ -n "$APK_SIGNING_PROFILE" && -n "$APK_SIGNING_PUBLIC_SHA256" &&
+   -n "$APK_SIGNING_PUBLIC_KEY" ]] || {
+  echo "APK signing public key preparation returned incomplete metadata" >&2
+  exit 1
+}
+export NEXAWRT_APK_SIGNING_PROFILE="$APK_SIGNING_PROFILE"
+export NEXAWRT_APK_SIGNING_PUBLIC_SHA256="$APK_SIGNING_PUBLIC_SHA256"
+export NEXAWRT_APK_SIGNING_PUBLIC_KEY_FILE="$APK_SIGNING_PUBLIC_KEY"
+/bin/bash "$APK_SIGNING_TOOL" verify-public
+APK_MAKE_ARGS=(
+  "NEXAWRT_APK_PUBLIC_ONLY=1"
+  "BUILD_KEY_APK_PUB=$APK_SIGNING_PUBLIC_KEY"
+)
+
+assert_no_topdir_private_key() {
+  if [[ -e "$WORK_DIR/private-key.pem" || -L "$WORK_DIR/private-key.pem" ]]; then
+    rm -f -- "$WORK_DIR/private-key.pem"
+    echo "OpenWrt attempted to create a private key inside TOPDIR" >&2
+    return 1
+  fi
+}
 
 {
   printf 'NexaWrt build start\n'
   printf 'flavor=%s\nsource_commit=%s\nopenwrt_revision=%s\nsource_date_epoch=%s\njobs=%s\nclean_build=%s\n' \
     "$NEXAWRT_FLAVOR" "$SOURCE_COMMIT" "$OPENWRT_REVISION" \
     "$SOURCE_DATE_EPOCH" "$JOBS" "$CLEAN_BUILD"
+  printf 'apk_signing_profile=%s\napk_signing_public_sha256=%s\n' \
+    "$APK_SIGNING_PROFILE" "$APK_SIGNING_PUBLIC_SHA256"
   uname -a
 } > "$BUILD_LOG"
 
 set +e
-make download -j"$JOBS" 2>&1 | tee -a "$BUILD_LOG"
+make "${APK_MAKE_ARGS[@]}" download -j"$JOBS" 2>&1 | tee -a "$BUILD_LOG"
 download_pipeline_status=("${PIPESTATUS[@]}")
 set -e
 download_make_status="${download_pipeline_status[0]}"
@@ -168,10 +207,11 @@ if ((download_make_status != 0)); then
   echo "Download failed; see $BUILD_LOG" >&2
   exit "$download_make_status"
 fi
+assert_no_topdir_private_key || exit 1
 find dl -type f -size -1024c -delete
 
 set +e
-make -j"$JOBS" V=sc 2>&1 | tee -a "$BUILD_LOG"
+make "${APK_MAKE_ARGS[@]}" -j"$JOBS" V=sc 2>&1 | tee -a "$BUILD_LOG"
 build_pipeline_status=("${PIPESTATUS[@]}")
 set -e
 build_make_status="${build_pipeline_status[0]}"
@@ -184,6 +224,8 @@ if ((build_make_status != 0)); then
   echo "Build failed; see $BUILD_LOG" >&2
   exit "$build_make_status"
 fi
+
+assert_no_topdir_private_key || exit 1
 
 if [[ "$NEXAWRT_FLAVOR" == official ]]; then
   NEXAWRT_FLAVOR=official WORK_DIR="$WORK_DIR" BUILD_LOG="$BUILD_LOG" "$ROOT_DIR/scripts/release.sh"

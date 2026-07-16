@@ -32,6 +32,8 @@ git -C "$PROJECT" fetch -q "$ROOT_DIR" HEAD
 git -C "$PROJECT" reset -q --mixed FETCH_HEAD
 PROJECT_COMMIT="$(git -C "$PROJECT" rev-parse HEAD)"
 EMPTY_SHA="$(printf '' | sha256sum | awk '{print $1}')"
+APK_SIGNING_PROFILE='repro-test'
+APK_SIGNING_PUBLIC_SHA256='0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef'
 
 write_checksums() {
   local directory="$1"
@@ -53,6 +55,8 @@ source_repository=$OPENWRT_REPO
 source_tag=$OPENWRT_TAG
 source_commit=$OPENWRT_COMMIT
 source_date_epoch=1
+apk_signing_profile=$APK_SIGNING_PROFILE
+apk_signing_public_sha256=$APK_SIGNING_PUBLIC_SHA256
 stage=initramfs-ram-boot-only
 real_device_boot_approved=no
 image=$IMAGE
@@ -62,7 +66,8 @@ rootfs_mtd_offset=$ROOTFS_MTD_OFFSET_HEX
 rootfs_mtd_size=$ROOTFS_MTD_SIZE_HEX
 MANIFEST_EOF
   {
-    printf 'flavor=official\nproject_commit=%s\nproject_tree_state=clean\nsource_commit=%s\nsource_origin=%s\n' "$PROJECT_COMMIT" "$OPENWRT_COMMIT" "$OPENWRT_REPO"
+    printf 'flavor=official\nproject_commit=%s\nproject_tree_state=clean\nsource_commit=%s\nsource_origin=%s\napk_signing_profile=%s\napk_signing_public_sha256=%s\n' \
+      "$PROJECT_COMMIT" "$OPENWRT_COMMIT" "$OPENWRT_REPO" "$APK_SIGNING_PROFILE" "$APK_SIGNING_PUBLIC_SHA256"
     while read -r name repository commit; do
       [[ -n "$name" && "$name" != \#* ]] || continue
       printf 'feed.%s.commit=%s\nfeed.%s.origin=%s\nfeed.%s.worktree_diff_sha256=%s\n' "$name" "$commit" "$name" "$repository" "$name" "$EMPTY_SHA"
@@ -73,8 +78,8 @@ MANIFEST_EOF
     while IFS= read -r -d '' file; do sha256sum "$file"; done < <(scripts/list-build-inputs.sh official)
   ) > "$directory/EVIDENCE/INPUTS.sha256"
   replica_id="${directory##*/}"; replica_id="${replica_id##*-}"
-  printf 'schema=1\nflavor=official\nreplica_id=%s\nrun_id=local\nrun_attempt=local\nproject_commit=%s\nsource_commit=%s\n' \
-    "$replica_id" "$PROJECT_COMMIT" "$OPENWRT_COMMIT" > "$directory/EVIDENCE/BUILD-IDENTITY.txt"
+  printf 'schema=2\nflavor=official\nreplica_id=%s\nrun_id=local\nrun_attempt=local\nproject_commit=%s\nsource_commit=%s\napk_signing_profile=%s\napk_signing_public_sha256=%s\n' \
+    "$replica_id" "$PROJECT_COMMIT" "$OPENWRT_COMMIT" "$APK_SIGNING_PROFILE" "$APK_SIGNING_PUBLIC_SHA256" > "$directory/EVIDENCE/BUILD-IDENTITY.txt"
   printf 'environment %s\n' "$serial" > "$directory/EVIDENCE/BUILD-ENVIRONMENT.txt"
   printf 'build log\n' > "$directory/EVIDENCE/build.log"
   printf 'config\n' > "$directory/EVIDENCE/resolved.config"
@@ -94,16 +99,27 @@ output="$TMP/output"
 
 session_file="$PROJECT/hardware-evidence/case/SESSION.txt"
 candidate_file="$PROJECT/hardware-evidence/case/CANDIDATE.txt"
+file_mode() {
+  if stat -c '%a' "$1" >/dev/null 2>&1; then
+    stat -c '%a' "$1"
+  else
+    stat -f '%Lp' "$1"
+  fi
+}
 for file in "$session_file" "$candidate_file"; do
   [[ -f "$file" && ! -L "$file" ]] || fail "$(basename "$file") was not created as a regular file"
-  [[ "$(stat -f '%Lp' "$file" 2>/dev/null || stat -c '%a' "$file")" == 600 ]] || fail "$(basename "$file") mode is not 0600"
+  [[ "$(file_mode "$file")" == 600 ]] || fail "$(basename "$file") mode is not 0600"
 done
 session_id="$(sed -n 's/^session_id=//p' "$session_file")"
 [[ "$session_id" =~ ^[0-9a-f]{64}$ ]] || fail 'SESSION.txt does not contain exactly one 64-character lowercase hex ID'
 [[ "$(wc -l < "$session_file" | tr -d ' ')" == 1 ]] || fail 'SESSION.txt contains extra lines'
 expected_candidate="$($PROJECT/scripts/compare-reproducible-builds.sh --verify-verified-dist "$DIST")"
 [[ "$(cat "$candidate_file")" == "$expected_candidate" ]] || fail 'CANDIDATE.txt does not exactly bind verified-dist metadata'
-[[ "$(wc -l < "$candidate_file" | tr -d ' ')" == 10 ]] || fail 'CANDIDATE.txt schema is incomplete or has extra fields'
+grep -Fxq "apk_signing_profile=$APK_SIGNING_PROFILE" "$candidate_file" || fail 'CANDIDATE.txt signing profile missing'
+grep -Fxq "apk_signing_public_sha256=$APK_SIGNING_PUBLIC_SHA256" "$candidate_file" || fail 'CANDIDATE.txt signing identity missing'
+grep -Fxq 'apk_signing_mode=public-key-only' "$candidate_file" || fail 'CANDIDATE.txt signing mode missing'
+grep -Fxq 'apk_index_signed=false' "$candidate_file" || fail 'CANDIDATE.txt unsigned index policy missing'
+[[ "$(wc -l < "$candidate_file" | tr -d ' ')" == 14 ]] || fail 'CANDIDATE.txt schema is incomplete or has extra fields'
 image_sha="$(sha256sum "$DIST/$IMAGE" | awk '{print $1}')"
 image_size="$(wc -c < "$DIST/$IMAGE" | tr -d ' ')"
 image_size_hex="$(printf '%x' "$image_size")"

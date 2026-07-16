@@ -7,7 +7,7 @@ trap 'rm -rf "$TMP"' EXIT
 fail() { echo "test_hardware_gate: $*" >&2; exit 1; }
 expect_gate_failure() {
   local label="$1"
-  if "$ROOT_DIR/scripts/verify-hardware-evidence.sh" "$TMP/evidence" "$DIST" "$TMP/allowed_signers" >/dev/null 2>&1; then
+  if "$VERIFY_HARDWARE" "$TMP/evidence" "$DIST" "$TMP/allowed_signers" >/dev/null 2>&1; then
     fail "$label unexpectedly passed"
   fi
 }
@@ -19,6 +19,10 @@ FINGERPRINT="$(printf 'xiaomi,ax9000\nethaddr=%s\n' "$ETHADDR" | sha256sum | awk
 PROJECT="$TMP/project"
 mkdir -p "$PROJECT/scripts" "$PROJECT/release-staging"
 cp "$ROOT_DIR/scripts/compare-reproducible-builds.sh" "$PROJECT/scripts/"
+for script in verify-hardware-evidence.sh verify-post-reboot-state.sh verify-stress-evidence.sh ax9000-runtime-probe.sh lock-file-policy.sh; do
+  cp "$ROOT_DIR/scripts/$script" "$PROJECT/scripts/$script"
+done
+VERIFY_HARDWARE="$PROJECT/scripts/verify-hardware-evidence.sh"
 copy_build_inputs() {
   local flavor file
   for flavor in official nss; do
@@ -29,6 +33,9 @@ copy_build_inputs() {
   done
 }
 copy_build_inputs
+APK_SIGNING_PROFILE='production'
+APK_SIGNING_PUBLIC_SHA256='0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef'
+printf 'NEXAWRT_APK_SIGNING_PRODUCTION_PUBLIC_SHA256="%s"\n' "$APK_SIGNING_PUBLIC_SHA256" > "$PROJECT/manifests/apk-signing.lock"
 mkdir -p "$TMP/evidence"
 # shellcheck disable=SC1090
 source "$PROJECT/manifests/nss.lock"
@@ -61,6 +68,8 @@ source_repository=$NSS_OPENWRT_REPO
 source_branch=$NSS_OPENWRT_BRANCH
 source_commit=$NSS_OPENWRT_COMMIT
 source_date_epoch=1
+apk_signing_profile=$APK_SIGNING_PROFILE
+apk_signing_public_sha256=$APK_SIGNING_PUBLIC_SHA256
 nss_packages_feed_repository=$NSS_PACKAGES_REPO
 nss_packages_feed_commit=$NSS_PACKAGES_COMMIT
 nss_sqm_feed_repository=$NSS_SQM_REPO
@@ -72,7 +81,8 @@ package_manifest=$MANIFEST
 sbom=$SBOM
 MANIFEST_EOF
   {
-    printf 'flavor=nss\nproject_commit=%s\nproject_tree_state=clean\nsource_commit=%s\nsource_origin=%s\n' "$PROJECT_COMMIT" "$NSS_OPENWRT_COMMIT" "$NSS_OPENWRT_REPO"
+    printf 'flavor=nss\nproject_commit=%s\nproject_tree_state=clean\nsource_commit=%s\nsource_origin=%s\napk_signing_profile=%s\napk_signing_public_sha256=%s\n' \
+      "$PROJECT_COMMIT" "$NSS_OPENWRT_COMMIT" "$NSS_OPENWRT_REPO" "$APK_SIGNING_PROFILE" "$APK_SIGNING_PUBLIC_SHA256"
     while read -r name repository commit; do
       [[ -n "$name" && "$name" != \#* ]] || continue
       printf 'feed.%s.commit=%s\nfeed.%s.origin=%s\nfeed.%s.worktree_diff_sha256=%s\n' "$name" "$commit" "$name" "$repository" "$name" "$EMPTY_SHA"
@@ -85,8 +95,8 @@ MANIFEST_EOF
     while IFS= read -r -d '' file; do sha256sum "$file"; done < <(scripts/list-build-inputs.sh nss)
   ) > "$directory/EVIDENCE/INPUTS.sha256"
   replica_id="${directory##*/}"; replica_id="${replica_id##*-}"
-  printf 'schema=1\nflavor=nss\nreplica_id=%s\nrun_id=local\nrun_attempt=local\nproject_commit=%s\nsource_commit=%s\n' \
-    "$replica_id" "$PROJECT_COMMIT" "$NSS_OPENWRT_COMMIT" > "$directory/EVIDENCE/BUILD-IDENTITY.txt"
+  printf 'schema=2\nflavor=nss\nreplica_id=%s\nrun_id=local\nrun_attempt=local\nproject_commit=%s\nsource_commit=%s\napk_signing_profile=%s\napk_signing_public_sha256=%s\n' \
+    "$replica_id" "$PROJECT_COMMIT" "$NSS_OPENWRT_COMMIT" "$APK_SIGNING_PROFILE" "$APK_SIGNING_PUBLIC_SHA256" > "$directory/EVIDENCE/BUILD-IDENTITY.txt"
   printf 'environment %s\n' "$serial" > "$directory/EVIDENCE/BUILD-ENVIRONMENT.txt"
   printf 'build log\n' > "$directory/EVIDENCE/build.log"
   printf 'config\n' > "$directory/EVIDENCE/resolved.config"
@@ -101,11 +111,13 @@ make_nss_replica "$PROJECT/b" b
 DIST="$PROJECT/release-staging/case/verified-dist"
 mkdir -p "$PROJECT/release-staging/test-provenance" "$TMP/bin"
 write_descriptor() {
-  local replica="$1" artifact_id="$2" artifact_name="release-local-local-nss-$1" receipt="$PROJECT/$1/SHA256SUMS"
-  /usr/bin/python3 - "$PROJECT/release-staging/test-provenance/$replica.descriptor.json" "$receipt" \
-    "$replica" "$artifact_id" "$artifact_name" <<'PY_DESCRIPTOR'
+  local replica="$1" artifact_id="$2" artifact_name="browser-build-local-local-nss-$1" receipt="$PROJECT/$1/SHA256SUMS"
+  python3 - "$PROJECT/release-staging/test-provenance/$replica.descriptor.json" "$receipt" \
+    "$replica" "$artifact_id" "$artifact_name" "$PROJECT_COMMIT" <<'PY_DESCRIPTOR'
 import hashlib, json, pathlib, sys
-path, receipt, replica, artifact_id, artifact_name = sys.argv[1:]
+path, receipt, replica, artifact_id, artifact_name, project_commit = sys.argv[1:]
+source_ref = "refs/heads/main"
+workflow = "tifycloud/NexaWrt/.github/workflows/build.yml"
 value = {
     "artifact_id": artifact_id,
     "artifact_name": artifact_name,
@@ -116,8 +128,12 @@ value = {
     "repository": "tifycloud/NexaWrt",
     "run_attempt": "local",
     "run_id": "local",
-    "schema": 1,
-    "workflow": "tifycloud/NexaWrt/.github/workflows/release.yml",
+    "schema": 2,
+    "signer_digest": project_commit,
+    "source_digest": project_commit,
+    "source_ref": source_ref,
+    "workflow": workflow,
+    "workflow_ref": f"{workflow}@{source_ref}",
 }
 pathlib.Path(path).write_text(json.dumps(value, sort_keys=True, separators=(",", ":")) + "\n")
 PY_DESCRIPTOR
@@ -132,36 +148,59 @@ set -euo pipefail
 [[ "$1" == attestation && "$2" == verify ]]
 subject="$3"; shift 3
 bundle=""
+signer_workflow=""
+source_digest=""
+source_ref=""
+signer_digest=""
 while (($#)); do
   case "$1" in
-    --repo|--signer-workflow) shift 2 ;;
+    --repo) [[ "$2" == tifycloud/NexaWrt ]]; shift 2 ;;
+    --signer-workflow) signer_workflow="$2"; shift 2 ;;
+    --source-digest) source_digest="$2"; shift 2 ;;
+    --source-ref) source_ref="$2"; shift 2 ;;
+    --signer-digest) signer_digest="$2"; shift 2 ;;
     --bundle) bundle="$2"; shift 2 ;;
     *) exit 1 ;;
   esac
 done
-[[ -n "$bundle" ]]
-expected="$(awk -F= '$1 == "descriptor_sha256" {print $2}' "$bundle")"
-actual="$(sha256sum "$subject" | awk '{print $1}')"
-[[ "$actual" == "$expected" ]]
+[[ -n "$bundle" && "$signer_workflow" == tifycloud/NexaWrt/.github/workflows/build.yml ]]
+python3 - "$subject" "$bundle" "$source_digest" "$source_ref" "$signer_digest" <<'PY_VERIFY'
+import hashlib, json, pathlib, sys
+subject, bundle, source_digest, source_ref, signer_digest = sys.argv[1:]
+descriptor = json.loads(pathlib.Path(subject).read_text())
+expected = dict(line.split("=", 1) for line in pathlib.Path(bundle).read_text().splitlines())["descriptor_sha256"]
+assert hashlib.sha256(pathlib.Path(subject).read_bytes()).hexdigest() == expected
+assert descriptor["source_digest"] == source_digest
+assert descriptor["source_ref"] == source_ref
+assert descriptor["signer_digest"] == signer_digest
+PY_VERIFY
 GH
 chmod +x "$TMP/bin/mock-gh"
 NEXAWRT_ATTESTATION_VERIFIER="$TMP/bin/mock-gh"
 NEXAWRT_ATTESTATION_VERIFIER_SHA256="$(sha256sum "$NEXAWRT_ATTESTATION_VERIFIER" | awk '{print $1}')"
 export NEXAWRT_ATTESTATION_VERIFIER NEXAWRT_ATTESTATION_VERIFIER_SHA256
 export NEXAWRT_LEFT_ARTIFACT_ID=201 NEXAWRT_RIGHT_ARTIFACT_ID=202
-export NEXAWRT_LEFT_ARTIFACT_NAME=release-local-local-nss-a NEXAWRT_RIGHT_ARTIFACT_NAME=release-local-local-nss-b
+export NEXAWRT_LEFT_ARTIFACT_NAME=browser-build-local-local-nss-a NEXAWRT_RIGHT_ARTIFACT_NAME=browser-build-local-local-nss-b
 export NEXAWRT_LEFT_PRODUCER_DESCRIPTOR="$PROJECT/release-staging/test-provenance/a.descriptor.json"
 export NEXAWRT_RIGHT_PRODUCER_DESCRIPTOR="$PROJECT/release-staging/test-provenance/b.descriptor.json"
 export NEXAWRT_LEFT_PROVENANCE_BUNDLE="$PROJECT/release-staging/test-provenance/a.bundle.json"
 export NEXAWRT_RIGHT_PROVENANCE_BUNDLE="$PROJECT/release-staging/test-provenance/b.bundle.json"
-"$PROJECT/scripts/compare-reproducible-builds.sh" nss "$PROJECT/a" "$PROJECT/b" "$DIST" >/dev/null
+GITHUB_ACTIONS=true GITHUB_REPOSITORY=tifycloud/NexaWrt \
+  GITHUB_REF=refs/heads/main GITHUB_SHA="$PROJECT_COMMIT" \
+  GITHUB_WORKFLOW_REF=tifycloud/NexaWrt/.github/workflows/build.yml@refs/heads/main \
+  GITHUB_WORKFLOW_SHA="$PROJECT_COMMIT" GITHUB_RUN_ID=local GITHUB_RUN_ATTEMPT=local \
+  "$PROJECT/scripts/compare-reproducible-builds.sh" nss "$PROJECT/a" "$PROJECT/b" "$DIST" >/dev/null
 sha="$(sha256sum "$DIST/$IMAGE" | awk '{print $1}')"
 image_size="$(wc -c < "$DIST/$IMAGE" | tr -d ' ')"
 image_size_hex="$(printf '%x' "$image_size")"
 probe_sha="$(sha256sum "$ROOT_DIR/scripts/ax9000-runtime-probe.sh" | awk '{print $1}')"
 
 printf 'session_id=%s\n' "$SESSION" > "$TMP/evidence/SESSION.txt"
-"$ROOT_DIR/scripts/compare-reproducible-builds.sh" --verify-verified-dist "$DIST" > "$TMP/evidence/CANDIDATE.txt"
+"$PROJECT/scripts/compare-reproducible-builds.sh" --verify-verified-dist "$DIST" > "$TMP/evidence/CANDIDATE.txt"
+grep -Fxq "apk_signing_profile=$APK_SIGNING_PROFILE" "$TMP/evidence/CANDIDATE.txt" || fail 'hardware candidate is not production-signed'
+grep -Fxq "apk_signing_public_sha256=$APK_SIGNING_PUBLIC_SHA256" "$TMP/evidence/CANDIDATE.txt" || fail 'hardware candidate signing identity mismatch'
+grep -Fxq 'apk_signing_mode=public-key-only' "$TMP/evidence/CANDIDATE.txt" || fail 'hardware candidate signing mode mismatch'
+grep -Fxq 'apk_index_signed=false' "$TMP/evidence/CANDIDATE.txt" || fail 'hardware candidate index signing policy mismatch'
 printf 'model=xiaomi,ax9000\nimage_sha256=%s\nflavor=nss\nprobe_sha256=%s\nsession_id=%s\ndevice_fingerprint_sha256=%s\n' \
   "$sha" "$probe_sha" "$SESSION" "$FINGERPRINT" > "$TMP/evidence/device.txt"
 cat > "$TMP/evidence/uart-cold-boot.log" <<EOF_UART
@@ -310,10 +349,44 @@ refresh_approval() {
   (cd "$TMP/evidence" && sha256sum "${required_files[@]}") > "$TMP/evidence/SHA256SUMS"
 }
 refresh_approval
-"$ROOT_DIR/scripts/verify-hardware-evidence.sh" "$TMP/evidence" "$DIST" "$TMP/allowed_signers" >/dev/null
+"$VERIFY_HARDWARE" "$TMP/evidence" "$DIST" "$TMP/allowed_signers" >/dev/null
+
+# The final hardware gate must reject a fully checksum-rebound descriptor from any workflow outside the exact allowlist.
+cp "$DIST/REPRODUCIBILITY/left.producer-descriptor.json" "$TMP/left-descriptor.valid"
+cp "$DIST/REPRODUCIBILITY/left.provenance.bundle.json" "$TMP/left-bundle.valid"
+cp "$DIST/REPRODUCIBILITY.json" "$TMP/reproducibility-workflow.valid"
+cp "$DIST/SHA256SUMS" "$TMP/dist-workflow-SHA256SUMS.valid"
+python3 - "$DIST" <<'PY_WORKFLOW'
+import hashlib
+import json
+import pathlib
+import sys
+root = pathlib.Path(sys.argv[1])
+descriptor_path = root / "REPRODUCIBILITY/left.producer-descriptor.json"
+bundle_path = root / "REPRODUCIBILITY/left.provenance.bundle.json"
+reproduction_path = root / "REPRODUCIBILITY.json"
+descriptor = json.loads(descriptor_path.read_text())
+descriptor["workflow"] = "tifycloud/NexaWrt/.github/workflows/evil.yml"
+descriptor_path.write_text(json.dumps(descriptor, sort_keys=True, separators=(",", ":")) + "\n")
+descriptor_sha = hashlib.sha256(descriptor_path.read_bytes()).hexdigest()
+bundle_path.write_text(f"descriptor_sha256={descriptor_sha}\n")
+bundle_sha = hashlib.sha256(bundle_path.read_bytes()).hexdigest()
+reproduction = json.loads(reproduction_path.read_text())
+item = reproduction["input_builds"][0]
+item["producer_descriptor_sha256"] = descriptor_sha
+item["provenance_bundle_sha256"] = bundle_sha
+item["producer_id"] = f"github-artifact:{item['artifact_id']}:bundle-sha256:{bundle_sha}"
+reproduction_path.write_text(json.dumps(reproduction, sort_keys=True, separators=(",", ":")) + "\n")
+PY_WORKFLOW
+write_dist_checksums "$DIST"
+expect_gate_failure 'untrusted producer workflow rebound into final verified-dist'
+cp "$TMP/left-descriptor.valid" "$DIST/REPRODUCIBILITY/left.producer-descriptor.json"
+cp "$TMP/left-bundle.valid" "$DIST/REPRODUCIBILITY/left.provenance.bundle.json"
+cp "$TMP/reproducibility-workflow.valid" "$DIST/REPRODUCIBILITY.json"
+cp "$TMP/dist-workflow-SHA256SUMS.valid" "$DIST/SHA256SUMS"
 
 if NEXAWRT_MAX_APPROVAL_AGE_SECONDS=2592001 \
-  "$ROOT_DIR/scripts/verify-hardware-evidence.sh" "$TMP/evidence" "$DIST" "$TMP/allowed_signers" >/dev/null 2>&1; then
+  "$VERIFY_HARDWARE" "$TMP/evidence" "$DIST" "$TMP/allowed_signers" >/dev/null 2>&1; then
   fail 'approval age limit was allowed to exceed the production maximum'
 fi
 

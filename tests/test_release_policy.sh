@@ -10,12 +10,21 @@ mkdir -p "$ROOT_DIR/.work"
 TMP_DIR="$(mktemp -d "$ROOT_DIR/.work/test-release-policy.XXXXXX")"
 trap 'rm -rf "$TMP_DIR"' EXIT
 fail() { echo "test_release_policy: $*" >&2; exit 1; }
+SIGNING_PUBLIC_KEY="$TMP_DIR/apk-signing-public.pem"
+SIGNING_PRIVATE_KEY="$(mktemp "${TMPDIR:-/tmp}/nexawrt-release-signing.XXXXXX")"
+trap 'rm -f "$SIGNING_PRIVATE_KEY"; rm -rf "$TMP_DIR"' EXIT
+openssl ecparam -name prime256v1 -genkey -noout -out "$SIGNING_PRIVATE_KEY"
+openssl pkey -in "$SIGNING_PRIVATE_KEY" -pubout -out "$SIGNING_PUBLIC_KEY" 2>/dev/null
+SIGNING_PUBLIC_SHA256="$(openssl pkey -pubin -in "$SIGNING_PUBLIC_KEY" -outform DER 2>/dev/null | { command -v sha256sum >/dev/null 2>&1 && sha256sum || shasum -a 256; } | awk '{print $1}')"
+rm -f "$SIGNING_PRIVATE_KEY"
 
 install_harness_scripts() {
   mkdir -p "$harness/scripts" "$harness/manifests"
   cp "$SOURCE_STAGE_SCRIPT" "$harness/scripts/release.sh"
   cp "$ROOT_DIR/scripts/sanitize-git-environment.sh" "$harness/scripts/sanitize-git-environment.sh"
   cp "$ROOT_DIR/scripts/lock-file-policy.sh" "$harness/scripts/lock-file-policy.sh"
+  cp "$ROOT_DIR/scripts/apk-signing-key.sh" "$harness/scripts/apk-signing-key.sh"
+  cp "$ROOT_DIR/manifests/apk-signing.lock" "$harness/manifests/apk-signing.lock"
   cat > "$harness/scripts/validate.sh" <<'VALIDATE'
 #!/usr/bin/env bash
 set -euo pipefail
@@ -78,8 +87,21 @@ LOCK
 }
 
 run_stage() {
+  local prepared prepared_profile prepared_sha canonical_public
+  prepared="$(
+    NEXAWRT_APK_SIGNING_PROFILE=repro-test \
+      NEXAWRT_APK_SIGNING_PUBLIC_SHA256="$SIGNING_PUBLIC_SHA256" \
+      NEXAWRT_APK_SIGNING_PUBLIC_KEY_FILE="$SIGNING_PUBLIC_KEY" \
+      /bin/bash "$harness/scripts/apk-signing-key.sh" prepare "$work"
+  )" || return 1
+  IFS=$'\t' read -r prepared_profile prepared_sha canonical_public <<<"$prepared"
+  [[ "$prepared_profile" == repro-test && "$prepared_sha" == "$SIGNING_PUBLIC_SHA256" && -f "$canonical_public" ]] || return 1
+
   NEXAWRT_FLAVOR=official WORK_DIR="$work" BUILD_LOG="$build_log" \
-    DIST_DIR_OVERRIDE="$dist_dir" "$stage_script"
+    NEXAWRT_APK_SIGNING_PROFILE="$prepared_profile" \
+    NEXAWRT_APK_SIGNING_PUBLIC_SHA256="$prepared_sha" \
+    NEXAWRT_APK_SIGNING_PUBLIC_KEY_FILE="$canonical_public" \
+    DIST_DIR_OVERRIDE="$dist_dir" /bin/bash "$stage_script"
 }
 expect_rejected() {
   local label="$1" expected="$2"
@@ -135,7 +157,7 @@ new_fixture wrong-name
 dist_dir="$harness/release-staging/not-dist"
 expect_rejected "wrong staging basename" "unsafe staging directory"
 new_fixture wrong-flavor
-if NEXAWRT_FLAVOR=nss WORK_DIR="$work" BUILD_LOG="$build_log" DIST_DIR_OVERRIDE="$dist_dir" "$stage_script" >/dev/null 2>&1; then
+if NEXAWRT_FLAVOR=nss WORK_DIR="$work" BUILD_LOG="$build_log" DIST_DIR_OVERRIDE="$dist_dir" /bin/bash "$stage_script" >/dev/null 2>&1; then
   fail "NSS flavor entered official staging"
 fi
 

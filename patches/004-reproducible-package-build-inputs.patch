@@ -1,0 +1,120 @@
+diff --git a/package/kernel/qca-ssdk/patches/001-reproducible-build-date.patch b/package/kernel/qca-ssdk/patches/001-reproducible-build-date.patch
+new file mode 100644
+index 0000000..7c43a12
+--- /dev/null
++++ b/package/kernel/qca-ssdk/patches/001-reproducible-build-date.patch
+@@ -0,0 +1,14 @@
++--- a/make/config.mk
+++++ b/make/config.mk
++@@ -136,7 +136,10 @@ endif
++ VERSION=2.0.0
++ SUB_VERSION=0
++ BUILD_NUMBER=0
++-BUILD_DATE=$(shell date -u  +%F-%T)
+++ifeq ($(strip $(SOURCE_DATE_EPOCH)),)
+++$(error SOURCE_DATE_EPOCH is required for reproducible qca-ssdk builds)
+++endif
+++BUILD_DATE := $(shell date -u -d "@$(SOURCE_DATE_EPOCH)" +%F-%T)
++ 
++ ifeq (TRUE, $(IN_SFP_PHY))
++   MODULE_TYPE=KSLIB
+diff --git a/package/network/utils/nftables/Makefile b/package/network/utils/nftables/Makefile
+index 0147c4d..ca028f3 100644
+--- a/package/network/utils/nftables/Makefile
++++ b/package/network/utils/nftables/Makefile
+@@ -25,6 +25,8 @@ include $(INCLUDE_DIR)/package.mk
+ 
+ DISABLE_NLS:=
+ 
++MAKE_FLAGS += MAKE_STAMP=$(SOURCE_DATE_EPOCH)
++
+ CONFIGURE_ARGS += \
+         --disable-debug \
+         --disable-man-doc \
+diff --git a/package/Makefile b/package/Makefile
+index c50f81b..5defeb4 100644
+--- a/package/Makefile
++++ b/package/Makefile
+@@ -59,19 +59,29 @@
+ 	-$(foreach pdir,$(PACKAGE_SUBDIRS),$(if $(wildcard $(pdir)/*.ipk),ln -s $(pdir)/*.ipk $(PACKAGE_DIR_ALL);))
+ endif
+ 
++ifeq ($(NEXAWRT_APK_PUBLIC_ONLY),1)
++  APK_BUILD_KEY_PREREQUISITES := $(BUILD_KEY_APK_PUB)
++  APK_INDEX_SIGNATURE_ARGS :=
++  APK_ROOTFS_TRUST_ARGS := --allow-untrusted
++else
+ $(BUILD_KEY_APK_SEC):
+ 	$(STAGING_DIR_HOST)/bin/openssl ecparam -name prime256v1 -genkey -noout -out $(BUILD_KEY_APK_SEC)
+ 
+ $(BUILD_KEY_APK_PUB): $(BUILD_KEY_APK_SEC)
+ 	$(STAGING_DIR_HOST)/bin/openssl ec -in $(BUILD_KEY_APK_SEC) -pubout > $(BUILD_KEY_APK_PUB)
+ 
++  APK_BUILD_KEY_PREREQUISITES := $(BUILD_KEY_APK_SEC) $(BUILD_KEY_APK_PUB)
++  APK_INDEX_SIGNATURE_ARGS = $(if $(CONFIG_SIGNED_PACKAGES),--sign $(BUILD_KEY_APK_SEC),)
++  APK_ROOTFS_TRUST_ARGS = $(if $(CONFIG_SIGNED_PACKAGES),,--allow-untrusted)
++endif
++
+ $(curdir)/merge-index: $(curdir)/merge
+ ifneq ($(CONFIG_USE_APK),)
+ 	(cd $(PACKAGE_DIR_ALL) && $(STAGING_DIR_HOST)/bin/apk mkndx \
+ 			--root $(TOPDIR) \
+ 			--keys-dir $(TOPDIR) \
+ 			--allow-untrusted \
+-			$(if $(CONFIG_SIGNED_PACKAGES),--sign $(BUILD_KEY_APK_SEC),) \
++			$(APK_INDEX_SIGNATURE_ARGS) \
+ 			--output packages.adb \
+ 			*.apk; \
+ 	)
+@@ -82,13 +92,13 @@
+ ifndef SDK
+   $(curdir)//compile = $(STAGING_DIR)/.prepared $(BIN_DIR)
+ ifneq ($(CONFIG_USE_APK),)
+-  $(curdir)//compile += $(curdir)/system/apk/host/compile $(BUILD_KEY_APK_SEC) $(BUILD_KEY_APK_PUB)
++  $(curdir)//compile += $(curdir)/system/apk/host/compile $(APK_BUILD_KEY_PREREQUISITES)
+ else
+   $(curdir)/compile: $(curdir)/system/opkg/host/compile
+ endif
+ else
+ ifneq ($(CONFIG_USE_APK),)
+-  $(curdir)//compile += $(BUILD_KEY_APK_SEC) $(BUILD_KEY_APK_PUB)
++  $(curdir)//compile += $(APK_BUILD_KEY_PREREQUISITES)
+ endif
+ endif
+ 
+@@ -101,7 +111,7 @@
+ 	    $(foreach pkg,$(shell cat $(PACKAGE_INSTALL_FILES) 2>/dev/null),$(pkg)$(call GetABISuffix,$(pkg))))
+ 	$(call apk,$(TARGET_DIR)) add --no-cache --initdb --no-scripts --arch $(ARCH_PACKAGES) \
+ 		--repositories-file /dev/null --repository file://$(PACKAGE_DIR_ALL)/packages.adb \
+-		$(if $(CONFIG_SIGNED_PACKAGES),,--allow-untrusted) \
++		$(APK_ROOTFS_TRUST_ARGS) \
+ 		$$(cat $(TMP_DIR)/apk_install_list) \
+ 			"base-files=$(shell cat $(STAGING_DIR)/base-files.version)" \
+ 			"libc=$(shell cat $(STAGING_DIR)/libc.version)" \
+@@ -137,7 +147,7 @@
+ 			--root $(TOPDIR) \
+ 			--keys-dir $(TOPDIR) \
+ 			--allow-untrusted \
+-			$(if $(CONFIG_SIGNED_PACKAGES),--sign $(BUILD_KEY_APK_SEC),) \
++			$(APK_INDEX_SIGNATURE_ARGS) \
+ 			--output packages.adb \
+ 			*.apk; \
+ 		$(STAGING_DIR_HOST)/bin/apk adbdump --format json packages.adb | \
+
+diff --git a/package/system/apk/patches/0011-genhelp-reproducible-gzip.patch b/package/system/apk/patches/0011-genhelp-reproducible-gzip.patch
+new file mode 100644
+index 0000000..f6684f2
+--- /dev/null
++++ b/package/system/apk/patches/0011-genhelp-reproducible-gzip.patch
+@@ -0,0 +1,11 @@
++--- a/src/genhelp.lua
+++++ b/src/genhelp.lua
++@@ -168,7 +168,7 @@ function scapp:compress(data)
++ 		f:write(data)
++ 		f:close()
++
++-		local p = io.popen(('gzip -%d < %s'):format(level, tmp), 'r')
+++		local p = io.popen(('gzip -n%d < %s'):format(level, tmp), 'r')
++ 		if p ~= nil then
++ 			ret = p:read("*all")
++ 			p:close()

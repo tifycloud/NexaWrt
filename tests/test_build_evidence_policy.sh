@@ -2,8 +2,10 @@
 set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
 TMP="$(mktemp -d "${TMPDIR:-/tmp}/nexawrt-build-evidence.XXXXXX")"
+TMP="$(cd "$TMP" && pwd -P)"
 PATCH_INPUT_PROBE="$ROOT_DIR/patches/999-input-binding-probe.patch"
-trap 'rm -f "$PATCH_INPUT_PROBE"; rm -rf "$TMP"' EXIT
+COLLECTOR_APK_PUBLIC_KEY=""
+trap 'rm -f "$PATCH_INPUT_PROBE" "${COLLECTOR_APK_PUBLIC_KEY:-}"; rm -rf "$TMP"' EXIT
 fail() { echo "test_build_evidence_policy: $*" >&2; exit 1; }
 expect_failure() { local label="$1"; shift; if "$@" >/dev/null 2>&1; then fail "$label unexpectedly passed"; fi; }
 
@@ -37,11 +39,13 @@ grep -Fxq 'patches/999-input-binding-probe.patch' <<<"$nss_inputs" || fail 'NSS 
 rm -f "$PATCH_INPUT_PROBE"
 for required in \
   scripts/list-build-inputs.sh \
+  scripts/apk-signing-key.sh \
   scripts/sanitize-git-environment.sh \
   scripts/lock-file-policy.sh \
   scripts/git-metadata-policy.sh \
   scripts/check-kernel-build-identity.sh \
   scripts/compare-reproducible-builds.sh \
+  manifests/apk-signing.lock \
   .github/workflows/build.yml \
   .github/workflows/release.yml \
   scripts/ax9000-runtime-probe.sh \
@@ -77,10 +81,13 @@ fi
 
 BUILD_POLICY_REPO="$TMP/build-policy-repo"
 BUILD_WRAPPERS="$TMP/build-wrappers"
-mkdir -p "$BUILD_POLICY_REPO/scripts" "$BUILD_POLICY_REPO/.work/openwrt" "$BUILD_WRAPPERS"
+mkdir -p "$BUILD_POLICY_REPO/scripts" "$BUILD_POLICY_REPO/manifests" "$BUILD_POLICY_REPO/.work/openwrt" "$BUILD_WRAPPERS"
 BUILD_POLICY_REPO="$(cd "$BUILD_POLICY_REPO" && pwd -P)"
 BUILD_WORK="$BUILD_POLICY_REPO/.work/openwrt"
 cp "$ROOT_DIR/scripts/build.sh" "$BUILD_POLICY_REPO/scripts/build.sh"
+cp "$ROOT_DIR/scripts/apk-signing-key.sh" "$BUILD_POLICY_REPO/scripts/apk-signing-key.sh"
+cp "$ROOT_DIR/scripts/lock-file-policy.sh" "$BUILD_POLICY_REPO/scripts/lock-file-policy.sh"
+cp "$ROOT_DIR/manifests/apk-signing.lock" "$BUILD_POLICY_REPO/manifests/apk-signing.lock"
 cp "$ROOT_DIR/scripts/sanitize-git-environment.sh" "$BUILD_POLICY_REPO/scripts/sanitize-git-environment.sh"
 cp "$ROOT_DIR/scripts/git-metadata-policy.sh" "$BUILD_POLICY_REPO/scripts/git-metadata-policy.sh"
 cat > "$BUILD_POLICY_REPO/scripts/prepare.sh" <<'PREPARE'
@@ -119,10 +126,28 @@ GIT_AUTHOR_DATE='1700000000 +0000' GIT_COMMITTER_DATE='1700000000 +0000' \
   "$(command -v git)" -C "$BUILD_WORK" commit -qm source
 build_source_head="$(git -C "$BUILD_WORK" rev-parse HEAD)"
 printf 'r0-%s\n' "${build_source_head:0:8}" > "$BUILD_WORK/version"
+FIXTURE_APK_KEY_SEED="$TMP/repro-test-apk-key-seed.pem"
+FIXTURE_APK_PUBLIC_KEY="$TMP/repro-test-apk-public.pem"
+FIXTURE_APK_PUBLIC_DER="$TMP/repro-test-apk-public.der"
+umask 077
+openssl ecparam -name prime256v1 -genkey -noout -out "$FIXTURE_APK_KEY_SEED"
+openssl pkey -in "$FIXTURE_APK_KEY_SEED" -pubout -out "$FIXTURE_APK_PUBLIC_KEY" 2>/dev/null
+rm -f -- "$FIXTURE_APK_KEY_SEED"
+openssl pkey -pubin -in "$FIXTURE_APK_PUBLIC_KEY" -outform DER -out "$FIXTURE_APK_PUBLIC_DER" 2>/dev/null
+if command -v sha256sum >/dev/null 2>&1; then
+  FIXTURE_APK_PUBLIC_SHA256="$(sha256sum "$FIXTURE_APK_PUBLIC_DER" | awk '{print $1}')"
+else
+  FIXTURE_APK_PUBLIC_SHA256="$(shasum -a 256 "$FIXTURE_APK_PUBLIC_DER" | awk '{print $1}')"
+fi
+export NEXAWRT_APK_SIGNING_PROFILE=repro-test
+export NEXAWRT_APK_SIGNING_PUBLIC_SHA256="$FIXTURE_APK_PUBLIC_SHA256"
 run_fixture_build() {
   env PATH="$BUILD_WRAPPERS:$PATH" REAL_GIT="$(command -v git)" \
     ALLOW_UNSUPPORTED_HOST=1 NEXAWRT_FLAVOR=official WORK_DIR="$BUILD_WORK" \
     BUILD_LOG="$BUILD_POLICY_REPO/build.log" CLEAN_BUILD=0 JOBS=1 \
+    NEXAWRT_APK_SIGNING_PROFILE=repro-test \
+    NEXAWRT_APK_SIGNING_PUBLIC_SHA256="$FIXTURE_APK_PUBLIC_SHA256" \
+    NEXAWRT_APK_SIGNING_PUBLIC_KEY_FILE="$FIXTURE_APK_PUBLIC_KEY" \
     "$BUILD_POLICY_REPO/scripts/build.sh"
 }
 run_fixture_build >/dev/null
@@ -136,6 +161,9 @@ expect_failure 'build invalid commit timestamp' env FAKE_GIT_SHOW=1 \
   PATH="$BUILD_WRAPPERS:$PATH" REAL_GIT="$(command -v git)" \
   ALLOW_UNSUPPORTED_HOST=1 NEXAWRT_FLAVOR=official WORK_DIR="$BUILD_WORK" \
   BUILD_LOG="$BUILD_POLICY_REPO/build.log" CLEAN_BUILD=0 JOBS=1 \
+  NEXAWRT_APK_SIGNING_PROFILE=repro-test \
+  NEXAWRT_APK_SIGNING_PUBLIC_SHA256="$FIXTURE_APK_PUBLIC_SHA256" \
+  NEXAWRT_APK_SIGNING_PUBLIC_KEY_FILE="$FIXTURE_APK_PUBLIC_KEY" \
   "$BUILD_POLICY_REPO/scripts/build.sh"
 
 mkdir -p "$TMP/work" "$TMP/dist"
@@ -146,6 +174,16 @@ printf 'CONFIG_TEST=y\n' > "$TMP/work/.config"
 git -C "$TMP/work" add .config
 git -C "$TMP/work" commit -qm initial
 git -C "$TMP/work" remote add origin https://example.invalid/openwrt.git
+collector_apk_identity="$(
+  NEXAWRT_APK_SIGNING_PROFILE=repro-test \
+    NEXAWRT_APK_SIGNING_PUBLIC_SHA256="$FIXTURE_APK_PUBLIC_SHA256" \
+    NEXAWRT_APK_SIGNING_PUBLIC_KEY_FILE="$FIXTURE_APK_PUBLIC_KEY" \
+    /bin/bash "$ROOT_DIR/scripts/apk-signing-key.sh" prepare "$TMP/work"
+)" || fail 'could not prepare canonical collector APK public key'
+IFS=$'\t' read -r collector_apk_profile collector_apk_sha COLLECTOR_APK_PUBLIC_KEY <<<"$collector_apk_identity"
+[[ "$collector_apk_profile" == repro-test && "$collector_apk_sha" == "$FIXTURE_APK_PUBLIC_SHA256" && -f "$COLLECTOR_APK_PUBLIC_KEY" ]] ||
+  fail 'collector APK public identity is incomplete'
+export NEXAWRT_APK_SIGNING_PUBLIC_KEY_FILE="$COLLECTOR_APK_PUBLIC_KEY"
 
 # Uppercase GHS_ is a known compiler/test-vector shape, not a lowercase GitHub token prefix.
 printf 'compiler self-test vector: GHS_012345678901234567890123456789\n' > "$TMP/build.log"

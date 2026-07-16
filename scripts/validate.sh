@@ -103,18 +103,21 @@ assert_uboot_defaults_read_only() {
 assert_patch_has_context() {
   local patch="$1"
   awk '
+    /^--- \/dev\/null$/ { new_file = 1; next }
+    /^--- / { new_file = 0; next }
     /^@@ / {
-      if (seen_hunk && !has_context) bad = 1
+      if (seen_hunk && !has_context && !creation_hunk) bad = 1
       seen_hunk = 1
       has_context = 0
+      creation_hunk = new_file && $0 ~ /^@@ -0,0 /
       next
     }
     seen_hunk && /^ / { has_context = 1 }
     END {
-      if (!seen_hunk || !has_context) bad = 1
+      if (!seen_hunk || (!has_context && !creation_hunk)) bad = 1
       exit bad
     }
-  ' "$patch" || fail "patch has a zero-context or malformed hunk: $(basename "$patch")"
+  ' "$patch" || fail "patch has a zero-context modification or malformed hunk: $(basename "$patch")"
 }
 
 extract_shell_function() {
@@ -664,10 +667,12 @@ fi
 patch_001="$ROOT_DIR/patches/001-ax9000-single-large-ubi-layout.patch"
 patch_002="$ROOT_DIR/patches/002-ax9000-block-persistent-upgrade.patch"
 patch_003="$ROOT_DIR/patches/003-uboot-envtools-read-only.patch"
+patch_004="$ROOT_DIR/patches/004-reproducible-package-build-inputs.patch"
 
 assert_patch_has_context "$patch_001"
 assert_patch_has_context "$patch_002"
 assert_patch_has_context "$patch_003"
+assert_patch_has_context "$patch_004"
 if [[ "$NEXAWRT_FLAVOR" == nss ]]; then
   [[ -f "$NSS_PACKAGES_SOURCE_PATCH" ]] || fail "NSS source archive patch is missing"
   assert_patch_has_context "$NSS_PACKAGES_SOURCE_PATCH"
@@ -686,6 +691,19 @@ if [[ "$NEXAWRT_FLAVOR" == nss ]]; then
   done
   ! grep -Fq '+PKG_MIRROR_HASH:=skip' "$NSS_PACKAGES_SOURCE_PATCH" ||
     fail "NSS source archive patch disables source verification"
+  for required in \
+    '$(error SOURCE_DATE_EPOCH is required for reproducible NSS client builds)' \
+    'NSS_CLIENT_BUILD_DATE := $(shell date -u -d "@$(SOURCE_DATE_EPOCH)"' \
+    '$(error SOURCE_DATE_EPOCH is required for reproducible NSS DTLS builds)' \
+    'NSS_DTLSMGR_BUILD_DATE := $(shell date -u -d "@$(SOURCE_DATE_EPOCH)"' \
+    '$(error SOURCE_DATE_EPOCH is required for reproducible NSS TLS builds)' \
+    'NSS_TLSMGR_BUILD_DATE := $(shell date -u -d "@$(SOURCE_DATE_EPOCH)"'; do
+    grep -Fq "+$required" "$NSS_PACKAGES_SOURCE_PATCH" ||
+      fail "NSS source archive patch lost a required fail-closed build identity fix"
+  done
+  if grep -Eq '^\+.*BUILD_DATE.*:= \$\(shell date \+' "$NSS_PACKAGES_SOURCE_PATCH"; then
+    fail "NSS source archive patch reintroduces a wall-clock build identity fallback"
+  fi
 fi
 assert_flavor_config "$SEED_CONFIG" "$NEXAWRT_FLAVOR seed config"
 

@@ -5,6 +5,11 @@ EVIDENCE_DIR="${1:-}"
 DIST_DIR="${2:-}"
 TRUSTED_REVIEWERS="${3:-${NEXAWRT_TRUSTED_REVIEWERS:-}}"
 COMPARE_SCRIPT="$ROOT_DIR/scripts/compare-reproducible-builds.sh"
+# shellcheck source=lock-file-policy.sh
+source "$ROOT_DIR/scripts/lock-file-policy.sh"
+nexawrt_validate_lock_file "$ROOT_DIR/manifests/apk-signing.lock" apk-signing || { echo "hardware gate failed: invalid APK signing trust lock" >&2; exit 1; }
+# shellcheck source=../manifests/apk-signing.lock
+source "$ROOT_DIR/manifests/apk-signing.lock"
 SIGNATURE_NAMESPACE='nexawrt-hardware-approval'
 DEFAULT_MAX_APPROVAL_AGE_SECONDS=2592000
 MAX_APPROVAL_AGE_SECONDS="${NEXAWRT_MAX_APPROVAL_AGE_SECONDS:-$DEFAULT_MAX_APPROVAL_AGE_SECONDS}"
@@ -21,21 +26,164 @@ command -v ssh-keygen >/dev/null || fail "ssh-keygen with SSH signature support 
 candidate_metadata="$(bash "$COMPARE_SCRIPT" --verify-verified-dist "$DIST_DIR")" ||
   fail "candidate is not a repository-locked compare-generated verified-dist"
 [[ -n "$candidate_metadata" ]] || fail "verified candidate metadata is empty"
-python3 - "$DIST_DIR/REPRODUCIBILITY.json" <<'PY' || fail "candidate lacks two distinct descriptor-bound GitHub-attested producer identities"
+candidate_signing_profile="$(awk -F= '$1 == "apk_signing_profile" { count++; value=$2 } END { if (count != 1) exit 1; print value }' <<<"$candidate_metadata")" ||
+  fail "verified candidate APK signing profile is missing or ambiguous"
+candidate_signing_sha256="$(awk -F= '$1 == "apk_signing_public_sha256" { count++; value=$2 } END { if (count != 1) exit 1; print value }' <<<"$candidate_metadata")" ||
+  fail "verified candidate APK signing identity is missing or ambiguous"
+candidate_signing_mode="$(awk -F= '$1 == "apk_signing_mode" { count++; value=$2 } END { if (count != 1) exit 1; print value }' <<<"$candidate_metadata")" ||
+  fail "verified candidate APK signing mode is missing or ambiguous"
+candidate_index_signed="$(awk -F= '$1 == "apk_index_signed" { count++; value=$2 } END { if (count != 1) exit 1; print value }' <<<"$candidate_metadata")" ||
+  fail "verified candidate APK index signing policy is missing or ambiguous"
+[[ "$NEXAWRT_APK_SIGNING_PRODUCTION_PUBLIC_SHA256" != UNPROVISIONED ]] ||
+  fail "production APK signing trust anchor is unprovisioned"
+[[ "$candidate_signing_profile" == production ]] ||
+  fail "hardware approval requires the production APK signing profile"
+[[ "$candidate_signing_sha256" == "$NEXAWRT_APK_SIGNING_PRODUCTION_PUBLIC_SHA256" ]] ||
+  fail "hardware candidate APK signing identity does not match the production trust anchor"
+[[ "$candidate_signing_mode" == public-key-only ]] ||
+  fail "hardware candidate must use public-key-only APK signing"
+[[ "$candidate_index_signed" == false ]] ||
+  fail "hardware candidate APK index must remain unsigned"
+python3 - "$DIST_DIR" <<'PY' || fail "candidate lacks two distinct producer identities bound to one trusted GitHub workflow"
+import hashlib
 import json
 import pathlib
 import re
 import sys
 
-value = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
-if value.get("schema") != 4:
+root = pathlib.Path(sys.argv[1]).resolve(strict=True)
+trusted_workflows = {
+    "tifycloud/NexaWrt/.github/workflows/release.yml": "release",
+    "tifycloud/NexaWrt/.github/workflows/build.yml": "browser-build",
+}
+
+def digest(path):
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+def unique_object(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError(f"duplicate JSON key: {key}")
+        result[key] = value
+    return result
+
+try:
+    value = json.loads(
+        (root / "REPRODUCIBILITY.json").read_text(encoding="utf-8", errors="strict"),
+        object_pairs_hook=unique_object,
+    )
+except (OSError, UnicodeError, ValueError, json.JSONDecodeError):
+    raise SystemExit(1)
+if value.get("schema") != 5 or value.get("reproducible") is not True:
+    raise SystemExit(1)
+signing = value.get("apk_signing")
+if not isinstance(signing, dict) or signing.get("mode") != "public-key-only" or signing.get("index_signed") is not False:
+    raise SystemExit(1)
+flavor = value.get("flavor")
+run_id = value.get("run_id")
+run_attempt = value.get("run_attempt")
+if flavor not in {"official", "nss"}:
+    raise SystemExit(1)
+if not isinstance(run_id, str) or not re.fullmatch(r"[A-Za-z0-9._-]+", run_id):
+    raise SystemExit(1)
+if not isinstance(run_attempt, str) or not re.fullmatch(r"[A-Za-z0-9._-]+", run_attempt):
     raise SystemExit(1)
 items = value.get("input_builds")
 if not isinstance(items, list) or len(items) != 2:
     raise SystemExit(1)
 pattern = re.compile(r"github-artifact:[1-9][0-9]*:bundle-sha256:[0-9a-f]{64}")
-producer_ids = [item.get("producer_id") for item in items if isinstance(item, dict)]
-if len(producer_ids) != 2 or len(set(producer_ids)) != 2 or any(not isinstance(item, str) or not pattern.fullmatch(item) for item in producer_ids):
+producer_ids = []
+producer_workflows = set()
+producer_source_refs = set()
+producer_source_digests = set()
+producer_workflow_refs = set()
+producer_signer_digests = set()
+manifest_values = {}
+for line in (root / "BUILD-MANIFEST.txt").read_text(encoding="utf-8", errors="strict").splitlines():
+    if not line or "=" not in line:
+        raise SystemExit(1)
+    key, field_value = line.split("=", 1)
+    if key in manifest_values:
+        raise SystemExit(1)
+    manifest_values[key] = field_value
+project_commit = manifest_values.get("project_commit")
+if not isinstance(project_commit, str) or not re.fullmatch(r"(?:[0-9a-f]{40}|[0-9a-f]{64})", project_commit):
+    raise SystemExit(1)
+for item, slot, replica_id in zip(items, ("left", "right"), ("a", "b")):
+    if not isinstance(item, dict) or item.get("slot") != slot or item.get("replica_id") != replica_id:
+        raise SystemExit(1)
+    producer_id = item.get("producer_id")
+    if not isinstance(producer_id, str) or not pattern.fullmatch(producer_id):
+        raise SystemExit(1)
+    descriptor_name = f"REPRODUCIBILITY/{slot}.producer-descriptor.json"
+    if item.get("producer_descriptor_filename") != descriptor_name:
+        raise SystemExit(1)
+    descriptor_path = root / descriptor_name
+    descriptor_sha = item.get("producer_descriptor_sha256")
+    if not isinstance(descriptor_sha, str) or not re.fullmatch(r"[0-9a-f]{64}", descriptor_sha) or digest(descriptor_path) != descriptor_sha:
+        raise SystemExit(1)
+    try:
+        descriptor_raw = descriptor_path.read_text(encoding="utf-8", errors="strict")
+        descriptor = json.loads(descriptor_raw, object_pairs_hook=unique_object)
+    except (OSError, UnicodeError, ValueError, json.JSONDecodeError):
+        raise SystemExit(1)
+    descriptor_keys = {
+        "schema", "repository", "workflow", "workflow_ref", "source_ref", "source_digest", "signer_digest",
+        "run_id", "run_attempt", "flavor", "replica_id", "artifact_id", "artifact_name",
+        "receipt_filename", "receipt_sha256",
+    }
+    if not isinstance(descriptor, dict) or set(descriptor) != descriptor_keys or descriptor.get("schema") != 2:
+        raise SystemExit(1)
+    if descriptor_raw != json.dumps(descriptor, sort_keys=True, separators=(",", ":")) + "\n":
+        raise SystemExit(1)
+    workflow = descriptor.get("workflow")
+    artifact_prefix = trusted_workflows.get(workflow)
+    if artifact_prefix is None:
+        raise SystemExit(1)
+    source_ref = descriptor.get("source_ref")
+    source_digest = descriptor.get("source_digest")
+    workflow_ref = descriptor.get("workflow_ref")
+    signer_digest = descriptor.get("signer_digest")
+    if artifact_prefix == "browser-build":
+        if source_ref != "refs/heads/main":
+            raise SystemExit(1)
+    elif not isinstance(source_ref, str) or not re.fullmatch(
+        r"refs/tags/ram-test-(?:nss-)?v[0-9][0-9A-Za-z._-]*", source_ref
+    ):
+        raise SystemExit(1)
+    if source_digest != project_commit or signer_digest != project_commit or workflow_ref != f"{workflow}@{source_ref}":
+        raise SystemExit(1)
+    producer_workflows.add(workflow)
+    producer_source_refs.add(source_ref)
+    producer_source_digests.add(source_digest)
+    producer_workflow_refs.add(workflow_ref)
+    producer_signer_digests.add(signer_digest)
+    artifact_id = item.get("artifact_id")
+    artifact_name = item.get("artifact_name")
+    expected_name = f"{artifact_prefix}-{run_id}-{run_attempt}-{flavor}-{replica_id}"
+    expected = {
+        "repository": "tifycloud/NexaWrt",
+        "workflow": workflow,
+        "workflow_ref": workflow_ref,
+        "source_ref": source_ref,
+        "source_digest": source_digest,
+        "signer_digest": signer_digest,
+        "run_id": run_id,
+        "run_attempt": run_attempt,
+        "flavor": flavor,
+        "replica_id": replica_id,
+        "artifact_id": artifact_id,
+        "artifact_name": expected_name,
+        "receipt_filename": "SHA256SUMS",
+        "receipt_sha256": item.get("receipt_sha256"),
+    }
+    if artifact_name != expected_name or any(descriptor.get(key) != expected_value for key, expected_value in expected.items()):
+        raise SystemExit(1)
+    producer_ids.append(producer_id)
+if len(set(producer_ids)) != 2 or any(len(values) != 1 for values in (
+    producer_workflows, producer_source_refs, producer_source_digests, producer_workflow_refs, producer_signer_digests,
+)):
     raise SystemExit(1)
 PY
 
@@ -240,15 +388,22 @@ def parse(path):
 
 candidate=parse(candidate_path)
 candidate_keys={
-    "schema", "flavor", "firmware_filename", "firmware_sha256", "firmware_size",
+    "schema", "flavor", "apk_signing_profile", "apk_signing_public_sha256",
+    "apk_signing_mode", "apk_index_signed",
+    "firmware_filename", "firmware_sha256", "firmware_size",
     "verified_dist_sha256sums_sha256", "reproducibility_sha256", "build_manifest_sha256",
     "repository_inputs_sha256", "comparison_receipt_sha256",
 }
 if set(candidate) != candidate_keys or candidate["schema"] != "1": raise SystemExit(1)
+if candidate["apk_signing_profile"] != "production": raise SystemExit(1)
+if not re.fullmatch(r"[0-9a-f]{64}", candidate["apk_signing_public_sha256"]): raise SystemExit(1)
+if candidate["apk_signing_mode"] != "public-key-only" or candidate["apk_index_signed"] != "false": raise SystemExit(1)
 values=parse(approval_path)
 expected_keys={
     "decision", "reviewer", "reviewed_utc", "evidence_sha256", "candidate_schema",
-    "flavor", "firmware_filename", "firmware_sha256", "firmware_size",
+    "flavor", "apk_signing_profile", "apk_signing_public_sha256",
+    "apk_signing_mode", "apk_index_signed",
+    "firmware_filename", "firmware_sha256", "firmware_size",
     "verified_dist_sha256sums_sha256", "reproducibility_sha256", "build_manifest_sha256",
     "repository_inputs_sha256", "comparison_receipt_sha256",
 }

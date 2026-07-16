@@ -18,6 +18,7 @@ inputs = [
     ".github/workflows/build.yml",
     ".github/workflows/release.yml",
     "scripts/build.sh",
+    "scripts/apk-signing-key.sh",
     "scripts/prepare.sh",
     "scripts/validate.sh",
     "scripts/collect-build-evidence.sh",
@@ -37,6 +38,7 @@ inputs = [
     "scripts/verify-stress-evidence.sh",
     "files",
     "manifests/upstream.lock",
+    "manifests/apk-signing.lock",
     "manifests/feeds.lock",
     "patches",
 ]

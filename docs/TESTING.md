@@ -22,7 +22,7 @@ verified-dist 与最终真机批准的本地策略回归使用最小但完整的
 ./tests/test_hardware_gate.sh
 ```
 
-这些测试要求只接受 compare 生成的 schema-4 verified dist，并覆盖缺失/伪造 reproducibility、错误
+这些测试要求只接受 compare 生成的 schema-5 verified dist，并覆盖缺失/伪造 reproducibility、APK 信任 profile/公钥摘要漂移、错误
 source/feed lock 或 reviewed patch digest、复制同一构建冒充双构建、错误 a/b/run build identity、缺失/
 额外/篡改完整构建输入、无效 `EVIDENCE.sha256`、替换 input receipt、批准未绑定 receipt、以及 firmware
 SHA-256/size 不一致等
@@ -143,8 +143,8 @@ mkdir -m 0700 "$EVIDENCE"
 ./scripts/create-hardware-session.sh "$EVIDENCE" <verified-dist>
 ```
 
-`SESSION.txt` 必须只有 `session_id=<64 位小写 hex>` 一行。创建脚本还必须生成严格十字段
-`CANDIDATE.txt`，绑定 flavor、真实 ITB filename/SHA-256/size、verified-dist `SHA256SUMS`、
+`SESSION.txt` 必须只有 `session_id=<64 位小写 hex>` 一行。创建脚本还必须生成严格十四字段
+`CANDIDATE.txt`，绑定 flavor、APK production 公钥信任 identity、`public-key-only`/未签名 index 策略、真实 ITB filename/SHA-256/size、verified-dist `SHA256SUMS`、
 `REPRODUCIBILITY.json`、`BUILD-MANIFEST.txt` 三个文件摘要，以及 repository-input 和双构建 comparison
 receipt 摘要。所有 production/runtime collector、压力测试和最终签名都复用这一个目录与 session；最终
 验证会重新验证 verified dist 并要求 candidate metadata 逐字节一致，不得手工复用旧会话或改选目录。
@@ -172,12 +172,12 @@ printenv nexawrt_image_sha256 nexawrt_image_size_hex nexawrt_session_id ethaddr
 
 - 两个独立干净构建的可复现性比较结果。候选必须是
   `scripts/compare-reproducible-builds.sh` 生成且通过 `--verify-verified-dist` 的目录；严格
-  `REPRODUCIBILITY.json` 必须为 schema 4、`reproducible=true`，绑定恰好两个 input checksum/evidence
+  `REPRODUCIBILITY.json` 必须为 schema 5、`reproducible=true`，绑定同一 APK 信任 profile/规范化公钥 SHA-256、`mode=public-key-only`、`index_signed=false`，以及恰好两个 input checksum/evidence
   receipts、comparison receipt、repository-input receipt，以及与真实 ITB 一致的 flavor/filename/SHA/size；
   左右 checksum/evidence receipt 摘要必须分别不同，`BUILD-IDENTITY.txt` 必须分别绑定 a/b 和同一 run，且
   `EVIDENCE.sha256` 必须校验精确 evidence payload 集并绑定对应 build identity。正式真机候选还必须让两个
   input build 各自绑定不同的 `github-artifact:<id>:bundle-sha256:<digest>` producer identity，并嵌入由
-  GitHub 签名、绑定 artifact ID/name、run、replica 与 receipt digest 的 canonical producer descriptor；
+  GitHub 签名、绑定 artifact ID/name、run、replica、receipt digest、精确 source ref/source digest 与 workflow ref/signer digest 的 schema-2 canonical producer descriptor；
   verifier 必须由显式绝对路径和预期 SHA-256 双重固定，不能从 `PATH` 注入。`local-unattested:a|b` 仅供开发预检，最终硬件 gate 必须拒绝。
   `BUILD-MANIFEST.txt` 中 source repository/commit 和每个 flavor 预期 feed repository/commit/patch digest
   必须与 `manifests/*.lock`、`EVIDENCE/SOURCE-STATE.txt`、`EVIDENCE/INPUTS.sha256` 及当前 reviewed patch

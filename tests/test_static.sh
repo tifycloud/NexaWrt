@@ -34,6 +34,7 @@ fi
 unset NEXAWRT_FLAVOR
 
 echo 'flavor policy: official default, isolated nss work tree, and official-only release OK'
+"$ROOT_DIR/tests/test_apk_signing_policy.sh"
 "$ROOT_DIR/tests/test_feed_policy.sh"
 "$ROOT_DIR/tests/test_git_environment_policy.sh"
 "$ROOT_DIR/tests/test_source_fetch_policy.sh"
@@ -53,4 +54,5 @@ echo 'flavor policy: official default, isolated nss work tree, and official-only
 "$ROOT_DIR/tests/test_hardware_gate.sh"
 "$ROOT_DIR/tests/test_release_policy.sh"
 "$ROOT_DIR/tests/test_reproducibility_policy.sh"
+"$ROOT_DIR/tests/test_browser_build_policy.sh"
 "$ROOT_DIR/tests/test_workflow_policy.sh"

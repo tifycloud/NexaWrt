@@ -11,9 +11,12 @@ EXPECTED_SBOM='openwrt-qualcommax-ipq807x-xiaomi_ax9000_single_ubi.bom.cdx.json'
 
 fail() { echo "reproducibility gate failed: $*" >&2; exit 1; }
 hash_file() { if command -v sha256sum >/dev/null 2>&1; then sha256sum -- "$1"; else shasum -a 256 -- "$1"; fi; }
+command -v python3 >/dev/null 2>&1 || fail "python3 is required"
+PYTHON_BIN="$(python3 -c 'import os, sys; print(os.path.realpath(sys.executable))')" || fail "cannot resolve the active Python interpreter"
+[[ "$PYTHON_BIN" == /* && -x "$PYTHON_BIN" && ! -L "$PYTHON_BIN" ]] || fail "active Python interpreter is not a safe absolute executable"
 
 canonicalize_input() {
-  python3 - "$ROOT_DIR" "$1" <<'PY'
+  "$PYTHON_BIN" - "$ROOT_DIR" "$1" <<'PY'
 import os
 import pathlib
 import sys
@@ -37,7 +40,7 @@ PY
 }
 
 canonicalize_output() {
-  python3 - "$ROOT_DIR" "$1" <<'PY'
+  "$PYTHON_BIN" - "$ROOT_DIR" "$1" <<'PY'
 import os
 import pathlib
 import sys
@@ -77,7 +80,7 @@ PY
 
 verify_distribution() {
   local directory="$1" flavor="$2" mode="$3"
-  python3 - "$ROOT_DIR" "$directory" "$flavor" "$mode" "$EXPECTED_IMAGE" "$EXPECTED_MANIFEST" "$EXPECTED_SBOM" <<'PY'
+  "$PYTHON_BIN" - "$ROOT_DIR" "$directory" "$flavor" "$mode" "$EXPECTED_IMAGE" "$EXPECTED_MANIFEST" "$EXPECTED_SBOM" <<'PY'
 import hashlib
 import json
 import os
@@ -296,6 +299,11 @@ upstream = parse_shell_lock(
     {"OPENWRT_REPO", "OPENWRT_TAG", "OPENWRT_COMMIT", "LAYOUT_ID", "ROOTFS_MTD_OFFSET_HEX", "ROOTFS_MTD_SIZE_HEX", "ROOTFS_MTD_ERASE_SIZE_HEX"},
     "upstream lock",
 )
+apk_signing = parse_shell_lock(
+    repo / "manifests/apk-signing.lock",
+    {"NEXAWRT_APK_SIGNING_PRODUCTION_PUBLIC_SHA256"},
+    "APK signing lock",
+)
 nss = parse_shell_lock(
     repo / "manifests/nss.lock",
     {"NSS_OPENWRT_REPO", "NSS_OPENWRT_BRANCH", "NSS_OPENWRT_COMMIT", "NSS_PACKAGES_FEED", "NSS_PACKAGES_REPO", "NSS_PACKAGES_COMMIT", "NSS_SQM_FEED", "NSS_SQM_REPO", "NSS_SQM_COMMIT"},
@@ -317,14 +325,14 @@ if flavor == "official":
     manifest_keys = {
         "project", "flavor", "project_commit", "layout", "source_repository", "source_tag", "source_commit",
         "source_date_epoch", "stage", "real_device_boot_approved", "image", "package_manifest", "sbom",
-        "rootfs_mtd_offset", "rootfs_mtd_size",
+        "rootfs_mtd_offset", "rootfs_mtd_size", "apk_signing_profile", "apk_signing_public_sha256",
     }
 else:
     manifest_keys = {
         "project", "flavor", "project_commit", "source_repository", "source_branch", "source_commit",
         "source_date_epoch", "nss_packages_feed_repository", "nss_packages_feed_commit",
         "nss_sqm_feed_repository", "nss_sqm_feed_commit", "stage", "real_device_boot_approved",
-        "image", "package_manifest", "sbom",
+        "image", "package_manifest", "sbom", "apk_signing_profile", "apk_signing_public_sha256",
     }
 manifest = parse_key_values(dist / "BUILD-MANIFEST.txt", manifest_keys, "BUILD-MANIFEST.txt")
 if manifest["project"] != "NexaWrt" or manifest["flavor"] != flavor:
@@ -343,6 +351,16 @@ if not re.fullmatch(r"[1-9][0-9]*", manifest["source_date_epoch"]):
     raise SystemExit("build manifest source_date_epoch is invalid")
 if manifest["stage"] != "initramfs-ram-boot-only" or manifest["real_device_boot_approved"] != "no":
     raise SystemExit("build manifest safety stage is invalid")
+if manifest["apk_signing_profile"] not in {"repro-test", "production"}:
+    raise SystemExit("build manifest APK signing profile is invalid")
+if not re.fullmatch(r"[0-9a-f]{64}", manifest["apk_signing_public_sha256"]):
+    raise SystemExit("build manifest APK signing public hash is invalid")
+production_anchor = apk_signing["NEXAWRT_APK_SIGNING_PRODUCTION_PUBLIC_SHA256"]
+if manifest["apk_signing_profile"] == "production":
+    if production_anchor == "UNPROVISIONED":
+        raise SystemExit("production APK signing trust anchor is unprovisioned")
+    if manifest["apk_signing_public_sha256"] != production_anchor:
+        raise SystemExit("production APK signing identity does not match repository trust anchor")
 if (manifest["image"], manifest["package_manifest"], manifest["sbom"]) != (image, package_manifest, sbom):
     raise SystemExit("build manifest artifact names are invalid")
 if flavor == "official":
@@ -380,7 +398,7 @@ if flavor == "nss":
     expected_feeds[nss["NSS_SQM_FEED"]] = (nss["NSS_SQM_REPO"], nss["NSS_SQM_COMMIT"])
     feed_declared_patch_hashes[nss["NSS_PACKAGES_FEED"]] = digest_file(repo / "patches/nss/001-pin-codelinaro-source-archives.patch")
     feed_declared_patch_hashes[nss["NSS_SQM_FEED"]] = hashlib.sha256(b"").hexdigest()
-source_keys = {"flavor", "project_commit", "project_tree_state", "source_commit", "source_origin"}
+source_keys = {"flavor", "project_commit", "project_tree_state", "source_commit", "source_origin", "apk_signing_profile", "apk_signing_public_sha256"}
 for name in expected_feeds:
     source_keys.update({f"feed.{name}.commit", f"feed.{name}.origin", f"feed.{name}.worktree_diff_sha256"})
 source_state = parse_key_values(dist / "EVIDENCE/SOURCE-STATE.txt", source_keys, "SOURCE-STATE.txt")
@@ -390,12 +408,14 @@ if source_state["project_tree_state"] != "clean":
     raise SystemExit("source state must come from a clean project tree")
 if source_state["source_commit"] != manifest["source_commit"] or source_state["source_origin"] != manifest["source_repository"]:
     raise SystemExit("source state does not match locked source")
+if source_state["apk_signing_profile"] != manifest["apk_signing_profile"] or source_state["apk_signing_public_sha256"] != manifest["apk_signing_public_sha256"]:
+    raise SystemExit("source state APK signing identity mismatch")
 build_identity = parse_key_values(
     dist / "EVIDENCE/BUILD-IDENTITY.txt",
-    {"schema", "flavor", "replica_id", "run_id", "run_attempt", "project_commit", "source_commit"},
+    {"schema", "flavor", "replica_id", "run_id", "run_attempt", "project_commit", "source_commit", "apk_signing_profile", "apk_signing_public_sha256"},
     "BUILD-IDENTITY.txt",
 )
-if build_identity["schema"] != "1" or build_identity["flavor"] != flavor:
+if build_identity["schema"] != "2" or build_identity["flavor"] != flavor:
     raise SystemExit("build identity schema or flavor mismatch")
 if build_identity["replica_id"] not in {"a", "b"}:
     raise SystemExit("build identity replica_id must be a or b")
@@ -404,6 +424,8 @@ for key in ("run_id", "run_attempt"):
         raise SystemExit(f"build identity {key} is invalid")
 if build_identity["project_commit"] != manifest["project_commit"] or build_identity["source_commit"] != manifest["source_commit"]:
     raise SystemExit("build identity commit binding mismatch")
+if build_identity["apk_signing_profile"] != manifest["apk_signing_profile"] or build_identity["apk_signing_public_sha256"] != manifest["apk_signing_public_sha256"]:
+    raise SystemExit("build identity APK signing binding mismatch")
 feed_worktree_state_hashes = {}
 for name, (repository, commit) in expected_feeds.items():
     if source_state[f"feed.{name}.origin"] != repository or source_state[f"feed.{name}.commit"] != commit:
@@ -479,6 +501,10 @@ repository_lines = [
     f"source_repository={manifest['source_repository']}",
     f"source_commit={manifest['source_commit']}",
     f"source_ref={source_ref}",
+    f"apk_signing_profile={manifest['apk_signing_profile']}",
+    f"apk_signing_public_sha256={manifest['apk_signing_public_sha256']}",
+    "apk_signing_mode=public-key-only",
+    "apk_index_signed=false",
 ]
 for name in sorted(expected_inputs):
     repository_lines.append(f"input.{name}.sha256={inputs[name]}")
@@ -500,6 +526,8 @@ def recompute_repository_inputs(source_state_path, inputs_path, label):
         raise SystemExit(f"{label} source state must come from a clean project tree")
     if retained_source["source_commit"] != manifest["source_commit"] or retained_source["source_origin"] != manifest["source_repository"]:
         raise SystemExit(f"{label} source state does not match locked source")
+    if retained_source["apk_signing_profile"] != manifest["apk_signing_profile"] or retained_source["apk_signing_public_sha256"] != manifest["apk_signing_public_sha256"]:
+        raise SystemExit(f"{label} source state APK signing identity mismatch")
     retained_feed_hashes = {}
     for name, (repository, commit) in expected_feeds.items():
         if retained_source[f"feed.{name}.origin"] != repository or retained_source[f"feed.{name}.commit"] != commit:
@@ -537,6 +565,10 @@ def recompute_repository_inputs(source_state_path, inputs_path, label):
         f"source_repository={manifest['source_repository']}",
         f"source_commit={manifest['source_commit']}",
         f"source_ref={source_ref}",
+        f"apk_signing_profile={manifest['apk_signing_profile']}",
+        f"apk_signing_public_sha256={manifest['apk_signing_public_sha256']}",
+        "apk_signing_mode=public-key-only",
+        "apk_index_signed=false",
     ]
     for name in sorted(expected_inputs):
         retained_lines.append(f"input.{name}.sha256={retained_inputs[name]}")
@@ -575,12 +607,12 @@ try:
 except (OSError, UnicodeError, ValueError, json.JSONDecodeError) as error:
     raise SystemExit(f"invalid REPRODUCIBILITY.json: {error}")
 expected_root_keys = {
-    "schema", "generator", "flavor", "reproducible", "firmware", "input_builds",
+    "schema", "generator", "flavor", "reproducible", "firmware", "apk_signing", "input_builds",
     "repository_inputs_sha256", "comparison_receipt_sha256", "run_id", "run_attempt",
 }
 if not isinstance(reproduction, dict) or set(reproduction) != expected_root_keys:
     raise SystemExit("REPRODUCIBILITY.json root schema mismatch")
-if reproduction["schema"] != 4 or reproduction["generator"] != "scripts/compare-reproducible-builds.sh":
+if reproduction["schema"] != 5 or reproduction["generator"] != "scripts/compare-reproducible-builds.sh":
     raise SystemExit("REPRODUCIBILITY.json generator schema mismatch")
 if reproduction["flavor"] != flavor or reproduction["reproducible"] is not True:
     raise SystemExit("REPRODUCIBILITY.json does not assert this reproducible flavor")
@@ -593,6 +625,17 @@ if firmware != {"filename": image, "sha256": actual_image_sha, "size": actual_im
     raise SystemExit("REPRODUCIBILITY.json firmware binding mismatch")
 if manifest["flavor"] != reproduction["flavor"] or manifest["image"] != firmware["filename"]:
     raise SystemExit("reproducibility metadata and build manifest disagree")
+signing = reproduction["apk_signing"]
+expected_signing = {
+    "profile": manifest["apk_signing_profile"],
+    "public_sha256": manifest["apk_signing_public_sha256"],
+    "mode": "public-key-only",
+    "index_signed": False,
+}
+if not isinstance(signing, dict) or set(signing) != set(expected_signing):
+    raise SystemExit("REPRODUCIBILITY.json APK signing schema mismatch")
+if signing != expected_signing:
+    raise SystemExit("REPRODUCIBILITY.json APK signing binding mismatch")
 if reproduction["repository_inputs_sha256"] != repository_inputs_sha256:
     raise SystemExit("REPRODUCIBILITY.json repository input binding mismatch")
 if not isinstance(reproduction["run_id"], str) or not re.fullmatch(r"[A-Za-z0-9._-]+", reproduction["run_id"]):
@@ -606,6 +649,15 @@ input_builds = reproduction["input_builds"]
 if not isinstance(input_builds, list) or len(input_builds) != 2:
     raise SystemExit("REPRODUCIBILITY.json must bind exactly two input builds")
 by_slot = {}
+producer_workflows = set()
+producer_source_refs = set()
+producer_source_digests = set()
+producer_workflow_refs = set()
+producer_signer_digests = set()
+trusted_producer_workflows = {
+    "tifycloud/NexaWrt/.github/workflows/release.yml": "release",
+    "tifycloud/NexaWrt/.github/workflows/build.yml": "browser-build",
+}
 for item in input_builds:
     if not isinstance(item, dict) or set(item) != {
         "slot", "receipt_filename", "receipt_sha256", "evidence_receipt_filename", "evidence_receipt_sha256",
@@ -664,12 +716,14 @@ for item in input_builds:
         raise SystemExit("input build retained repository input receipt mismatch")
     identity = parse_key_values(
         identity_path,
-        {"schema", "flavor", "replica_id", "run_id", "run_attempt", "project_commit", "source_commit"},
+        {"schema", "flavor", "replica_id", "run_id", "run_attempt", "project_commit", "source_commit", "apk_signing_profile", "apk_signing_public_sha256"},
         f"{slot} build identity",
     )
     expected_replica_id = "a" if slot == "left" else "b"
-    if identity["schema"] != "1" or identity["flavor"] != flavor or identity["replica_id"] != expected_replica_id:
+    if identity["schema"] != "2" or identity["flavor"] != flavor or identity["replica_id"] != expected_replica_id:
         raise SystemExit("input build identity slot binding mismatch")
+    if identity["apk_signing_profile"] != manifest["apk_signing_profile"] or identity["apk_signing_public_sha256"] != manifest["apk_signing_public_sha256"]:
+        raise SystemExit("input build identity APK signing binding mismatch")
     if item["replica_id"] != expected_replica_id or identity["run_id"] != reproduction["run_id"] or identity["run_attempt"] != reproduction["run_attempt"]:
         raise SystemExit("input build identity run binding mismatch")
     producer_id = item["producer_id"]
@@ -702,18 +756,57 @@ for item in input_builds:
         except (OSError, UnicodeError, ValueError, json.JSONDecodeError) as error:
             raise SystemExit(f"invalid platform producer descriptor: {error}")
         descriptor_keys = {
-            "schema", "repository", "workflow", "run_id", "run_attempt", "flavor", "replica_id",
-            "artifact_id", "artifact_name", "receipt_filename", "receipt_sha256",
+            "schema", "repository", "workflow", "workflow_ref", "source_ref", "source_digest", "signer_digest",
+            "run_id", "run_attempt", "flavor", "replica_id", "artifact_id", "artifact_name",
+            "receipt_filename", "receipt_sha256",
         }
-        if not isinstance(descriptor, dict) or set(descriptor) != descriptor_keys or descriptor.get("schema") != 1:
+        if not isinstance(descriptor, dict) or set(descriptor) != descriptor_keys or descriptor.get("schema") != 2:
             raise SystemExit("platform producer descriptor schema mismatch")
         canonical_descriptor = json.dumps(descriptor, sort_keys=True, separators=(",", ":")) + "\n"
         if descriptor_raw != canonical_descriptor:
             raise SystemExit("platform producer descriptor is not canonical JSON")
-        expected_artifact_name = f"release-{reproduction['run_id']}-{reproduction['run_attempt']}-{flavor}-{expected_replica_id}"
+        descriptor_workflow = descriptor.get("workflow")
+        artifact_prefix = trusted_producer_workflows.get(descriptor_workflow)
+        if artifact_prefix is None:
+            raise SystemExit("platform producer workflow is not trusted")
+        descriptor_source_ref = descriptor.get("source_ref")
+        descriptor_source_digest = descriptor.get("source_digest")
+        descriptor_workflow_ref = descriptor.get("workflow_ref")
+        descriptor_signer_digest = descriptor.get("signer_digest")
+        expected_workflow_ref = f"{descriptor_workflow}@{descriptor_source_ref}"
+        if artifact_prefix == "browser-build":
+            if descriptor_source_ref != "refs/heads/main":
+                raise SystemExit("browser producer descriptor is not bound to refs/heads/main")
+        elif not isinstance(descriptor_source_ref, str) or not re.fullmatch(
+            r"refs/tags/ram-test-(?:nss-)?v[0-9][0-9A-Za-z._-]*", descriptor_source_ref
+        ):
+            raise SystemExit("release producer descriptor is not bound to an exact trusted refs/tags/... ref")
+        if descriptor_source_digest != manifest["project_commit"] or descriptor_signer_digest != manifest["project_commit"]:
+            raise SystemExit("platform producer descriptor commit binding mismatch")
+        if descriptor_workflow_ref != expected_workflow_ref:
+            raise SystemExit("platform producer descriptor workflow ref binding mismatch")
+        if os.environ.get("GITHUB_ACTIONS") == "true":
+            current = {
+                "source_ref": os.environ.get("GITHUB_REF"),
+                "source_digest": os.environ.get("GITHUB_SHA"),
+                "workflow_ref": os.environ.get("GITHUB_WORKFLOW_REF"),
+                "signer_digest": os.environ.get("GITHUB_WORKFLOW_SHA"),
+            }
+            if any(descriptor.get(key) != expected for key, expected in current.items()):
+                raise SystemExit("platform producer descriptor does not bind the current GitHub ref/commit/workflow")
+        producer_workflows.add(descriptor_workflow)
+        producer_source_refs.add(descriptor_source_ref)
+        producer_source_digests.add(descriptor_source_digest)
+        producer_workflow_refs.add(descriptor_workflow_ref)
+        producer_signer_digests.add(descriptor_signer_digest)
+        expected_artifact_name = f"{artifact_prefix}-{reproduction['run_id']}-{reproduction['run_attempt']}-{flavor}-{expected_replica_id}"
         expected_descriptor_values = {
             "repository": "tifycloud/NexaWrt",
-            "workflow": "tifycloud/NexaWrt/.github/workflows/release.yml",
+            "workflow": descriptor_workflow,
+            "workflow_ref": descriptor_workflow_ref,
+            "source_ref": descriptor_source_ref,
+            "source_digest": descriptor_source_digest,
+            "signer_digest": descriptor_signer_digest,
             "run_id": reproduction["run_id"],
             "run_attempt": reproduction["run_attempt"],
             "flavor": flavor,
@@ -747,7 +840,10 @@ for item in input_builds:
                 str(verifier_path), "attestation", "verify", str(descriptor_path),
                 "--repo", "tifycloud/NexaWrt",
                 "--bundle", str(bundle_path),
-                "--signer-workflow", "tifycloud/NexaWrt/.github/workflows/release.yml",
+                "--signer-workflow", descriptor_workflow,
+                "--source-digest", descriptor_source_digest,
+                "--source-ref", descriptor_source_ref,
+                "--signer-digest", descriptor_signer_digest,
             ], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
         except (FileNotFoundError, PermissionError) as error:
             raise SystemExit(f"cannot execute attestation verifier: {error}")
@@ -760,6 +856,10 @@ for item in input_builds:
     if receipt[image] != actual_image_sha or receipt["BUILD-MANIFEST.txt"] != digest_file(dist / "BUILD-MANIFEST.txt"):
         raise SystemExit("input build receipt is not bound to the selected artifact and manifest")
     by_slot[slot] = (item, receipt, retained_repository_inputs_sha256)
+if platform_provenance_expected and any(len(values) != 1 for values in (
+    producer_workflows, producer_source_refs, producer_source_digests, producer_workflow_refs, producer_signer_digests,
+)):
+    raise SystemExit("platform producer descriptors must bind one trusted workflow/ref/commit identity")
 if by_slot["left"][0]["receipt_sha256"] == by_slot["right"][0]["receipt_sha256"]:
     raise SystemExit("input build receipts must be distinct")
 if by_slot["left"][0]["evidence_receipt_sha256"] == by_slot["right"][0]["evidence_receipt_sha256"]:
@@ -781,9 +881,13 @@ for name in exact_compared:
     if by_slot["right"][1][name] != by_slot["left"][1][name]:
         raise SystemExit(f"input receipts disagree for exact compared file: {name}")
 comparison_lines = [
-    "schema=4",
+    "schema=5",
     "generator=scripts/compare-reproducible-builds.sh",
     f"flavor={flavor}",
+    f"apk_signing_profile={manifest['apk_signing_profile']}",
+    f"apk_signing_public_sha256={manifest['apk_signing_public_sha256']}",
+    "apk_signing_mode=public-key-only",
+    "apk_index_signed=false",
     f"firmware_filename={image}",
     f"firmware_sha256={actual_image_sha}",
     f"firmware_size={actual_image_size}",
@@ -822,6 +926,10 @@ if reproduction["comparison_receipt_sha256"] != comparison_receipt_sha256:
 candidate = [
     "schema=1",
     f"flavor={flavor}",
+    f"apk_signing_profile={manifest['apk_signing_profile']}",
+    f"apk_signing_public_sha256={manifest['apk_signing_public_sha256']}",
+    "apk_signing_mode=public-key-only",
+    "apk_index_signed=false",
     f"firmware_filename={image}",
     f"firmware_sha256={actual_image_sha}",
     f"firmware_size={actual_image_size}",
@@ -887,7 +995,7 @@ if [[ "$FLAVOR" == nss ]]; then
 fi
 
 normalize_sbom() {
-  python3 - "$1" <<'PY'
+  "$PYTHON_BIN" - "$1" <<'PY'
 import json
 import sys
 
@@ -928,7 +1036,7 @@ right_sbom="$(normalize_sbom "$RIGHT/$EXPECTED_SBOM")" || fail "right SBOM norma
 [[ "$left_sbom" == "$right_sbom" ]] || fail "normalized CycloneDX SBOMs differ"
 
 read_build_identity() {
-  python3 - "$1" <<'PY'
+  "$PYTHON_BIN" - "$1" <<'PY'
 import pathlib
 import re
 import sys
@@ -940,10 +1048,12 @@ for line in pathlib.Path(sys.argv[1]).read_text(encoding="utf-8", errors="strict
     if key in values:
         raise SystemExit(1)
     values[key] = value
-expected = {"schema", "flavor", "replica_id", "run_id", "run_attempt", "project_commit", "source_commit"}
-if set(values) != expected or values["schema"] != "1":
+expected = {"schema", "flavor", "replica_id", "run_id", "run_attempt", "project_commit", "source_commit", "apk_signing_profile", "apk_signing_public_sha256"}
+if set(values) != expected or values["schema"] != "2":
     raise SystemExit(1)
 if values["replica_id"] not in {"a", "b"}:
+    raise SystemExit(1)
+if values["apk_signing_profile"] not in {"repro-test", "production"} or not re.fullmatch(r"[0-9a-f]{64}", values["apk_signing_public_sha256"]):
     raise SystemExit(1)
 if not re.fullmatch(r"[A-Za-z0-9._-]+", values["run_id"]) or not re.fullmatch(r"[A-Za-z0-9._-]+", values["run_attempt"]):
     raise SystemExit(1)
@@ -969,6 +1079,10 @@ left_identity_sha="$(hash_file "$LEFT/EVIDENCE/BUILD-IDENTITY.txt" | awk '{print
 right_identity_sha="$(hash_file "$RIGHT/EVIDENCE/BUILD-IDENTITY.txt" | awk '{print $1}')"
 [[ "$left_receipt_sha" != "$right_receipt_sha" ]] || fail "input build receipts must be distinct"
 [[ "$left_evidence_receipt_sha" != "$right_evidence_receipt_sha" ]] || fail "input build evidence receipts must be distinct"
+
+project_commit="$(awk -F= '$1 == "project_commit" { count++; value=$2 } END { if (count != 1 || value !~ /^([0-9a-f]{40}|[0-9a-f]{64})$/) exit 1; print value }' "$LEFT/BUILD-MANIFEST.txt")" || fail "left manifest project commit is invalid"
+right_project_commit="$(awk -F= '$1 == "project_commit" { count++; value=$2 } END { if (count != 1 || value !~ /^([0-9a-f]{40}|[0-9a-f]{64})$/) exit 1; print value }' "$RIGHT/BUILD-MANIFEST.txt")" || fail "right manifest project commit is invalid"
+[[ "$project_commit" == "$right_project_commit" ]] || fail "replicas disagree on the project commit"
 
 platform_requested=false
 for value in \
@@ -998,7 +1112,7 @@ left_bundle_sha=""
 right_bundle_sha=""
 
 canonicalize_provenance_file() {
-  /usr/bin/python3 - "$ROOT_DIR" "$1" <<'PY'
+  "$PYTHON_BIN" - "$ROOT_DIR" "$1" <<'PY'
 import os
 import pathlib
 import stat
@@ -1016,8 +1130,45 @@ print(resolved)
 PY
 }
 
+resolve_platform_workflow() {
+  "$PYTHON_BIN" - "${GITHUB_ACTIONS:-}" "${GITHUB_REPOSITORY:-}" "${GITHUB_WORKFLOW_REF:-}" \
+    "${GITHUB_REF:-}" "${GITHUB_SHA:-}" "${GITHUB_WORKFLOW_SHA:-}" "$1" <<'PY'
+import re
+import sys
+
+github_actions, repository, workflow_ref, source_ref, source_digest, signer_digest, project_commit = sys.argv[1:]
+trusted = {
+    "tifycloud/NexaWrt/.github/workflows/release.yml": "release",
+    "tifycloud/NexaWrt/.github/workflows/build.yml": "browser-build",
+}
+commit_pattern = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})")
+if github_actions != "true" or repository != "tifycloud/NexaWrt":
+    raise SystemExit("platform provenance requires the trusted GitHub repository context")
+if "@" not in workflow_ref:
+    raise SystemExit("GITHUB_WORKFLOW_REF is missing an immutable workflow path binding")
+workflow, workflow_source_ref = workflow_ref.rsplit("@", 1)
+artifact_prefix = trusted.get(workflow)
+if artifact_prefix is None:
+    raise SystemExit("current GitHub producer workflow is not trusted")
+if source_ref != workflow_source_ref:
+    raise SystemExit("GitHub source ref and workflow ref do not match")
+if artifact_prefix == "browser-build":
+    if source_ref != "refs/heads/main":
+        raise SystemExit("browser producer workflow must run only from refs/heads/main")
+else:
+    if not re.fullmatch(r"refs/tags/ram-test-(?:nss-)?v[0-9][0-9A-Za-z._-]*", source_ref):
+        raise SystemExit("release producer workflow must use an exact trusted refs/tags/... source ref")
+if not commit_pattern.fullmatch(project_commit):
+    raise SystemExit("project commit is not a full Git object digest")
+if source_digest != project_commit:
+    raise SystemExit("GitHub source digest does not match the project commit")
+if signer_digest != project_commit:
+    raise SystemExit("GitHub signer digest does not match the project commit")
+print("\t".join((workflow, source_ref, source_digest, workflow_ref, signer_digest)))
+PY
+}
 validate_platform_descriptor() {
-  /usr/bin/python3 - "$@" <<'PY'
+  "$PYTHON_BIN" - "$@" <<'PY'
 import hashlib
 import json
 import pathlib
@@ -1027,7 +1178,8 @@ import subprocess
 import sys
 (
     slot, descriptor_raw_path, bundle_raw_path, receipt_raw_path, flavor, replica_id,
-    run_id, run_attempt, expected_artifact_id, expected_artifact_name,
+    run_id, run_attempt, expected_artifact_id, expected_artifact_name, actual_workflow,
+    actual_source_ref, actual_source_digest, actual_workflow_ref, actual_signer_digest,
     verifier_raw_path, verifier_expected_hash,
 ) = sys.argv[1:]
 
@@ -1057,25 +1209,37 @@ if slot not in {"left", "right"} or replica_id not in {"a", "b"} or flavor not i
     raise SystemExit("invalid platform producer coordinates")
 if not re.fullmatch(r"[1-9][0-9]*", expected_artifact_id):
     raise SystemExit("platform artifact id is invalid")
-canonical_name = f"release-{run_id}-{run_attempt}-{flavor}-{replica_id}"
+trusted_workflows = {
+    "tifycloud/NexaWrt/.github/workflows/release.yml": "release",
+    "tifycloud/NexaWrt/.github/workflows/build.yml": "browser-build",
+}
+artifact_prefix = trusted_workflows.get(actual_workflow)
+if artifact_prefix is None:
+    raise SystemExit("actual platform producer workflow is not trusted")
+canonical_name = f"{artifact_prefix}-{run_id}-{run_attempt}-{flavor}-{replica_id}"
 if expected_artifact_name != canonical_name:
-    raise SystemExit("platform artifact name is not canonical")
+    raise SystemExit("platform artifact name is not canonical for the actual workflow")
 try:
     descriptor_raw = descriptor_path.read_text(encoding="utf-8", errors="strict")
     descriptor = json.loads(descriptor_raw, object_pairs_hook=unique_object, parse_constant=reject_constant)
 except (OSError, UnicodeError, ValueError, json.JSONDecodeError) as error:
     raise SystemExit(f"invalid platform producer descriptor: {error}")
 expected_keys = {
-    "schema", "repository", "workflow", "run_id", "run_attempt", "flavor", "replica_id",
-    "artifact_id", "artifact_name", "receipt_filename", "receipt_sha256",
+    "schema", "repository", "workflow", "workflow_ref", "source_ref", "source_digest", "signer_digest",
+    "run_id", "run_attempt", "flavor", "replica_id", "artifact_id", "artifact_name",
+    "receipt_filename", "receipt_sha256",
 }
-if not isinstance(descriptor, dict) or set(descriptor) != expected_keys or descriptor.get("schema") != 1:
+if not isinstance(descriptor, dict) or set(descriptor) != expected_keys or descriptor.get("schema") != 2:
     raise SystemExit("platform producer descriptor schema mismatch")
 if descriptor_raw != json.dumps(descriptor, sort_keys=True, separators=(",", ":")) + "\n":
     raise SystemExit("platform producer descriptor is not canonical JSON")
 expected = {
     "repository": "tifycloud/NexaWrt",
-    "workflow": "tifycloud/NexaWrt/.github/workflows/release.yml",
+    "workflow": actual_workflow,
+    "workflow_ref": actual_workflow_ref,
+    "source_ref": actual_source_ref,
+    "source_digest": actual_source_digest,
+    "signer_digest": actual_signer_digest,
     "run_id": run_id,
     "run_attempt": run_attempt,
     "flavor": flavor,
@@ -1101,7 +1265,10 @@ try:
     subprocess.run([
         str(verifier_path), "attestation", "verify", str(descriptor_path),
         "--repo", "tifycloud/NexaWrt", "--bundle", str(bundle_path),
-        "--signer-workflow", "tifycloud/NexaWrt/.github/workflows/release.yml",
+        "--signer-workflow", actual_workflow,
+        "--source-digest", actual_source_digest,
+        "--source-ref", actual_source_ref,
+        "--signer-digest", actual_signer_digest,
     ], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
 except (FileNotFoundError, PermissionError) as error:
     raise SystemExit(f"cannot execute attestation verifier: {error}")
@@ -1115,6 +1282,9 @@ PY
 }
 
 if [[ "$platform_requested" == true ]]; then
+  IFS=$'	' read -r actual_producer_workflow actual_source_ref actual_source_digest actual_workflow_ref actual_signer_digest < <(
+    resolve_platform_workflow "$project_commit"
+  ) || fail "cannot bind platform producers to the actual trusted GitHub workflow/ref/commit"
   [[ -n "${NEXAWRT_ATTESTATION_VERIFIER:-}" && -n "${NEXAWRT_ATTESTATION_VERIFIER_SHA256:-}" ]] ||
     fail "explicit attestation verifier path and SHA256 are required"
   [[ "${NEXAWRT_ATTESTATION_VERIFIER}" == /* ]] || fail "attestation verifier path must be absolute"
@@ -1128,12 +1298,14 @@ if [[ "$platform_requested" == true ]]; then
   right_bundle="$(canonicalize_provenance_file "${NEXAWRT_RIGHT_PROVENANCE_BUNDLE:-}")" || fail "right provenance bundle is missing, unsafe, or outside release-staging"
   IFS=$'\t' read -r left_producer_id left_descriptor_sha left_bundle_sha < <(
     validate_platform_descriptor left "$left_descriptor" "$left_bundle" "$LEFT/SHA256SUMS" "$FLAVOR" a \
-      "$run_id" "$run_attempt" "$left_artifact_id" "$left_artifact_name" \
+      "$run_id" "$run_attempt" "$left_artifact_id" "$left_artifact_name" "$actual_producer_workflow" \
+      "$actual_source_ref" "$actual_source_digest" "$actual_workflow_ref" "$actual_signer_digest" \
       "$NEXAWRT_ATTESTATION_VERIFIER" "$NEXAWRT_ATTESTATION_VERIFIER_SHA256"
   ) || fail "left platform producer descriptor validation failed"
   IFS=$'\t' read -r right_producer_id right_descriptor_sha right_bundle_sha < <(
     validate_platform_descriptor right "$right_descriptor" "$right_bundle" "$RIGHT/SHA256SUMS" "$FLAVOR" b \
-      "$run_id" "$run_attempt" "$right_artifact_id" "$right_artifact_name" \
+      "$run_id" "$run_attempt" "$right_artifact_id" "$right_artifact_name" "$actual_producer_workflow" \
+      "$actual_source_ref" "$actual_source_digest" "$actual_workflow_ref" "$actual_signer_digest" \
       "$NEXAWRT_ATTESTATION_VERIFIER" "$NEXAWRT_ATTESTATION_VERIFIER_SHA256"
   ) || fail "right platform producer descriptor validation failed"
   [[ "$left_artifact_id" != "$right_artifact_id" && "$left_artifact_name" != "$right_artifact_name" ]] || fail "platform artifact identities must be distinct"
@@ -1165,19 +1337,22 @@ left_source_state_sha="$(hash_file "$LEFT/EVIDENCE/SOURCE-STATE.txt" | awk '{pri
 right_source_state_sha="$(hash_file "$RIGHT/EVIDENCE/SOURCE-STATE.txt" | awk '{print $1}')"
 left_inputs_sha="$(hash_file "$LEFT/EVIDENCE/INPUTS.sha256" | awk '{print $1}')"
 right_inputs_sha="$(hash_file "$RIGHT/EVIDENCE/INPUTS.sha256" | awk '{print $1}')"
+apk_signing_profile="$(awk -F= '$1 == "apk_signing_profile" { count++; value=$2 } END { if (count != 1) exit 1; print value }' "$LEFT/BUILD-MANIFEST.txt")" || fail "left manifest APK signing profile is invalid"
+apk_signing_public_sha256="$(awk -F= '$1 == "apk_signing_public_sha256" { count++; value=$2 } END { if (count != 1) exit 1; print value }' "$LEFT/BUILD-MANIFEST.txt")" || fail "left manifest APK signing hash is invalid"
 if [[ -n "$left_bundle" ]]; then
   cp "$left_descriptor" "$OUTPUT/REPRODUCIBILITY/left.producer-descriptor.json"
   cp "$right_descriptor" "$OUTPUT/REPRODUCIBILITY/right.producer-descriptor.json"
   cp "$left_bundle" "$OUTPUT/REPRODUCIBILITY/left.provenance.bundle.json"
   cp "$right_bundle" "$OUTPUT/REPRODUCIBILITY/right.provenance.bundle.json"
 fi
-python3 - "$OUTPUT/REPRODUCIBILITY.json" "$FLAVOR" "$EXPECTED_IMAGE" "$image_sha" "$image_size" \
+"$PYTHON_BIN" - "$OUTPUT/REPRODUCIBILITY.json" "$FLAVOR" "$EXPECTED_IMAGE" "$image_sha" "$image_size" \
   "$repository_inputs_sha256" "$left_receipt_sha" "$left_evidence_receipt_sha" \
   "$right_receipt_sha" "$right_evidence_receipt_sha" "$left_identity_sha" "$right_identity_sha" \
   "$left_source_state_sha" "$right_source_state_sha" "$left_inputs_sha" "$right_inputs_sha" \
   "$run_id" "$run_attempt" "$left_producer_id" "$right_producer_id" \
   "$left_artifact_id" "$right_artifact_id" "$left_artifact_name" "$right_artifact_name" \
-  "$left_descriptor_sha" "$right_descriptor_sha" "$left_bundle_sha" "$right_bundle_sha" <<'PY'
+  "$left_descriptor_sha" "$right_descriptor_sha" "$left_bundle_sha" "$right_bundle_sha" \
+  "$apk_signing_profile" "$apk_signing_public_sha256" <<'PY'
 import hashlib
 import json
 import pathlib
@@ -1189,11 +1364,16 @@ import sys
  left_source_state_sha, right_source_state_sha, left_inputs_sha, right_inputs_sha,
  run_id, run_attempt, left_producer_id, right_producer_id,
  left_artifact_id, right_artifact_id, left_artifact_name, right_artifact_name,
- left_descriptor_sha, right_descriptor_sha, left_bundle_sha, right_bundle_sha) = sys.argv[1:]
+ left_descriptor_sha, right_descriptor_sha, left_bundle_sha, right_bundle_sha,
+ apk_signing_profile, apk_signing_public_sha256) = sys.argv[1:]
 lines = [
-    "schema=4",
+    "schema=5",
     "generator=scripts/compare-reproducible-builds.sh",
     f"flavor={flavor}",
+    f"apk_signing_profile={apk_signing_profile}",
+    f"apk_signing_public_sha256={apk_signing_public_sha256}",
+    "apk_signing_mode=public-key-only",
+    "apk_index_signed=false",
     f"firmware_filename={image}",
     f"firmware_sha256={image_sha}",
     f"firmware_size={image_size}",
@@ -1239,11 +1419,17 @@ lines = [
 ]
 comparison_receipt_sha256 = hashlib.sha256(("\n".join(lines) + "\n").encode()).hexdigest()
 document = {
-    "schema": 4,
+    "schema": 5,
     "generator": "scripts/compare-reproducible-builds.sh",
     "flavor": flavor,
     "reproducible": True,
     "firmware": {"filename": image, "sha256": image_sha, "size": int(image_size)},
+    "apk_signing": {
+        "profile": apk_signing_profile,
+        "public_sha256": apk_signing_public_sha256,
+        "mode": "public-key-only",
+        "index_signed": False,
+    },
     "input_builds": [
         {
             "slot": "left",

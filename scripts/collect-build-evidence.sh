@@ -901,19 +901,26 @@ if grep -Eq '(^|[^[:alnum:]_])(gh[pousr]_[A-Za-z0-9_]{20,}|github_pat_[A-Za-z0-9
   fail "build log appears to contain a credential or private key"
 fi
 
+/bin/bash "$ROOT_DIR/scripts/apk-signing-key.sh" verify-public ||
+  fail "APK signing identity is missing or invalid"
+APK_SIGNING_PROFILE="$NEXAWRT_APK_SIGNING_PROFILE"
+APK_SIGNING_PUBLIC_SHA256="$NEXAWRT_APK_SIGNING_PUBLIC_SHA256"
+
 EVIDENCE_STAGING_DIR="$(mktemp -d "$DIST_DIR/.EVIDENCE.XXXXXX")" ||
   fail "could not create temporary evidence staging directory"
 TEMP_DIRS+=("$EVIDENCE_STAGING_DIR")
 cp "$BUILD_LOG" "$EVIDENCE_STAGING_DIR/build.log"
 cp "$WORK_DIR/.config" "$EVIDENCE_STAGING_DIR/resolved.config"
 {
-  printf 'schema=1\n'
+  printf 'schema=2\n'
   printf 'flavor=%s\n' "$FLAVOR"
   printf 'replica_id=%s\n' "$REPLICA_ID"
   printf 'run_id=%s\n' "$RUN_ID"
   printf 'run_attempt=%s\n' "$RUN_ATTEMPT"
   printf 'project_commit=%s\n' "$PROJECT_COMMIT"
   printf 'source_commit=%s\n' "$SOURCE_COMMIT"
+  printf 'apk_signing_profile=%s\n' "$APK_SIGNING_PROFILE"
+  printf 'apk_signing_public_sha256=%s\n' "$APK_SIGNING_PUBLIC_SHA256"
 } > "$EVIDENCE_STAGING_DIR/BUILD-IDENTITY.txt"
 
 SOURCE_STATE_TMP="$(mktemp "$EVIDENCE_STAGING_DIR/.SOURCE-STATE.XXXXXX")" ||
@@ -934,6 +941,8 @@ revalidate_top_level_feed_entries || fail "feed state changed before SOURCE-STAT
   source_origin="$(git -C "$WORK_DIR" remote get-url origin)" ||
     fail "source origin could not be resolved"
   printf 'source_origin=%s\n' "$source_origin"
+  printf 'apk_signing_profile=%s\n' "$APK_SIGNING_PROFILE"
+  printf 'apk_signing_public_sha256=%s\n' "$APK_SIGNING_PUBLIC_SHA256"
   if ((${#TOP_LEVEL_FEED_ENTRIES[@]})); then
     for ((feed_index = 0; feed_index < ${#TOP_LEVEL_FEED_ENTRIES[@]}; feed_index++)); do
       revalidate_top_level_feed_entries || fail "feed state changed before evidence collection"

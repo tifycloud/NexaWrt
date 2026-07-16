@@ -12,22 +12,47 @@ initramfs RAM-only 候选，不是刷机包。** 在全部真机门禁和独立�
 ./tests/test_static.sh
 ```
 
+### 1.1 APK 公钥信任身份
+
+OpenWrt APK 信任身份属于构建输入，不允许每个副本随机生成。生产 P-256 公钥以
+`manifests/apk-signing-public.pem` 提交，规范化 SubjectPublicKeyInfo DER SHA-256 必须匹配
+`manifests/apk-signing.lock` 的 `NEXAWRT_APK_SIGNING_PRODUCTION_PUBLIC_SHA256`。构建脚本仅把规范化
+公钥复制到仓库 `.work/apk-signing/`，通过 `BUILD_KEY_APK_PUB` 和显式
+`NEXAWRT_APK_PUBLIC_ONLY=1` 绑定 build/download；源码顶层出现 `private-key.pem` 必须拒绝。
+
+公钥-only 模式不得生成或读取 APK 私钥，不得依赖 `BUILD_KEY_APK_SEC`：临时 package index 不签名，
+rootfs 安装显式使用 `--allow-untrusted`，最终系统仍嵌入被仓库锁定的受信公钥。未来若提供在线 APK
+更新仓库，其 index 必须在独立、受控、离线环境中使用仓库外生产私钥签署；固件构建工作流永远不接触
+该私钥。
+
+本地双构建可使用 `NEXAWRT_APK_SIGNING_PROFILE=repro-test`，但必须显式提供仓库和 OpenWrt
+`TOPDIR` 外的 P-256 公钥，并校验规范化 DER SHA-256；这种候选只能得到
+`local-unattested:*`，最终硬件 gate 必须拒绝。GitHub browser build 和 tag release 只接受
+`NEXAWRT_APK_SIGNING_PROFILE=production`，且提交公钥、锁定摘要、构建 evidence 三者必须一致。
+锚未配置、公钥缺失/为符号链接、曲线/权限/摘要不匹配时，正式构建必须在编译前 fail closed。
+生产私钥不得进入 Git、GitHub secret、OpenWrt `TOPDIR`、evidence、artifact、SBOM 或 verified dist。
+`BUILD-MANIFEST.txt`、`SOURCE-STATE.txt`、`BUILD-IDENTITY.txt`、repository-input receipt 与 schema-5
+`REPRODUCIBILITY.json` 必须绑定相同 profile 和公钥摘要；机器可读 reproducibility 元数据还必须明确声明
+`mode=public-key-only`、`index_signed=false`，不得把仅公钥信任身份误表述为已签名 APK index。最终硬件批准只接受匹配仓库生产锚的
+`production` 候选。
+
 发布候选还必须经过两个相互独立、无共享构建目录的干净构建，并由
 `scripts/compare-reproducible-builds.sh` 比较精确 ITB、包清单、配置、buildinfo、输入摘要和规范化
 SBOM。真机会话只接受该脚本生成且能再次通过 `--verify-verified-dist` 的 verified dist；手工复制 firmware
-并添加 `flavor=nss` 等自述文件不构成候选。`REPRODUCIBILITY.json` 使用严格 schema 4，必须声明
-`reproducible=true`，绑定恰好两个独立 input build 的 checksum receipt 及 evidence receipt 摘要，并把
+并添加 `flavor=nss` 等自述文件不构成候选。`REPRODUCIBILITY.json` 使用严格 schema 5，必须声明
+`reproducible=true`，绑定统一的 APK 信任 profile/公钥摘要、`public-key-only` 模式、未签名 index 策略、恰好两个独立 input build 的 checksum receipt 及 evidence receipt 摘要，并把
 comparison receipt、flavor、ITB 文件名/SHA-256/字节数和仓库输入摘要一起纳入校验。左右 checksum
 receipt 及 evidence receipt 的摘要都必须互不相同；每个构建还必须提供受 checksum/evidence receipt 双重
 绑定的 `BUILD-IDENTITY.txt`，分别声明 `replica_id=a|b`，并绑定同一个 run id/attempt、project commit 与
-source commit。发布 workflow 还必须在各 matrix build job 上传副本后生成 canonical `producer-descriptor.json`；descriptor 精确绑定
-repository、signer workflow、run ID/attempt、flavor、replica、Artifact API 返回的 artifact ID/name，以及该副本
-`SHA256SUMS` 的文件名和 SHA-256。GitHub build-provenance attestation 的 subject 是 descriptor 本身，而不是可被
+source commit。浏览器构建或发布 workflow 还必须在各 matrix build job 上传副本后生成 canonical `producer-descriptor.json`；descriptor 精确绑定
+repository、实际 signer workflow、精确 workflow ref、source ref/source digest、signer digest、run ID/attempt、flavor、replica、Artifact API 返回的 artifact ID/name，以及该副本
+`SHA256SUMS` 的文件名和 SHA-256。浏览器 descriptor 只接受 `refs/heads/main`；release descriptor 只接受与运行 tag 一致的精确 `refs/tags/...`。GitHub build-provenance attestation 的 subject 是 descriptor 本身，而不是可被
 重新贴标签的 receipt。compare job 离线验证两份 descriptor attestation 后，才派生
-`github-artifact:<id>:bundle-sha256:<digest>` 并写入 schema 4 的两个 `producer_id`；descriptor 与 bundle 分别固化为
+`github-artifact:<id>:bundle-sha256:<digest>` 并写入 schema 5 的两个 `producer_id`；descriptor 与 bundle 分别固化为
 `REPRODUCIBILITY/{left,right}.producer-descriptor.json` 和 `{left,right}.provenance.bundle.json`。
 `--verify-verified-dist` 使用显式绝对路径的 GitHub CLI，并先校验该可执行文件的预期 SHA-256，再对嵌入 descriptor、
-bundle、固定仓库 `tifycloud/NexaWrt` 和固定 signer workflow 离线验签。GitHub Actions 环境缺失、
+bundle、固定仓库 `tifycloud/NexaWrt`、严格 signer workflow 白名单，以及 `--source-digest`、`--source-ref`、`--signer-digest` 离线验签。白名单只允许
+`.github/workflows/release.yml` 或 `.github/workflows/build.yml`，且左右副本必须来自同一个实际 workflow；GitHub Actions 环境缺失、
 相同或未验证的 producer identity 均拒绝；本地 compare 只会标记为 `local-unattested:a|b`，这种输出可用于
 开发预检，但最终硬件门禁明确拒绝。直接复制同一个构建目录或伪造不同路径冒充双构建会被拒绝。目录中的真实 ITB、
 `SHA256SUMS`、两个 receipt 或任一受比较文件发生变化都会 fail closed；`EVIDENCE.sha256`
@@ -141,6 +166,10 @@ verified dist 的受控 receipt，严格字段集为：
 ```text
 schema=1
 flavor=official|nss
+apk_signing_profile=production
+apk_signing_public_sha256=<仓库锁定的规范化 P-256 公钥 SHA-256>
+apk_signing_mode=public-key-only
+apk_index_signed=false
 firmware_filename=<精确 ITB basename>
 firmware_sha256=<真实 ITB SHA-256>
 firmware_size=<真实 ITB 十进制字节数>
@@ -334,6 +363,10 @@ reviewed_utc=<UTC RFC3339>
 evidence_sha256=<按固定 payload 顺序计算的摘要>
 candidate_schema=1
 flavor=official|nss
+apk_signing_profile=production
+apk_signing_public_sha256=<仓库锁定的规范化 P-256 公钥 SHA-256>
+apk_signing_mode=public-key-only
+apk_index_signed=false
 firmware_filename=<精确 ITB basename>
 firmware_sha256=<精确 ITB SHA-256>
 firmware_size=<精确 ITB 十进制字节数>
@@ -353,7 +386,7 @@ signature namespace `nexawrt-hardware-approval` 签名。缺失 receipt 绑定�
 SHA-256；验证器不会从通用 `PATH` 搜索替代程序。候选必须在 `REPRODUCIBILITY.json` 中绑定两个不同的
 GitHub artifact ID/name、两份不同 descriptor/bundle 摘要，以及嵌入的
 `REPRODUCIBILITY/{left,right}.producer-descriptor.json` 和 `{left,right}.provenance.bundle.json`。最终验证器先校验
-GitHub CLI 文件摘要，再用固定仓库与 signer workflow 对两份 descriptor bundle 离线验签；descriptor/bundle
+GitHub CLI 文件摘要，再用固定仓库、descriptor 绑定的受信 signer workflow、精确 source ref/source digest 和 signer digest 对两份 descriptor bundle 离线验签；descriptor/bundle
 缺失、artifact 重标、摘要漂移、签名/仓库/workflow/subject 不匹配或 verifier 路径/摘要缺失均 fail-closed。本地 `local-unattested:*` 候选不含这些 bundle，只能做开发预检，不能进入最终硬件签名。发布时附带的 firmware/SBOM/checksum/archive provenance bundle 是额外的
 分发层证明，不替代副本生产者身份。威胁模型不覆盖持有受信 reviewer 私钥的
 本地攻击者；私钥保护、allowed-signers 管理与 CI environment 审批仍必须独立执行。

@@ -74,6 +74,9 @@ actual_source_origin="$(git -C "$WORK_DIR" remote get-url origin 2>/dev/null)" |
 [[ "$actual_source_commit" == "$NSS_OPENWRT_COMMIT" ]] || fail "NSS source checkout is not at locked commit"
 [[ "$actual_source_origin" == "$NSS_OPENWRT_REPO" ]] || fail "NSS source checkout uses an unexpected origin"
 
+/bin/bash "$ROOT_DIR/scripts/apk-signing-key.sh" verify-public ||
+  fail "APK signing identity is missing or invalid"
+
 NEXAWRT_FLAVOR=nss "$ROOT_DIR/scripts/validate.sh" --source "$WORK_DIR" --artifacts ||
   fail "NSS source/artifact validation failed"
 
@@ -133,6 +136,8 @@ source_repository=$actual_source_origin
 source_branch=$NSS_OPENWRT_BRANCH
 source_commit=$actual_source_commit
 source_date_epoch=$source_date_epoch
+apk_signing_profile=$NEXAWRT_APK_SIGNING_PROFILE
+apk_signing_public_sha256=$NEXAWRT_APK_SIGNING_PUBLIC_SHA256
 nss_packages_feed_repository=$NSS_PACKAGES_REPO
 nss_packages_feed_commit=$NSS_PACKAGES_COMMIT
 nss_sqm_feed_repository=$NSS_SQM_REPO

@@ -173,11 +173,44 @@ NSS 不是隐式 fallback。只有明确选择 `nss` 时才允许使用 NSS 构�
 NEXAWRT_FLAVOR=nss ./scripts/build.sh
 ```
 
+构建不会再让 OpenWrt 在源码顶层随机生成 APK 私钥，也不会把长期私钥交给联网的第三方构建机。
+当前 initramfs 构建采用**仅公钥信任身份**：仓库提交 `manifests/apk-signing-public.pem`，其规范化
+SubjectPublicKeyInfo DER SHA-256 由 `manifests/apk-signing.lock` 锁定；OpenWrt 只嵌入该受信公钥，构建期
+临时 package index 保持未签名并以显式 `--allow-untrusted` 安装。未来若发布可更新 APK 仓库，必须在受控、
+离线的签名环境中使用仓库外私钥单独签署 index，不能把私钥注入固件构建工作流。
+
+生产构建使用已提交的公钥：
+
+```sh
+export NEXAWRT_APK_SIGNING_PROFILE=production
+export NEXAWRT_APK_SIGNING_PUBLIC_KEY_FILE="$PWD/manifests/apk-signing-public.pem"
+./scripts/build.sh
+```
+
+本地双构建也可使用 `repro-test`，但必须显式提供一个位于仓库与 OpenWrt `TOPDIR` 之外、不可由其他
+用户写入、无符号链接/硬链接的 P-256 **公钥**，并设置其规范化 DER SHA-256：
+
+```sh
+export NEXAWRT_APK_SIGNING_PROFILE=repro-test
+export NEXAWRT_APK_SIGNING_PUBLIC_KEY_FILE=/absolute/path/nexawrt-repro-test-public.pem
+export NEXAWRT_APK_SIGNING_PUBLIC_SHA256="$(
+  openssl pkey -pubin -in "$NEXAWRT_APK_SIGNING_PUBLIC_KEY_FILE" -outform DER 2>/dev/null |
+    sha256sum | awk '{print $1}'
+)"
+NEXAWRT_FLAVOR=nss ./scripts/build.sh
+```
+
+`repro-test` 只能做本地确定性预检，最终硬件批准会拒绝它。生产私钥保存在仓库外，不得提交到 Git、
+GitHub secret、OpenWrt `TOPDIR`、构建 evidence、artifact、SBOM 或 verified dist。
+
 不要通过修改 `official` 的 source、配置或 `files/` 来模拟 NSS。
 
 macOS 自带的 Bash、Make 和默认大小写不敏感文件系统通常不满足 OpenWrt 完整构建
-要求。本机建议只做静态检查和只读备份，固件通过 GitHub Actions 的
-**NexaWrt AX9000 initramfs build** 工作流手动构建。
+要求。本机建议只做静态检查和只读备份。要从浏览器构建并下载最新候选：进入 GitHub
+**Actions → NexaWrt AX9000 browser verified build → Run workflow**，选择 `official` 或 `nss`。
+工作流会执行两个隔离的干净构建、校验 GitHub provenance 和字节级可复现性；成功后在本次运行页面
+**Artifacts** 区域下载 `NexaWrt-AX9000-<flavor>-verified-dist-<commit>`。该下载仍是 RAM-only
+真机测试候选，不是可直接写入闪存的生产刷机包。
 
 两个 flavor 的安全构建流程都只允许 AX9000 single-large-UBI initramfs profile，artifact 名
 必须能追溯到 flavor，镜像文件名必须能追溯到 profile。当前 profile 明确关闭 sysupgrade 和
@@ -189,10 +222,11 @@ flavor，不允许未知 tag 回退到默认构建。每个 flavor 都执行两�
 flavor/replica `WORK_DIR`、构建日志和 staging 目录的干净构建，再把正确 flavor 传给比较器，
 比较精确 ITB、package manifest、解析配置、buildinfo、输入摘要及规范化 CycloneDX SBOM。
 
-每个副本 job 上传后都生成 canonical producer descriptor，绑定 run、replica、artifact ID/name 和
-`SHA256SUMS` 摘要，并以 descriptor 作为 GitHub provenance attestation subject；compare job 从本次 workflow
-run 的 API 取得两个不同 artifact ID，离线验证两份 descriptor bundle 的仓库和 signer workflow，把外部
-producer identity 写入 schema-4 `REPRODUCIBILITY.json`，并将 descriptor 与 bundle 一同固化进 verified dist。
+浏览器手动构建和 tag 发布的每个副本 job 上传后都生成 schema-2 canonical producer descriptor，绑定 run、replica、artifact ID/name、
+`SHA256SUMS` 摘要、精确 source ref/source digest，以及实际 workflow ref/signer digest，并以 descriptor 作为 GitHub provenance
+attestation subject；compare job 从本次 workflow run 的 API 取得两个不同 artifact ID，使用 source/ref/signer digest 约束离线验证，
+再把外部 producer identity 与 APK 信任 profile/规范化公钥 SHA-256、`mode=public-key-only`、`index_signed=false` 写入 schema-5
+`REPRODUCIBILITY.json`，并将 descriptor 与 bundle 一同固化进 verified dist。
 后续复验只接受显式绝对路径且 SHA-256 已绑定的 GitHub CLI，不从通用 `PATH` 搜索 verifier。本地 `local-unattested` 比较结果只能预检，不能
 进入真机生产批准。只有可复现门禁通过，受保护的 `ram-test-release` Environment 才能发布 prerelease，
 并继续为 ITB、SBOM、最终 `SHA256SUMS` 和精确 verified-dist archive 生成 GitHub provenance attestation。

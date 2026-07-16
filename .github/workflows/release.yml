@@ -33,6 +33,9 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           test "$GITHUB_REF_TYPE" = tag
+          test "$GITHUB_REF" = "refs/tags/$GITHUB_REF_NAME"
+          test "$GITHUB_WORKFLOW_REF" = "tifycloud/NexaWrt/.github/workflows/release.yml@$GITHUB_REF"
+          test "$GITHUB_WORKFLOW_SHA" = "$GITHUB_SHA"
           if [[ "$GITHUB_REF_NAME" =~ ^ram-test-v[0-9][0-9A-Za-z._-]*$ ]]; then
             flavor=official
             work_basename=openwrt
@@ -49,10 +52,23 @@ jobs:
           test "$(git rev-parse "refs/tags/$GITHUB_REF_NAME")" = "$GITHUB_SHA"
           git fetch --force origin main:refs/remotes/origin/main
           git merge-base --is-ancestor "$GITHUB_SHA" origin/main
-          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
-            echo "Release already exists: $GITHUB_REF_NAME" >&2
-            exit 1
-          fi
+          release_tag_is_absent() {
+            local tag="$1" output status
+            if output="$(gh release view "$tag" 2>&1)"; then
+              echo "Release already exists: $tag" >&2
+              return 1
+            else
+              status=$?
+            fi
+            if printf '%s\n' "$output" | grep -Eiq \
+              '(^|[^[:alnum:]])(HTTP[[:space:]]+404|404[[:space:]]+Not[[:space:]]+Found|release[[:space:]]+not[[:space:]]+found)([^[:alnum:]]|$)'; then
+              return 0
+            fi
+            echo "Unable to determine whether release exists: $tag" >&2
+            printf '%s\n' "$output" >&2
+            return "$status"
+          }
+          release_tag_is_absent "$GITHUB_REF_NAME"
           printf 'flavor=%s\nwork_basename=%s\nstaging_basename=%s\n' \
             "$flavor" "$work_basename" "$staging_basename" >> "$GITHUB_OUTPUT"
           NEXAWRT_FLAVOR="$flavor" ./tests/test_static.sh
@@ -69,6 +85,7 @@ jobs:
       contents: read
       id-token: write
       attestations: write
+      artifact-metadata: write
     env:
       NEXAWRT_FLAVOR: ${{ needs.preflight.outputs.flavor }}
       NEXAWRT_BUILD_REPLICA: ${{ matrix.replica }}
@@ -82,6 +99,33 @@ jobs:
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           persist-credentials: false
+      - name: Require committed production APK public trust identity
+        run: |
+          set -euo pipefail
+          source ./scripts/lock-file-policy.sh
+          nexawrt_validate_lock_file manifests/apk-signing.lock apk-signing
+          # The validated lock grammar permits only one quoted declarative assignment.
+          source manifests/apk-signing.lock
+          production_anchor="$NEXAWRT_APK_SIGNING_PRODUCTION_PUBLIC_SHA256"
+          [[ "$production_anchor" =~ ^[0-9a-f]{64}$ ]] || { echo 'production APK signing trust anchor is not provisioned' >&2; exit 1; }
+          public_key="$(pwd -P)/manifests/apk-signing-public.pem"
+          [[ -f "$public_key" && ! -L "$public_key" ]] || { echo 'committed production APK public key is missing or unsafe' >&2; exit 1; }
+          policy_topdir="$RUNNER_TEMP/nexawrt-apk-policy-topdir-${{ matrix.replica }}"
+          mkdir -m 0700 "$policy_topdir"
+          prepared="$(NEXAWRT_APK_SIGNING_PROFILE=production \
+            NEXAWRT_APK_SIGNING_PUBLIC_SHA256="$production_anchor" \
+            NEXAWRT_APK_SIGNING_PUBLIC_KEY_FILE="$public_key" \
+            ./scripts/apk-signing-key.sh prepare "$policy_topdir")"
+          IFS=$'\t' read -r prepared_profile prepared_sha256 prepared_public_key <<<"$prepared"
+          [[ "$prepared_profile" == production && "$prepared_sha256" == "$production_anchor" && -f "$prepared_public_key" ]] || {
+            echo 'committed production APK public key did not satisfy the repository trust anchor' >&2
+            exit 1
+          }
+          {
+            printf 'NEXAWRT_APK_SIGNING_PROFILE=production\n'
+            printf 'NEXAWRT_APK_SIGNING_PUBLIC_KEY_FILE=%s\n' "$public_key"
+            printf 'NEXAWRT_APK_SIGNING_PUBLIC_SHA256=%s\n' "$production_anchor"
+          } >> "$GITHUB_ENV"
       - name: Install OpenWrt build dependencies
         run: |
           sudo apt-get update
@@ -113,15 +157,22 @@ jobs:
         run: |
           test -n "$ARTIFACT_ID"
           mkdir -p "$(dirname "$DESCRIPTOR_PATH")"
+          test "$GITHUB_REF" = "refs/tags/$GITHUB_REF_NAME"
+          test "$GITHUB_WORKFLOW_REF" = "tifycloud/NexaWrt/.github/workflows/release.yml@$GITHUB_REF"
+          test "$GITHUB_WORKFLOW_SHA" = "$GITHUB_SHA"
           python3 - "$DESCRIPTOR_PATH" "$RECEIPT_PATH" "$ARTIFACT_ID" "$ARTIFACT_NAME" \
-            "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" "$RELEASE_FLAVOR" "$REPLICA_ID" <<'PY'
+            "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" "$RELEASE_FLAVOR" "$REPLICA_ID" \
+            "$GITHUB_REF" "$GITHUB_SHA" "$GITHUB_WORKFLOW_REF" "$GITHUB_WORKFLOW_SHA" <<'PY'
           import hashlib
           import json
           import pathlib
           import re
           import sys
 
-          descriptor_path, receipt_path, artifact_id, artifact_name, run_id, run_attempt, flavor, replica_id = sys.argv[1:]
+          (
+              descriptor_path, receipt_path, artifact_id, artifact_name, run_id, run_attempt, flavor, replica_id,
+              source_ref, source_digest, workflow_ref, signer_digest,
+          ) = sys.argv[1:]
           if not re.fullmatch(r"[1-9][0-9]*", artifact_id):
               raise SystemExit("artifact-id is invalid")
           if flavor not in {"official", "nss"} or replica_id not in {"a", "b"}:
@@ -141,8 +192,12 @@ jobs:
               "repository": "tifycloud/NexaWrt",
               "run_attempt": run_attempt,
               "run_id": run_id,
-              "schema": 1,
+              "schema": 2,
+              "signer_digest": signer_digest,
+              "source_digest": source_digest,
+              "source_ref": source_ref,
               "workflow": "tifycloud/NexaWrt/.github/workflows/release.yml",
+              "workflow_ref": workflow_ref,
           }
           pathlib.Path(descriptor_path).write_text(
               json.dumps(descriptor, sort_keys=True, separators=(",", ":")) + "\n",
@@ -170,6 +225,7 @@ jobs:
     needs: [preflight, build]
     runs-on: ubuntu-24.04
     permissions:
+      actions: read
       contents: read
       attestations: read
     steps:
@@ -265,6 +321,7 @@ jobs:
       contents: write
       id-token: write
       attestations: write
+      artifact-metadata: write
     env:
       RELEASE_FLAVOR: ${{ needs.preflight.outputs.flavor }}
     steps:

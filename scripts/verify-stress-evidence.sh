@@ -12,16 +12,35 @@ PATH=/usr/bin:/bin:/usr/sbin:/sbin
 export PATH
 fail() { echo "stress evidence verification failed: $*" >&2; exit 1; }
 
-trusted_python() {
-  local path=/usr/bin/python3 metadata uid mode
-  [[ -x /usr/bin/stat && ! -L /usr/bin/stat && -f "$path" && -x "$path" && ! -L "$path" ]] || return 1
-  if metadata="$(/usr/bin/stat -f '%u %Lp' "$path" 2>/dev/null)"; then :
-  elif metadata="$(/usr/bin/stat -c '%u %a' "$path" 2>/dev/null)"; then :
-  else return 1
+trusted_owner_mode() {
+  local candidate="$1" metadata uid mode
+  if /usr/bin/stat -c '%u %a' "$candidate" >/dev/null 2>&1; then
+    metadata="$(/usr/bin/stat -c '%u %a' "$candidate")"
+  elif /usr/bin/stat -f '%u %Lp' "$candidate" >/dev/null 2>&1; then
+    metadata="$(/usr/bin/stat -f '%u %Lp' "$candidate")"
+  else
+    return 1
   fi
   read -r uid mode <<<"$metadata"
   [[ "$uid" == 0 && "$mode" =~ ^[0-7]{3,4}$ ]] || return 1
-  (( (8#$mode & 022) == 0 )) || return 1
+  (( (8#$mode & 022) == 0 ))
+}
+
+trusted_python() {
+  local path=/usr/bin/python3 target
+  [[ -x /usr/bin/stat && ! -L /usr/bin/stat && -d /usr/bin && ! -L /usr/bin ]] || return 1
+  trusted_owner_mode /usr/bin || return 1
+  trusted_owner_mode /usr/bin/stat || return 1
+
+  if [[ -L "$path" ]]; then
+    [[ -x /usr/bin/readlink && -f /usr/bin/readlink && ! -L /usr/bin/readlink ]] || return 1
+    trusted_owner_mode /usr/bin/readlink || return 1
+    target="$(/usr/bin/readlink "$path")" || return 1
+    [[ "$target" =~ ^python3\.[0-9]+$ ]] || return 1
+    path="/usr/bin/$target"
+  fi
+  [[ -f "$path" && -x "$path" && ! -L "$path" ]] || return 1
+  trusted_owner_mode "$path" || return 1
   printf '%s\n' "$path"
 }
 PYTHON_BIN="$(trusted_python)" || fail "trusted root-owned /usr/bin/python3 is required"

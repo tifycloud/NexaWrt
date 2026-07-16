@@ -28,6 +28,56 @@ nss_tag_pattern='^ram-test-nss-v[0-9][0-9A-Za-z._-]*$'
 for untrusted_tag in ram-test-v ram-test-nss-v ram-test-debug-v1 ram-test-v1/other ram-test-nss-v1/other; do
   ! [[ "$untrusted_tag" =~ $official_tag_pattern || "$untrusted_tag" =~ $nss_tag_pattern ]] || { echo "untrusted tag matches a release flavor: $untrusted_tag" >&2; exit 1; }
 done
+workflow_tmp="$(mktemp -d)"
+trap 'rm -rf "$workflow_tmp"' EXIT
+python3 - "$RELEASE" "$workflow_tmp/release-helper.sh" <<'PY_RELEASE_HELPER'
+import pathlib
+import sys
+
+source = pathlib.Path(sys.argv[1]).read_text(encoding="utf-8").splitlines()
+start = next(i for i, line in enumerate(source) if line.strip() == "release_tag_is_absent() {")
+body = []
+for line in source[start:]:
+    if not line.startswith("          "):
+        raise SystemExit("release helper indentation is unsafe")
+    stripped = line[10:]
+    body.append(stripped)
+    if stripped == "}":
+        break
+else:
+    raise SystemExit("release helper terminator is missing")
+pathlib.Path(sys.argv[2]).write_text("\n".join(body) + "\n", encoding="utf-8")
+PY_RELEASE_HELPER
+mkdir "$workflow_tmp/bin"
+cat > "$workflow_tmp/bin/gh" <<'GH_FIXTURE'
+#!/usr/bin/env bash
+case "${GH_RELEASE_FIXTURE:-}" in
+  exists) printf 'existing release\n'; exit 0 ;;
+  missing) printf 'release not found\n' >&2; exit 1 ;;
+  http404) printf 'HTTP 404 Not Found\n' >&2; exit 1 ;;
+  auth) printf 'HTTP 401: Bad credentials\n' >&2; exit 1 ;;
+  network) printf 'error connecting to api.github.com\n' >&2; exit 1 ;;
+  rate-limit) printf 'HTTP 403: API rate limit exceeded\n' >&2; exit 1 ;;
+  host-not-found) printf 'api.github.com: host not found\n' >&2; exit 1 ;;
+  *) exit 2 ;;
+esac
+GH_FIXTURE
+chmod +x "$workflow_tmp/bin/gh"
+release_helper() {
+  PATH="$workflow_tmp/bin:$PATH" GH_RELEASE_FIXTURE="$1"     bash -euo pipefail -c 'source "$1"; release_tag_is_absent ram-test-v1' bash "$workflow_tmp/release-helper.sh"
+}
+release_helper missing
+release_helper http404
+if release_helper exists >"$workflow_tmp/stdout" 2>"$workflow_tmp/stderr"; then
+  echo 'release helper accepted an existing release' >&2; exit 1
+fi
+grep -Fq 'Release already exists' "$workflow_tmp/stderr"
+for fixture in auth network rate-limit host-not-found; do
+  if release_helper "$fixture" >"$workflow_tmp/stdout" 2>"$workflow_tmp/stderr"; then
+    echo "release helper accepted unsafe gh result: $fixture" >&2; exit 1
+  fi
+  grep -Fq 'Unable to determine whether release exists' "$workflow_tmp/stderr"
+done
 grep -Fq 'Untrusted release tag name' "$RELEASE"
 grep -Fq 'flavor=official' "$RELEASE"
 grep -Fq 'flavor=nss' "$RELEASE"
@@ -38,6 +88,18 @@ grep -Fq 'staging_basename=dist-nss' "$RELEASE"
 grep -Fq 'flavor: ${{ steps.release_identity.outputs.flavor }}' "$RELEASE"
 grep -Fq 'NEXAWRT_FLAVOR: ${{ needs.preflight.outputs.flavor }}' "$RELEASE"
 grep -Fq 'NEXAWRT_BUILD_REPLICA: ${{ matrix.replica }}' "$RELEASE"
+! grep -Eq 'NEXAWRT_APK_SIGNING_KEY_PEM|NEXAWRT_APK_SIGNING_KEY_FILE|BUILD_KEY_APK_SEC|secrets\.NEXAWRT_APK_SIGNING' "$RELEASE" || {
+  echo 'release workflow still references APK private or secret signing material' >&2; exit 1
+}
+grep -Fq 'Require committed production APK public trust identity' "$RELEASE"
+grep -Fq 'nexawrt_validate_lock_file manifests/apk-signing.lock apk-signing' "$RELEASE"
+grep -Fq 'source manifests/apk-signing.lock' "$RELEASE"
+grep -Fq 'public_key="$(pwd -P)/manifests/apk-signing-public.pem"' "$RELEASE"
+grep -Fq 'NEXAWRT_APK_SIGNING_PUBLIC_SHA256="$production_anchor"' "$RELEASE"
+grep -Fq 'NEXAWRT_APK_SIGNING_PUBLIC_KEY_FILE="$public_key"' "$RELEASE"
+grep -Fq 'NEXAWRT_APK_SIGNING_PRODUCTION_PUBLIC_SHA256' "$RELEASE"
+grep -Fq "printf 'NEXAWRT_APK_SIGNING_PROFILE=production\\n'" "$RELEASE"
+! grep -Fq "printf 'NEXAWRT_APK_SIGNING_PROFILE=repro-test\\n'" "$RELEASE"
 ! grep -Fq 'NEXAWRT_FLAVOR: official' "$RELEASE"
 grep -Fq 'replica: [a, b]' "$RELEASE"
 grep -Fq 'WORK_DIR: .work/${{ needs.preflight.outputs.work_basename }}-${{ matrix.replica }}' "$RELEASE"
@@ -61,6 +123,7 @@ grep -Fq 'git/ref/tags/$GITHUB_REF_NAME' "$RELEASE"
 grep -Fq 'test "$remote_sha" = "$GITHUB_SHA"' "$RELEASE"
 grep -Fq 'gh release create "$GITHUB_REF_NAME" --verify-tag --draft --prerelease' "$RELEASE"
 grep -Fq 'attestations: write' "$RELEASE"
+[[ "$(grep -c '^      artifact-metadata: write$' "$RELEASE")" == 2 ]] || { echo 'release artifact metadata write permission is not limited to producer and publish jobs' >&2; exit 1; }
 grep -Fq 'actions/attest-build-provenance@96278af6caaf10aea03fd8d33a09a777ca52d62f' "$RELEASE"
 [[ "$(grep -Fc 'actions/attest-build-provenance@96278af6caaf10aea03fd8d33a09a777ca52d62f' "$RELEASE")" == 5 ]] || {
   echo 'release workflow must attest each producer descriptor plus the four publish subjects' >&2; exit 1
@@ -68,12 +131,17 @@ grep -Fq 'actions/attest-build-provenance@96278af6caaf10aea03fd8d33a09a777ca52d6
 grep -Fq 'subject-path: release-staging/replica-provenance-${{ matrix.replica }}/producer-descriptor.json' "$RELEASE"
 grep -Fq '"repository": "tifycloud/NexaWrt"' "$RELEASE"
 grep -Fq '"workflow": "tifycloud/NexaWrt/.github/workflows/release.yml"' "$RELEASE"
-for field in schema repository workflow run_id run_attempt flavor replica_id artifact_id artifact_name receipt_filename receipt_sha256; do
+grep -Fq 'test "$GITHUB_REF" = "refs/tags/$GITHUB_REF_NAME"' "$RELEASE"
+grep -Fq 'test "$GITHUB_WORKFLOW_REF" = "tifycloud/NexaWrt/.github/workflows/release.yml@$GITHUB_REF"' "$RELEASE"
+grep -Fq 'test "$GITHUB_WORKFLOW_SHA" = "$GITHUB_SHA"' "$RELEASE"
+grep -Fq '"schema": 2' "$RELEASE"
+for field in schema repository workflow workflow_ref source_ref source_digest signer_digest run_id run_attempt flavor replica_id artifact_id artifact_name receipt_filename receipt_sha256; do
   grep -Fq "\"$field\"" "$RELEASE" || { echo "producer descriptor field missing: $field" >&2; exit 1; }
 done
 grep -Fq 'replica-provenance-${{ github.run_id }}-${{ github.run_attempt }}-${{ needs.preflight.outputs.flavor }}-${{ matrix.replica }}' "$RELEASE"
 grep -Fq 'producer-descriptor.provenance.bundle.json' "$RELEASE"
 grep -Fq 'attestations: read' "$RELEASE"
+[[ "$(grep -c '^      actions: read$' "$RELEASE")" == 1 ]] || { echo 'release compare must have actions: read exactly once' >&2; exit 1; }
 grep -Fq '/usr/bin/gh api "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/artifacts?per_page=100"' "$RELEASE"
 [[ "$(grep -Fc 'NEXAWRT_ATTESTATION_VERIFIER=/usr/bin/gh' "$RELEASE")" == 2 ]] || { echo 'compare and publish do not pin /usr/bin/gh' >&2; exit 1; }
 [[ "$(grep -Fc 'NEXAWRT_ATTESTATION_VERIFIER_SHA256=' "$RELEASE")" == 2 ]] || { echo 'compare and publish do not bind verifier SHA256' >&2; exit 1; }
@@ -85,6 +153,13 @@ grep -Fq 'NEXAWRT_LEFT_PRODUCER_DESCRIPTOR: release-staging/provenance/${{ needs
 grep -Fq 'NEXAWRT_RIGHT_PRODUCER_DESCRIPTOR: release-staging/provenance/${{ needs.preflight.outputs.flavor }}/b/producer-descriptor.json' "$RELEASE"
 grep -Fq 'NEXAWRT_LEFT_PROVENANCE_BUNDLE: release-staging/provenance/${{ needs.preflight.outputs.flavor }}/a/producer-descriptor.provenance.bundle.json' "$RELEASE"
 grep -Fq 'NEXAWRT_RIGHT_PROVENANCE_BUNDLE: release-staging/provenance/${{ needs.preflight.outputs.flavor }}/b/producer-descriptor.provenance.bundle.json' "$RELEASE"
+for flag in --source-digest --source-ref --signer-digest; do
+  grep -Fq -- '"'$flag'"' "$ROOT_DIR/scripts/compare-reproducible-builds.sh" || { echo "comparator missing attestation constraint: $flag" >&2; exit 1; }
+done
+grep -Fq 'apk_signing_mode=public-key-only' "$ROOT_DIR/scripts/compare-reproducible-builds.sh"
+grep -Fq 'apk_index_signed=false' "$ROOT_DIR/scripts/compare-reproducible-builds.sh"
+! grep -Fq '/usr/bin/python3' "$ROOT_DIR/scripts/compare-reproducible-builds.sh"
+grep -Fq 'sys.executable' "$ROOT_DIR/scripts/compare-reproducible-builds.sh"
 
 # verified-dist is an immutable input to publish: verify it, archive it externally,
 # verify the unpacked archive, and never append or copy release products into it.
@@ -152,12 +227,12 @@ grep -Fq 'download_tee_status' "$ROOT_DIR/scripts/build.sh"
 grep -Fq 'build_tee_status' "$ROOT_DIR/scripts/build.sh"
 policy_tmp="$(mktemp -d "$ROOT_DIR/.work/test-build-path-policy.XXXXXX")"
 outside_tmp="$(mktemp -d)"
-trap 'rm -rf "$policy_tmp" "$outside_tmp"' EXIT
-if WORK_DIR="$outside_tmp/outside-work" BUILD_LOG="$ROOT_DIR/build-policy.log" "$ROOT_DIR/scripts/build.sh" >"$policy_tmp/stdout" 2>"$policy_tmp/stderr"; then
+trap 'rm -rf "$workflow_tmp" "$policy_tmp" "$outside_tmp"' EXIT
+if WORK_DIR="$outside_tmp/outside-work" BUILD_LOG="$ROOT_DIR/build-policy.log" bash "$ROOT_DIR/scripts/build.sh" >"$policy_tmp/stdout" 2>"$policy_tmp/stderr"; then
   echo 'build accepted a work directory outside .work' >&2; exit 1
 fi
 grep -Fq 'Unsafe WORK_DIR' "$policy_tmp/stderr"
-if WORK_DIR="$ROOT_DIR/.work/build-path-policy" BUILD_LOG="$outside_tmp/outside.log" "$ROOT_DIR/scripts/build.sh" >"$policy_tmp/stdout" 2>"$policy_tmp/stderr"; then
+if WORK_DIR="$ROOT_DIR/.work/build-path-policy" BUILD_LOG="$outside_tmp/outside.log" bash "$ROOT_DIR/scripts/build.sh" >"$policy_tmp/stdout" 2>"$policy_tmp/stderr"; then
   echo 'build accepted a log path outside safe build-log roots' >&2; exit 1
 fi
 grep -Fq 'Unsafe BUILD_LOG' "$policy_tmp/stderr"

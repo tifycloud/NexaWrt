@@ -24,6 +24,7 @@ schemas = {
         "OPENWRT_REPO", "OPENWRT_TAG", "OPENWRT_COMMIT", "LAYOUT_ID",
         "ROOTFS_MTD_OFFSET_HEX", "ROOTFS_MTD_SIZE_HEX", "ROOTFS_MTD_ERASE_SIZE_HEX",
     },
+    "apk-signing": {"NEXAWRT_APK_SIGNING_PRODUCTION_PUBLIC_SHA256"},
     "nss": {
         "NSS_OPENWRT_REPO", "NSS_OPENWRT_BRANCH", "NSS_OPENWRT_COMMIT",
         "NSS_PACKAGES_FEED", "NSS_PACKAGES_REPO", "NSS_PACKAGES_COMMIT",
@@ -62,7 +63,9 @@ for key in [key for key in values if key.endswith("_REPO")]:
     require(key, r"https://[A-Za-z0-9._~:/?#\[\]@!$&'()*+,;=%-]+")
 for key in [key for key in values if key.endswith("_HEX")]:
     require(key, r"0x[0-9a-f]{8}")
-if schema == "upstream":
+if schema == "apk-signing":
+    require("NEXAWRT_APK_SIGNING_PRODUCTION_PUBLIC_SHA256", r"UNPROVISIONED|[0-9a-f]{64}")
+elif schema == "upstream":
     require("OPENWRT_TAG", r"[A-Za-z0-9._/-]+")
     require("LAYOUT_ID", r"[A-Za-z0-9._-]+")
 else:
