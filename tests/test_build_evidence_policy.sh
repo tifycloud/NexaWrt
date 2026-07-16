@@ -190,15 +190,288 @@ git -C "$TMP/work/feeds/packages" ls-files --others -z > "$clean_feed_untracked"
 [[ -d "$TMP/dist/EVIDENCE" && -s "$TMP/dist/EVIDENCE/EVIDENCE.sha256" ]] ||
   fail 'clean feed success path did not publish complete evidence'
 
-printf 'ignored.bin\n' > "$TMP/work/feeds/packages/.gitignore"
+git -C "$TMP/work/feeds/packages" update-index --assume-unchanged tracked.txt
+assert_collector_rejects 'collector rejects assume-unchanged feed index entry'
+[[ ! -e "$TMP/dist/EVIDENCE" ]] ||
+  fail 'assume-unchanged feed index entry published final evidence'
+git -C "$TMP/work/feeds/packages" update-index --no-assume-unchanged tracked.txt
+
+git -C "$TMP/work/feeds/packages" update-index --skip-worktree tracked.txt
+assert_collector_rejects 'collector rejects skip-worktree feed index entry'
+[[ ! -e "$TMP/dist/EVIDENCE" ]] ||
+  fail 'skip-worktree feed index entry published final evidence'
+git -C "$TMP/work/feeds/packages" update-index --no-skip-worktree tracked.txt
+
+feed_worktree_hash_from_evidence() {
+  awk -F= '$1 == "feed.packages.worktree_diff_sha256" { print $2 }' \
+    "$TMP/dist/EVIDENCE/SOURCE-STATE.txt"
+}
+
+nul_file_contains_path() {
+  python3 -I - "$1" "$2" <<'PY_NUL_FILE_CONTAINS'
+import os
+import sys
+
+with open(sys.argv[1], "rb") as handle:
+    records = handle.read().split(b"\0")
+raise SystemExit(0 if os.fsencode(sys.argv[2]) in records else 1)
+PY_NUL_FILE_CONTAINS
+}
+
+printf '*.txt text\n' > "$TMP/work/feeds/packages/.gitattributes"
+ln -s tracked.txt "$TMP/work/feeds/packages/tracked.link"
+git -C "$TMP/work/feeds/packages" add .gitattributes tracked.link
+git -C "$TMP/work/feeds/packages" commit -qm tracked-raw-state-fixtures
+"$ROOT_DIR/scripts/collect-build-evidence.sh" official \
+  "$TMP/work" "$TMP/dist" "$TMP/build.log" >/dev/null ||
+  fail 'collector rejected tracked raw-state baseline'
+tracked_raw_baseline_hash="$(feed_worktree_hash_from_evidence)"
+
+printf 'feed\r\n' > "$TMP/work/feeds/packages/tracked.txt"
+if ! git -C "$TMP/work/feeds/packages" diff --quiet HEAD -- tracked.txt; then
+  fail 'tracked CRLF fixture unexpectedly produced a normalized Git diff'
+fi
+"$ROOT_DIR/scripts/collect-build-evidence.sh" official \
+  "$TMP/work" "$TMP/dist" "$TMP/build.log" >/dev/null ||
+  fail 'collector rejected tracked CRLF raw worktree state'
+tracked_crlf_hash="$(feed_worktree_hash_from_evidence)"
+[[ "$tracked_crlf_hash" != "$tracked_raw_baseline_hash" ]] ||
+  fail 'tracked LF-to-CRLF raw byte change did not alter feed state hash'
+
+printf 'feed\n' > "$TMP/work/feeds/packages/tracked.txt"
+"$ROOT_DIR/scripts/collect-build-evidence.sh" official \
+  "$TMP/work" "$TMP/dist" "$TMP/build.log" >/dev/null ||
+  fail 'collector rejected restored tracked LF state'
+tracked_lf_restored_hash="$(feed_worktree_hash_from_evidence)"
+[[ "$tracked_lf_restored_hash" == "$tracked_raw_baseline_hash" ]] ||
+  fail 'restoring tracked LF bytes did not restore baseline feed state hash'
+
+rm "$TMP/work/feeds/packages/tracked.link"
+ln -s .gitattributes "$TMP/work/feeds/packages/tracked.link"
+"$ROOT_DIR/scripts/collect-build-evidence.sh" official \
+  "$TMP/work" "$TMP/dist" "$TMP/build.log" >/dev/null ||
+  fail 'collector rejected changed tracked symlink target'
+tracked_symlink_hash="$(feed_worktree_hash_from_evidence)"
+[[ "$tracked_symlink_hash" != "$tracked_raw_baseline_hash" ]] ||
+  fail 'tracked symlink target change did not alter feed state hash'
+
+rm "$TMP/work/feeds/packages/tracked.link"
+"$ROOT_DIR/scripts/collect-build-evidence.sh" official \
+  "$TMP/work" "$TMP/dist" "$TMP/build.log" >/dev/null ||
+  fail 'collector rejected tracked missing/deletion state'
+tracked_missing_hash="$(feed_worktree_hash_from_evidence)"
+[[ "$tracked_missing_hash" != "$tracked_raw_baseline_hash" ]] ||
+  fail 'tracked missing/deletion state did not alter feed state hash'
+
+ln -s tracked.txt "$TMP/work/feeds/packages/tracked.link"
+"$ROOT_DIR/scripts/collect-build-evidence.sh" official \
+  "$TMP/work" "$TMP/dist" "$TMP/build.log" >/dev/null ||
+  fail 'collector rejected restored tracked symlink state'
+tracked_symlink_restored_hash="$(feed_worktree_hash_from_evidence)"
+[[ "$tracked_symlink_restored_hash" == "$tracked_raw_baseline_hash" ]] ||
+  fail 'restoring tracked symlink did not restore baseline feed state hash'
+
+mkdir "$TMP/work/feeds/packages/.github"
+printf 'legal target\n' > "$TMP/work/feeds/packages/.github/legal-target"
+rm "$TMP/work/feeds/packages/tracked.link"
+ln -s .github/legal-target "$TMP/work/feeds/packages/tracked.link"
+"$ROOT_DIR/scripts/collect-build-evidence.sh" official \
+  "$TMP/work" "$TMP/dist" "$TMP/build.log" >/dev/null ||
+  fail 'collector incorrectly rejected tracked symlink target under .github'
+[[ -d "$TMP/dist/EVIDENCE" && -s "$TMP/dist/EVIDENCE/EVIDENCE.sha256" ]] ||
+  fail 'legal .github symlink target did not publish complete evidence'
+rm "$TMP/work/feeds/packages/tracked.link"
+ln -s tracked.txt "$TMP/work/feeds/packages/tracked.link"
+rm "$TMP/work/feeds/packages/.github/legal-target"
+rmdir "$TMP/work/feeds/packages/.github"
+
+rm "$TMP/work/feeds/packages/tracked.link"
+ln -s .git/config "$TMP/work/feeds/packages/tracked.link"
+assert_collector_rejects 'collector rejects tracked symlink into top-level Git metadata'
+[[ ! -e "$TMP/dist/EVIDENCE" ]] ||
+  fail 'tracked symlink into top-level Git metadata published final evidence'
+rm "$TMP/work/feeds/packages/tracked.link"
+ln -s tracked.txt "$TMP/work/feeds/packages/tracked.link"
+
+ln -s .git/config "$TMP/work/feeds/packages/untracked-git-metadata.link"
+assert_collector_rejects 'collector rejects untracked symlink into top-level Git metadata'
+[[ ! -e "$TMP/dist/EVIDENCE" ]] ||
+  fail 'untracked symlink into top-level Git metadata published final evidence'
+rm "$TMP/work/feeds/packages/untracked-git-metadata.link"
+
+ln -s .git "$TMP/work/feeds/packages/z-git-metadata-hop"
+rm "$TMP/work/feeds/packages/tracked.link"
+ln -s z-git-metadata-hop/config "$TMP/work/feeds/packages/tracked.link"
+assert_collector_rejects 'collector rejects tracked symlink indirectly resolving into top-level Git metadata'
+[[ ! -e "$TMP/dist/EVIDENCE" ]] ||
+  fail 'tracked symlink indirectly resolving into top-level Git metadata published final evidence'
+rm "$TMP/work/feeds/packages/tracked.link"
+ln -s tracked.txt "$TMP/work/feeds/packages/tracked.link"
+rm "$TMP/work/feeds/packages/z-git-metadata-hop"
+
+ln -s .git "$TMP/work/feeds/packages/z-git-metadata-hop"
+ln -s z-git-metadata-hop/config "$TMP/work/feeds/packages/a-indirect-git-metadata.link"
+assert_collector_rejects 'collector rejects untracked symlink indirectly resolving into top-level Git metadata'
+[[ ! -e "$TMP/dist/EVIDENCE" ]] ||
+  fail 'untracked symlink indirectly resolving into top-level Git metadata published final evidence'
+rm "$TMP/work/feeds/packages/a-indirect-git-metadata.link"
+rm "$TMP/work/feeds/packages/z-git-metadata-hop"
+
+mkdir "$TMP/work/feeds/packages/plain"
+printf 'nested dot-git regular one\n' > "$TMP/work/feeds/packages/plain/.git"
+nested_git_others="$TMP/nested-git-others.list"
+git -C "$TMP/work/feeds/packages" ls-files --others -z > "$nested_git_others" ||
+  fail 'Git untracked enumeration failed for nested .git regular file fixture'
+if nul_file_contains_path "$nested_git_others" 'plain/.git'; then
+  fail 'Git unexpectedly enumerated nested plain/.git regular file fixture'
+fi
+"$ROOT_DIR/scripts/collect-build-evidence.sh" official \
+  "$TMP/work" "$TMP/dist" "$TMP/build.log" >/dev/null ||
+  fail 'collector rejected nested plain/.git regular file'
+nested_git_regular_one_hash="$(feed_worktree_hash_from_evidence)"
+printf 'nested dot-git regular two\n' > "$TMP/work/feeds/packages/plain/.git"
+"$ROOT_DIR/scripts/collect-build-evidence.sh" official \
+  "$TMP/work" "$TMP/dist" "$TMP/build.log" >/dev/null ||
+  fail 'collector rejected changed nested plain/.git regular file'
+nested_git_regular_two_hash="$(feed_worktree_hash_from_evidence)"
+[[ "$nested_git_regular_two_hash" != "$nested_git_regular_one_hash" ]] ||
+  fail 'Git-omitted nested plain/.git regular file content change did not alter feed state hash'
+rm "$TMP/work/feeds/packages/plain/.git"
+
+printf 'same nested symlink target content\n' > "$TMP/work/feeds/packages/plain/target-a"
+printf 'same nested symlink target content\n' > "$TMP/work/feeds/packages/plain/target-b"
+ln -s target-a "$TMP/work/feeds/packages/plain/.git"
+"$ROOT_DIR/scripts/collect-build-evidence.sh" official \
+  "$TMP/work" "$TMP/dist" "$TMP/build.log" >/dev/null ||
+  fail 'collector rejected nested plain/.git symlink'
+nested_git_symlink_a_hash="$(feed_worktree_hash_from_evidence)"
+rm "$TMP/work/feeds/packages/plain/.git"
+ln -s target-b "$TMP/work/feeds/packages/plain/.git"
+"$ROOT_DIR/scripts/collect-build-evidence.sh" official \
+  "$TMP/work" "$TMP/dist" "$TMP/build.log" >/dev/null ||
+  fail 'collector rejected changed nested plain/.git symlink target'
+nested_git_symlink_b_hash="$(feed_worktree_hash_from_evidence)"
+[[ "$nested_git_symlink_b_hash" != "$nested_git_symlink_a_hash" ]] ||
+  fail 'Git-omitted nested plain/.git symlink target change did not alter feed state hash'
+rm "$TMP/work/feeds/packages/plain/.git"
+rm "$TMP/work/feeds/packages/plain/target-a" "$TMP/work/feeds/packages/plain/target-b"
+
+mkdir "$TMP/work/feeds/packages/plain/.git"
+printf 'nested config one\n' > "$TMP/work/feeds/packages/plain/.git/config"
+git -C "$TMP/work/feeds/packages" ls-files --others -z > "$nested_git_others" ||
+  fail 'Git untracked enumeration failed for nested .git/config fixture'
+if nul_file_contains_path "$nested_git_others" 'plain/.git/config'; then
+  fail 'Git unexpectedly enumerated nested plain/.git/config fixture'
+fi
+"$ROOT_DIR/scripts/collect-build-evidence.sh" official \
+  "$TMP/work" "$TMP/dist" "$TMP/build.log" >/dev/null ||
+  fail 'collector rejected nested plain/.git/config regular file'
+nested_git_config_one_hash="$(feed_worktree_hash_from_evidence)"
+printf 'nested config two\n' > "$TMP/work/feeds/packages/plain/.git/config"
+"$ROOT_DIR/scripts/collect-build-evidence.sh" official \
+  "$TMP/work" "$TMP/dist" "$TMP/build.log" >/dev/null ||
+  fail 'collector rejected changed nested plain/.git/config regular file'
+nested_git_config_two_hash="$(feed_worktree_hash_from_evidence)"
+[[ "$nested_git_config_two_hash" != "$nested_git_config_one_hash" ]] ||
+  fail 'Git-omitted nested plain/.git/config content change did not alter feed state hash'
+rm -rf "$TMP/work/feeds/packages/plain"
+rm -f "$nested_git_others"
+
+printf 'ignored*\n' > "$TMP/work/feeds/packages/.gitignore"
 git -C "$TMP/work/feeds/packages" add .gitignore
 git -C "$TMP/work/feeds/packages" commit -qm ignore-rule
 printf 'ignored but still untracked\n' > "$TMP/work/feeds/packages/ignored.bin"
-assert_collector_rejects 'collector ignored untracked feed file'
-[[ ! -e "$TMP/dist/EVIDENCE" ]] ||
-  fail 'ignored untracked feed file published final evidence'
-rm -f "$TMP/work/feeds/packages/ignored.bin"
+ln -s ignored.bin "$TMP/work/feeds/packages/ignored.link"
+"$ROOT_DIR/scripts/collect-build-evidence.sh" official \
+  "$TMP/work" "$TMP/dist" "$TMP/build.log" >/dev/null ||
+  fail 'collector rejected ignored untracked regular file and symlink'
+ignored_untracked_hash="$(feed_worktree_hash_from_evidence)"
+[[ "$ignored_untracked_hash" =~ ^[0-9a-f]{64}$ ]] ||
+  fail 'collector produced invalid ignored untracked state hash'
+
+printf 'ignored content changed\n' > "$TMP/work/feeds/packages/ignored.bin"
+"$ROOT_DIR/scripts/collect-build-evidence.sh" official \
+  "$TMP/work" "$TMP/dist" "$TMP/build.log" >/dev/null ||
+  fail 'collector rejected changed ignored untracked regular file'
+ignored_content_hash="$(feed_worktree_hash_from_evidence)"
+[[ "$ignored_content_hash" =~ ^[0-9a-f]{64}$ ]] ||
+  fail 'collector produced invalid ignored content state hash'
+[[ "$ignored_content_hash" != "$ignored_untracked_hash" ]] ||
+  fail 'ignored untracked regular file content change did not alter feed state hash'
+
+printf 'ignored but still untracked\n' > "$TMP/work/feeds/packages/ignored.bin"
+printf 'alternate ignored target\n' > "$TMP/work/feeds/packages/ignored-alt.bin"
+rm "$TMP/work/feeds/packages/ignored.link"
+ln -s ignored-alt.bin "$TMP/work/feeds/packages/ignored.link"
+"$ROOT_DIR/scripts/collect-build-evidence.sh" official \
+  "$TMP/work" "$TMP/dist" "$TMP/build.log" >/dev/null ||
+  fail 'collector rejected changed ignored untracked symlink target'
+ignored_symlink_hash="$(feed_worktree_hash_from_evidence)"
+[[ "$ignored_symlink_hash" =~ ^[0-9a-f]{64}$ ]] ||
+  fail 'collector produced invalid ignored symlink state hash'
+[[ "$ignored_symlink_hash" != "$ignored_untracked_hash" ]] ||
+  fail 'ignored untracked symlink target change did not alter feed state hash'
+
+rm -f "$TMP/work/feeds/packages"/ignored*
+"$ROOT_DIR/scripts/collect-build-evidence.sh" official \
+  "$TMP/work" "$TMP/dist" "$TMP/build.log" >/dev/null ||
+  fail 'collector rejected feed before empty-directory tests'
+empty_directory_baseline_hash="$(feed_worktree_hash_from_evidence)"
+
+mkdir "$TMP/work/feeds/packages/ignored-empty"
+chmod 0755 "$TMP/work/feeds/packages/ignored-empty"
+git -C "$TMP/work/feeds/packages" check-ignore -q ignored-empty ||
+  fail 'ignored empty-directory fixture is not ignored'
+"$ROOT_DIR/scripts/collect-build-evidence.sh" official \
+  "$TMP/work" "$TMP/dist" "$TMP/build.log" >/dev/null ||
+  fail 'collector rejected ignored empty directory'
+ignored_empty_directory_hash="$(feed_worktree_hash_from_evidence)"
+[[ "$ignored_empty_directory_hash" != "$empty_directory_baseline_hash" ]] ||
+  fail 'adding an ignored empty directory did not alter feed state hash'
+
+mkdir "$TMP/work/feeds/packages/untracked-empty"
+chmod 0755 "$TMP/work/feeds/packages/untracked-empty"
+if git -C "$TMP/work/feeds/packages" check-ignore -q untracked-empty; then
+  fail 'untracked empty-directory fixture unexpectedly is ignored'
+fi
+"$ROOT_DIR/scripts/collect-build-evidence.sh" official \
+  "$TMP/work" "$TMP/dist" "$TMP/build.log" >/dev/null ||
+  fail 'collector rejected untracked empty directory'
+empty_directory_added_hash="$(feed_worktree_hash_from_evidence)"
+[[ "$empty_directory_added_hash" != "$ignored_empty_directory_hash" ]] ||
+  fail 'adding an untracked empty directory did not alter feed state hash'
+
+chmod 0700 "$TMP/work/feeds/packages/ignored-empty"
+"$ROOT_DIR/scripts/collect-build-evidence.sh" official \
+  "$TMP/work" "$TMP/dist" "$TMP/build.log" >/dev/null ||
+  fail 'collector rejected empty-directory mode change'
+empty_directory_mode_hash="$(feed_worktree_hash_from_evidence)"
+[[ "$empty_directory_mode_hash" != "$empty_directory_added_hash" ]] ||
+  fail 'empty-directory mode change did not alter feed state hash'
+
+rmdir "$TMP/work/feeds/packages/untracked-empty"
+"$ROOT_DIR/scripts/collect-build-evidence.sh" official \
+  "$TMP/work" "$TMP/dist" "$TMP/build.log" >/dev/null ||
+  fail 'collector rejected untracked empty-directory removal'
+untracked_empty_directory_removed_hash="$(feed_worktree_hash_from_evidence)"
+[[ "$untracked_empty_directory_removed_hash" != "$empty_directory_mode_hash" ]] ||
+  fail 'removing an untracked empty directory did not alter feed state hash'
+
+rmdir "$TMP/work/feeds/packages/ignored-empty"
+"$ROOT_DIR/scripts/collect-build-evidence.sh" official \
+  "$TMP/work" "$TMP/dist" "$TMP/build.log" >/dev/null ||
+  fail 'collector rejected ignored empty-directory removal'
+empty_directory_removed_hash="$(feed_worktree_hash_from_evidence)"
+[[ "$empty_directory_removed_hash" == "$empty_directory_baseline_hash" ]] ||
+  fail 'removing empty directories did not restore the baseline feed state hash'
+
 git -C "$TMP/work/feeds/packages" reset --hard "$feed_head" >/dev/null
+
+mkfifo "$TMP/work/feeds/packages/untracked.fifo"
+assert_collector_rejects 'collector rejects untracked feed FIFO'
+[[ ! -e "$TMP/dist/EVIDENCE" ]] ||
+  fail 'untracked feed FIFO published final evidence'
+rm -f "$TMP/work/feeds/packages/untracked.fifo"
 
 printf 'feed v2\n' > "$TMP/work/feeds/packages/tracked.txt"
 git -C "$TMP/work/feeds/packages" add tracked.txt
@@ -382,6 +655,45 @@ if [[ "${NEXAWRT_TEST_MUTATE_FEED:-}" == 1 &&
         "$NEXAWRT_TEST_REAL_GIT" -C "$NEXAWRT_TEST_FEED_DIR" reset --hard "$NEXAWRT_TEST_FEED_NEW_HEAD" >/dev/null
       fi
       ;;
+    fail-index-flag-enumeration)
+      if [[ "${1:-}" == -C && "${2:-}" == "$NEXAWRT_TEST_FEED_DIR" &&
+            "${3:-}" == ls-files && "${4:-}" == --cached &&
+            "${5:-}" == -v && "${6:-}" == -z ]]; then
+        exit 75
+      fi
+      ;;
+    fail-tracked-file-enumeration)
+      if [[ "${1:-}" == -C && "${2:-}" == "$NEXAWRT_TEST_FEED_DIR" &&
+            "${3:-}" == ls-files && "${4:-}" == --cached &&
+            "${5:-}" == -z && -z "${6:-}" ]]; then
+        exit 76
+      fi
+      ;;
+    replace-directory-during-hash)
+      if [[ "${1:-}" == -C && "${2:-}" == "$NEXAWRT_TEST_FEED_DIR" &&
+            "${3:-}" == ls-files && "${4:-}" == --cached &&
+            "${5:-}" == -v && "${6:-}" == -z ]]; then
+        : > "$NEXAWRT_TEST_MUTATION_MARKER"
+        mv -- "$NEXAWRT_TEST_DIRECTORY" "$NEXAWRT_TEST_DIRECTORY_BACKUP"
+        mkdir -- "$NEXAWRT_TEST_DIRECTORY"
+        chmod 0755 "$NEXAWRT_TEST_DIRECTORY"
+      fi
+      ;;
+    nested-git-add-after-scan|nested-git-delete-after-scan)
+      if [[ "${1:-}" == -C && "${2:-}" == "$NEXAWRT_TEST_FEED_DIR" &&
+            "${3:-}" == ls-files && "${4:-}" == --cached &&
+            "${5:-}" == -v && "${6:-}" == -z ]]; then
+        : > "$NEXAWRT_TEST_MUTATION_MARKER"
+        case "$NEXAWRT_TEST_MUTATION_ACTION" in
+          nested-git-add-after-scan)
+            printf 'added after initial filesystem scan\n' > "$NEXAWRT_TEST_NESTED_GIT_PATH"
+            ;;
+          nested-git-delete-after-scan)
+            rm -- "$NEXAWRT_TEST_NESTED_GIT_PATH"
+            ;;
+        esac
+      fi
+      ;;
     dirty-after-diff|untracked-after-diff)
       if [[ "${1:-}" == -C && "${2:-}" == "$NEXAWRT_TEST_FEED_DIR" &&
             "${3:-}" == diff ]]; then
@@ -411,6 +723,94 @@ EOF_GIT_WRAPPER
 chmod +x "$git_wrapper_dir/git"
 
 mutation_marker="$TMP/feed-mutation.marker"
+rm -f "$mutation_marker"
+expect_failure 'collector feed index flag enumeration failure' \
+  env PATH="$git_wrapper_dir:$PATH" \
+  NEXAWRT_TEST_MUTATE_FEED=1 \
+  NEXAWRT_TEST_MUTATION_ACTION=fail-index-flag-enumeration \
+  NEXAWRT_TEST_MUTATION_MARKER="$mutation_marker" \
+  NEXAWRT_TEST_FEED_DIR="$TMP/work/feeds/packages" \
+  NEXAWRT_TEST_REAL_GIT="$real_git" \
+  "$ROOT_DIR/scripts/collect-build-evidence.sh" official \
+  "$TMP/work" "$TMP/dist" "$TMP/build.log"
+[[ ! -e "$TMP/dist/EVIDENCE" ]] ||
+  fail 'feed index flag enumeration failure published final evidence'
+
+rm -f "$mutation_marker"
+expect_failure 'collector tracked file enumeration failure' \
+  env PATH="$git_wrapper_dir:$PATH" \
+  NEXAWRT_TEST_MUTATE_FEED=1 \
+  NEXAWRT_TEST_MUTATION_ACTION=fail-tracked-file-enumeration \
+  NEXAWRT_TEST_MUTATION_MARKER="$mutation_marker" \
+  NEXAWRT_TEST_FEED_DIR="$TMP/work/feeds/packages" \
+  NEXAWRT_TEST_REAL_GIT="$real_git" \
+  "$ROOT_DIR/scripts/collect-build-evidence.sh" official \
+  "$TMP/work" "$TMP/dist" "$TMP/build.log"
+[[ ! -e "$TMP/dist/EVIDENCE" ]] ||
+  fail 'tracked file enumeration failure published final evidence'
+
+directory_race_path="$TMP/work/feeds/packages/directory-race"
+directory_race_backup="$TMP/directory-race.saved"
+mkdir "$directory_race_path"
+chmod 0755 "$directory_race_path"
+rm -f "$mutation_marker"
+expect_failure 'collector feed directory is replaced during worktree hash' \
+  env PATH="$git_wrapper_dir:$PATH" \
+  NEXAWRT_TEST_MUTATE_FEED=1 \
+  NEXAWRT_TEST_MUTATION_ACTION=replace-directory-during-hash \
+  NEXAWRT_TEST_MUTATION_MARKER="$mutation_marker" \
+  NEXAWRT_TEST_FEED_DIR="$TMP/work/feeds/packages" \
+  NEXAWRT_TEST_DIRECTORY="$directory_race_path" \
+  NEXAWRT_TEST_DIRECTORY_BACKUP="$directory_race_backup" \
+  NEXAWRT_TEST_REAL_GIT="$real_git" \
+  "$ROOT_DIR/scripts/collect-build-evidence.sh" official \
+  "$TMP/work" "$TMP/dist" "$TMP/build.log"
+[[ -d "$directory_race_path" && -d "$directory_race_backup" ]] ||
+  fail 'feed directory replacement wrapper did not run during worktree hash'
+[[ ! -e "$TMP/dist/EVIDENCE" ]] ||
+  fail 'feed directory replacement race published final evidence'
+rmdir "$directory_race_path"
+mv -- "$directory_race_backup" "$directory_race_path"
+rmdir "$directory_race_path"
+
+nested_git_race_parent="$TMP/work/feeds/packages/filesystem-race"
+nested_git_race_path="$nested_git_race_parent/.git"
+mkdir "$nested_git_race_parent"
+rm -f "$mutation_marker"
+expect_failure 'collector detects Git-omitted nested .git file added after initial filesystem scan' \
+  env PATH="$git_wrapper_dir:$PATH" \
+  NEXAWRT_TEST_MUTATE_FEED=1 \
+  NEXAWRT_TEST_MUTATION_ACTION=nested-git-add-after-scan \
+  NEXAWRT_TEST_MUTATION_MARKER="$mutation_marker" \
+  NEXAWRT_TEST_FEED_DIR="$TMP/work/feeds/packages" \
+  NEXAWRT_TEST_NESTED_GIT_PATH="$nested_git_race_path" \
+  NEXAWRT_TEST_REAL_GIT="$real_git" \
+  "$ROOT_DIR/scripts/collect-build-evidence.sh" official \
+  "$TMP/work" "$TMP/dist" "$TMP/build.log"
+[[ -f "$nested_git_race_path" ]] ||
+  fail 'nested .git addition wrapper did not run after initial filesystem scan'
+[[ ! -e "$TMP/dist/EVIDENCE" ]] ||
+  fail 'Git-omitted nested .git addition race published final evidence'
+rm "$nested_git_race_path"
+
+printf 'delete after initial filesystem scan\n' > "$nested_git_race_path"
+rm -f "$mutation_marker"
+expect_failure 'collector detects Git-omitted nested .git file deleted after initial filesystem scan' \
+  env PATH="$git_wrapper_dir:$PATH" \
+  NEXAWRT_TEST_MUTATE_FEED=1 \
+  NEXAWRT_TEST_MUTATION_ACTION=nested-git-delete-after-scan \
+  NEXAWRT_TEST_MUTATION_MARKER="$mutation_marker" \
+  NEXAWRT_TEST_FEED_DIR="$TMP/work/feeds/packages" \
+  NEXAWRT_TEST_NESTED_GIT_PATH="$nested_git_race_path" \
+  NEXAWRT_TEST_REAL_GIT="$real_git" \
+  "$ROOT_DIR/scripts/collect-build-evidence.sh" official \
+  "$TMP/work" "$TMP/dist" "$TMP/build.log"
+[[ ! -e "$nested_git_race_path" ]] ||
+  fail 'nested .git deletion wrapper did not run after initial filesystem scan'
+[[ ! -e "$TMP/dist/EVIDENCE" ]] ||
+  fail 'Git-omitted nested .git deletion race published final evidence'
+rmdir "$nested_git_race_parent"
+
 deleted_feed_backup="$TMP/packages-feed.saved"
 rm -f "$mutation_marker"
 expect_failure 'collector feed disappears after validation' \

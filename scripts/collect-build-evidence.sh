@@ -136,25 +136,480 @@ print(":".join(identities))
 PY_CHECKOUT_IDENTITY
 }
 
-assert_feed_has_no_untracked_files() {
+feed_worktree_state_hash() {
   local checkout="$1"
   local feed="$2"
-  local phase="$3"
-  local untracked_file
+  local commit="$3"
+  local phase="$4"
 
-  untracked_file="$(mktemp "${TMPDIR:-/tmp}/nexawrt-feed-untracked.XXXXXX")" || {
-    echo "could not create temporary feed untracked list" >&2
+  [[ -n "$commit" ]] || {
+    echo "feed checkout $feed worktree state hash requires an explicit commit during $phase" >&2
     return 1
   }
-  TEMP_FILES+=("$untracked_file")
-  if ! git -C "$checkout" ls-files --others -z > "$untracked_file"; then
-    echo "feed checkout $feed untracked file enumeration failed during $phase" >&2
-    return 1
-  fi
-  if [[ -s "$untracked_file" ]]; then
-    echo "feed checkout $feed contains untracked or ignored files during $phase" >&2
-    return 1
-  fi
+
+  python3 -I - "$checkout" "$feed" "$commit" "$phase" <<'PY_FEED_WORKTREE_STATE'
+import hashlib
+import os
+import stat
+import subprocess
+import sys
+
+
+checkout_arg, feed, commit, phase = sys.argv[1:5]
+
+
+def refuse(message):
+    print(f"feed checkout {feed} {message} during {phase}", file=sys.stderr)
+    raise SystemExit(1)
+
+
+def run_git(arguments, description):
+    completed = subprocess.run(
+        ["git", "-C", checkout_arg, *arguments],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    if completed.returncode != 0:
+        if completed.stderr:
+            sys.stderr.buffer.write(completed.stderr)
+        refuse(f"{description} failed")
+    return completed.stdout
+
+
+def metadata_tuple(status):
+    return (
+        status.st_dev,
+        status.st_ino,
+        stat.S_IFMT(status.st_mode),
+        stat.S_IMODE(status.st_mode),
+        status.st_nlink,
+        status.st_uid,
+        status.st_gid,
+        status.st_size,
+        getattr(status, "st_mtime_ns", int(status.st_mtime * 1_000_000_000)),
+        getattr(status, "st_ctime_ns", int(status.st_ctime * 1_000_000_000)),
+    )
+
+
+def add_field_header(digest, label, length):
+    digest.update(label)
+    digest.update(b"\0")
+    digest.update(str(length).encode("ascii"))
+    digest.update(b"\0")
+
+
+def add_field(digest, label, data):
+    add_field_header(digest, label, len(data))
+    digest.update(data)
+    digest.update(b"\0")
+
+
+def validate_relative_path(entry, description):
+    if not entry:
+        refuse(f"{description} path is empty")
+    if entry.startswith(b"/"):
+        refuse(f"{description} path is absolute: {entry!r}")
+    parts = entry.split(b"/")
+    if any(part in (b"", b".", b"..") for part in parts):
+        refuse(f"{description} path is unsafe: {entry!r}")
+    if parts[0] == b".git":
+        refuse(f"{description} path enters top-level Git metadata: {entry!r}")
+    return parts
+
+
+def is_within_directory(root, path):
+    try:
+        return os.path.commonpath([root, path]) == root
+    except ValueError:
+        return False
+
+
+def nul_records(raw, description):
+    if raw and not raw.endswith(b"\0"):
+        refuse(f"{description} was not NUL terminated")
+    records = raw[:-1].split(b"\0") if raw else []
+    if any(not record for record in records):
+        refuse(f"{description} contains an empty record")
+    return records
+
+
+def directory_open_flags():
+    flags = os.O_RDONLY
+    if hasattr(os, "O_DIRECTORY"):
+        flags |= os.O_DIRECTORY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    return flags
+
+
+def scan_checkout_state(root):
+    directories = {}
+    non_directories = {}
+    root_before = os.lstat(root)
+    if not stat.S_ISDIR(root_before.st_mode):
+        refuse("path is not a non-symlink directory")
+
+    try:
+        root_fd = os.open(root, directory_open_flags())
+    except OSError as error:
+        refuse(f"directory could not be opened safely: {error}")
+    try:
+        root_opened = os.fstat(root_fd)
+        if metadata_tuple(root_opened) != metadata_tuple(root_before):
+            refuse("directory changed before scan")
+        directories[b"."] = metadata_tuple(root_before)
+
+        def scan_directory(directory_fd, relative_directory):
+            directory_before = os.fstat(directory_fd)
+            try:
+                with os.scandir(directory_fd) as iterator:
+                    entries = list(iterator)
+            except OSError as error:
+                refuse(f"directory could not be enumerated: {relative_directory!r}: {error}")
+
+            named_entries = []
+            for entry in entries:
+                name = entry.name if isinstance(entry.name, bytes) else os.fsencode(entry.name)
+                if name in (b"", b".", b"..") or b"/" in name or b"\0" in name:
+                    refuse(f"directory contains an unsafe entry name: {name!r}")
+                named_entries.append((name, entry))
+            named_entries.sort(key=lambda item: item[0])
+            if len(named_entries) != len({name for name, _ in named_entries}):
+                refuse(f"directory enumeration contains duplicates: {relative_directory!r}")
+
+            for name, _entry in named_entries:
+                if relative_directory == b"." and name == b".git":
+                    continue
+                relative_path = name if relative_directory == b"." else relative_directory + b"/" + name
+                validate_relative_path(relative_path, "checkout")
+                try:
+                    before = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+                except OSError as error:
+                    refuse(f"path could not be inspected: {relative_path!r}: {error}")
+
+                if stat.S_ISDIR(before.st_mode):
+                    try:
+                        child_fd = os.open(name, directory_open_flags(), dir_fd=directory_fd)
+                    except OSError as error:
+                        refuse(f"directory could not be opened safely: {relative_path!r}: {error}")
+                    try:
+                        opened = os.fstat(child_fd)
+                        if metadata_tuple(opened) != metadata_tuple(before):
+                            refuse(f"directory changed before scan: {relative_path!r}")
+                        if relative_path in directories:
+                            refuse(f"directory enumeration contains duplicate path: {relative_path!r}")
+                        directories[relative_path] = metadata_tuple(before)
+                        scan_directory(child_fd, relative_path)
+                        opened_after = os.fstat(child_fd)
+                        if metadata_tuple(opened_after) != metadata_tuple(before):
+                            refuse(f"directory changed during scan: {relative_path!r}")
+                    finally:
+                        os.close(child_fd)
+                    try:
+                        after = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+                    except OSError as error:
+                        refuse(f"directory disappeared after scan: {relative_path!r}: {error}")
+                    if metadata_tuple(after) != metadata_tuple(before):
+                        refuse(f"directory was replaced during scan: {relative_path!r}")
+                elif stat.S_ISREG(before.st_mode) or stat.S_ISLNK(before.st_mode):
+                    if relative_path in non_directories:
+                        refuse(f"directory enumeration contains duplicate path: {relative_path!r}")
+                    non_directories[relative_path] = metadata_tuple(before)
+                    try:
+                        after = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+                    except OSError as error:
+                        refuse(f"path disappeared during scan: {relative_path!r}: {error}")
+                    if metadata_tuple(after) != metadata_tuple(before):
+                        refuse(f"path changed during scan: {relative_path!r}")
+                else:
+                    refuse(f"path has unsupported special type: {relative_path!r}")
+
+            directory_after = os.fstat(directory_fd)
+            if metadata_tuple(directory_after) != metadata_tuple(directory_before):
+                refuse(f"directory changed during enumeration: {relative_directory!r}")
+
+        scan_directory(root_fd, b".")
+        root_opened_after = os.fstat(root_fd)
+        if metadata_tuple(root_opened_after) != metadata_tuple(root_before):
+            refuse("directory changed during scan")
+    finally:
+        os.close(root_fd)
+
+    try:
+        root_after = os.lstat(root)
+    except OSError as error:
+        refuse(f"directory disappeared after scan: {error}")
+    if metadata_tuple(root_after) != metadata_tuple(root_before):
+        refuse("directory was replaced during scan")
+    return directories, non_directories
+
+
+
+def parse_index_flags(raw):
+    flags = {}
+    for record in nul_records(raw, "index flag enumeration"):
+        if len(record) < 3 or record[1:2] != b" ":
+            refuse(f"index flag enumeration contains a malformed record: {record!r}")
+        marker = record[:1]
+        path = record[2:]
+        validate_relative_path(path, "index")
+        if path in flags:
+            refuse(f"index flag enumeration contains a duplicate path: {path!r}")
+        if b"a" <= marker <= b"z":
+            refuse(f"index entry is marked assume-unchanged: {path!r}")
+        if marker.upper() == b"S":
+            refuse(f"index entry is marked skip-worktree: {path!r}")
+        if marker not in b"HMRCkK?":
+            refuse(f"index flag enumeration contains an unknown marker: {marker!r}")
+        flags[path] = marker
+    return flags
+
+
+def sorted_unique_paths(raw, description):
+    records = nul_records(raw, description)
+    for entry in records:
+        validate_relative_path(entry, description)
+    if len(records) != len(set(records)):
+        refuse(f"{description} contains duplicate paths")
+    return sorted(records)
+
+
+def stat_entry(directory_fd, name, relative_path):
+    try:
+        return os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        return None
+    except OSError as error:
+        refuse(f"path could not be inspected: {relative_path!r}: {error}")
+
+
+def validate_symlink_target(entry, parent_path, target):
+    if target.startswith(b"/"):
+        refuse(f"path symlink target escapes checkout: {entry!r}")
+    lexical_target = os.path.normpath(os.path.join(parent_path, target))
+    if not is_within_directory(checkout_root, lexical_target):
+        refuse(f"path symlink target escapes checkout: {entry!r}")
+    lexical_git_metadata = os.path.join(checkout_root, b".git")
+    if is_within_directory(lexical_git_metadata, lexical_target):
+        refuse(f"path symlink target enters top-level Git metadata: {entry!r}")
+
+    real_target = os.path.realpath(lexical_target)
+    if not is_within_directory(checkout_real_root, real_target):
+        refuse(f"path symlink target escapes checkout: {entry!r}")
+    real_git_metadata = os.path.realpath(lexical_git_metadata)
+    if is_within_directory(real_git_metadata, real_target):
+        refuse(f"path symlink target resolves into top-level Git metadata: {entry!r}")
+
+
+def add_worktree_path_state(digest, category, entry, allow_missing, root_fd, expected_metadata=None):
+    parts = validate_relative_path(entry, category.decode("ascii"))
+    full_path = os.path.join(checkout_root, *parts)
+    lexical_path = os.path.normpath(full_path)
+    if not is_within_directory(checkout_root, lexical_path):
+        refuse(f"{category.decode('ascii')} path escapes checkout: {entry!r}")
+
+    add_field(digest, category + b".path", entry)
+    current_fd = root_fd
+    opened_directories = []
+    missing_at = None
+    parent_parts = []
+    try:
+        for component in parts[:-1]:
+            parent_parts.append(component)
+            relative_parent = b"/".join(parent_parts)
+            before = stat_entry(current_fd, component, relative_parent)
+            if before is None:
+                missing_at = (current_fd, component, relative_parent)
+                break
+            if stat.S_ISLNK(before.st_mode):
+                refuse(f"{category.decode('ascii')} path has a symlink parent: {relative_parent!r}")
+            if not stat.S_ISDIR(before.st_mode):
+                refuse(f"{category.decode('ascii')} path parent is not a directory: {relative_parent!r}")
+            try:
+                child_fd = os.open(component, directory_open_flags(), dir_fd=current_fd)
+            except OSError as error:
+                refuse(f"directory could not be opened safely: {relative_parent!r}: {error}")
+            opened = os.fstat(child_fd)
+            if metadata_tuple(opened) != metadata_tuple(before):
+                os.close(child_fd)
+                refuse(f"directory changed before path read: {relative_parent!r}")
+            opened_directories.append((current_fd, component, metadata_tuple(before), child_fd, relative_parent))
+            current_fd = child_fd
+
+        if missing_at is None:
+            final_name = parts[-1]
+            before = stat_entry(current_fd, final_name, entry)
+            if before is None:
+                missing_at = (current_fd, final_name, entry)
+
+        if missing_at is not None:
+            if not allow_missing:
+                refuse(f"{category.decode('ascii')} path disappeared before read: {entry!r}")
+            add_field(digest, category + b".type", b"missing")
+            missing_fd, missing_name, missing_relative = missing_at
+            if stat_entry(missing_fd, missing_name, missing_relative) is not None:
+                refuse(f"{category.decode('ascii')} missing path appeared during read: {entry!r}")
+        else:
+            before_meta = metadata_tuple(before)
+            if expected_metadata is not None and before_meta != expected_metadata:
+                refuse(f"{category.decode('ascii')} path changed after filesystem scan: {entry!r}")
+            mode = f"{stat.S_IMODE(before.st_mode):06o}".encode("ascii")
+            if stat.S_ISREG(before.st_mode):
+                flags = os.O_RDONLY
+                if hasattr(os, "O_NOFOLLOW"):
+                    flags |= os.O_NOFOLLOW
+                try:
+                    fd = os.open(final_name, flags, dir_fd=current_fd)
+                except OSError as error:
+                    refuse(f"{category.decode('ascii')} regular file could not be opened safely: {entry!r}: {error}")
+                try:
+                    opened = os.fstat(fd)
+                    if metadata_tuple(opened) != before_meta:
+                        refuse(f"{category.decode('ascii')} regular file changed before read: {entry!r}")
+                    add_field(digest, category + b".type", b"file")
+                    add_field(digest, category + b".mode", mode)
+                    add_field_header(digest, category + b".content", before.st_size)
+                    bytes_read = 0
+                    while True:
+                        try:
+                            chunk = os.read(fd, 1024 * 1024)
+                        except OSError as error:
+                            refuse(f"{category.decode('ascii')} regular file could not be read: {entry!r}: {error}")
+                        if not chunk:
+                            break
+                        bytes_read += len(chunk)
+                        digest.update(chunk)
+                    if bytes_read != before.st_size:
+                        refuse(f"{category.decode('ascii')} regular file size changed during read: {entry!r}")
+                    digest.update(b"\0")
+                finally:
+                    os.close(fd)
+                after = stat_entry(current_fd, final_name, entry)
+                if after is None or metadata_tuple(after) != before_meta:
+                    refuse(f"{category.decode('ascii')} regular file changed during read: {entry!r}")
+            elif stat.S_ISLNK(before.st_mode):
+                try:
+                    target = os.readlink(final_name, dir_fd=current_fd)
+                except OSError as error:
+                    refuse(f"{category.decode('ascii')} symlink target could not be read: {entry!r}: {error}")
+                if isinstance(target, str):
+                    target = os.fsencode(target)
+                parent_path = os.path.join(checkout_root, *parts[:-1])
+                validate_symlink_target(entry, parent_path, target)
+                after = stat_entry(current_fd, final_name, entry)
+                if after is None or metadata_tuple(after) != before_meta:
+                    refuse(f"{category.decode('ascii')} symlink changed during readlink: {entry!r}")
+                add_field(digest, category + b".type", b"symlink")
+                add_field(digest, category + b".mode", mode)
+                add_field(digest, category + b".target", target)
+            else:
+                refuse(f"{category.decode('ascii')} path has unsupported special type: {entry!r}")
+
+        for parent_fd, component, before_meta, child_fd, relative_parent in reversed(opened_directories):
+            if metadata_tuple(os.fstat(child_fd)) != before_meta:
+                refuse(f"directory changed during path read: {relative_parent!r}")
+            after = stat_entry(parent_fd, component, relative_parent)
+            if after is None or metadata_tuple(after) != before_meta:
+                refuse(f"directory was replaced during path read: {relative_parent!r}")
+    finally:
+        for _parent_fd, _component, _before_meta, child_fd, _relative_parent in reversed(opened_directories):
+            os.close(child_fd)
+
+
+try:
+    checkout_status = os.lstat(checkout_arg)
+except OSError as error:
+    refuse(f"directory could not be inspected: {error}")
+if not stat.S_ISDIR(checkout_status.st_mode):
+    refuse("path is not a non-symlink directory")
+
+checkout_root = os.fsencode(os.path.abspath(checkout_arg))
+checkout_real_root = os.path.realpath(checkout_root)
+initial_directories, initial_filesystem_entries = scan_checkout_state(checkout_root)
+
+index_flags_raw = run_git(
+    ["ls-files", "--cached", "-v", "-z"],
+    "index flag enumeration",
+)
+index_flags = parse_index_flags(index_flags_raw)
+tracked_raw = run_git(["ls-files", "--cached", "-z"], "tracked file enumeration")
+tracked_entries = sorted_unique_paths(tracked_raw, "tracked file enumeration")
+if set(index_flags) != set(tracked_entries):
+    refuse("tracked file and index flag enumerations disagree")
+tracked_diff = run_git(["diff", "--binary", "--no-ext-diff", commit, "--"], "tracked diff collection")
+untracked_raw = run_git(["ls-files", "--others", "-z"], "untracked file enumeration")
+untracked_entries = sorted_unique_paths(untracked_raw, "untracked file enumeration")
+
+digest = hashlib.sha256()
+digest.update(b"nexawrt feed worktree state v4\0")
+add_field(digest, b"tracked-diff", tracked_diff)
+add_field(digest, b"directory-count", str(len(initial_directories)).encode("ascii"))
+for directory in sorted(initial_directories):
+    if directory != b".":
+        validate_relative_path(directory, "directory")
+    add_field(digest, b"directory.path", directory)
+    add_field(digest, b"directory.type", b"directory")
+    directory_mode = f"{initial_directories[directory][3]:06o}".encode("ascii")
+    add_field(digest, b"directory.mode", directory_mode)
+
+try:
+    checkout_fd = os.open(checkout_root, directory_open_flags())
+except OSError as error:
+    refuse(f"directory could not be opened safely for path hashing: {error}")
+try:
+    checkout_opened = os.fstat(checkout_fd)
+    checkout_before_meta = metadata_tuple(checkout_opened)
+    checkout_now = os.lstat(checkout_root)
+    if metadata_tuple(checkout_now) != checkout_before_meta:
+        refuse("directory changed before path hashing")
+
+    add_field(digest, b"filesystem-count", str(len(initial_filesystem_entries)).encode("ascii"))
+    for entry in sorted(initial_filesystem_entries):
+        add_worktree_path_state(
+            digest,
+            b"filesystem",
+            entry,
+            False,
+            checkout_fd,
+            initial_filesystem_entries[entry],
+        )
+
+    add_field(digest, b"tracked-count", str(len(tracked_entries)).encode("ascii"))
+    for entry in tracked_entries:
+        add_worktree_path_state(digest, b"tracked", entry, True, checkout_fd)
+    add_field(digest, b"untracked-count", str(len(untracked_entries)).encode("ascii"))
+    for entry in untracked_entries:
+        add_worktree_path_state(digest, b"untracked", entry, False, checkout_fd)
+
+    if metadata_tuple(os.fstat(checkout_fd)) != checkout_before_meta:
+        refuse("directory changed during path hashing")
+    checkout_after = os.lstat(checkout_root)
+    if metadata_tuple(checkout_after) != checkout_before_meta:
+        refuse("directory was replaced during path hashing")
+finally:
+    os.close(checkout_fd)
+
+final_index_flags_raw = run_git(
+    ["ls-files", "--cached", "-v", "-z"],
+    "final index flag enumeration",
+)
+if parse_index_flags(final_index_flags_raw) != index_flags:
+    refuse("index flags changed during worktree hashing")
+final_tracked_raw = run_git(["ls-files", "--cached", "-z"], "final tracked file enumeration")
+if sorted_unique_paths(final_tracked_raw, "final tracked file enumeration") != tracked_entries:
+    refuse("tracked file enumeration changed during worktree hashing")
+final_untracked_raw = run_git(["ls-files", "--others", "-z"], "final untracked file enumeration")
+if sorted_unique_paths(final_untracked_raw, "final untracked file enumeration") != untracked_entries:
+    refuse("untracked file enumeration changed during worktree hashing")
+
+final_directories, final_filesystem_entries = scan_checkout_state(checkout_root)
+if final_directories != initial_directories:
+    refuse("directory state changed during worktree hashing")
+if final_filesystem_entries != initial_filesystem_entries:
+    refuse("filesystem non-directory state changed during worktree hashing")
+print(digest.hexdigest())
+PY_FEED_WORKTREE_STATE
 }
 
 enumerate_top_level_feed_entries() {
@@ -224,9 +679,7 @@ revalidate_top_level_feed_entry() {
         echo "feed checkout $entry_name changed after validation" >&2
         return 1
       }
-      assert_feed_has_no_untracked_files "$entry" "$entry_name" "feed revalidation" || return 1
       git_history_overrides_absent "$entry" "feed checkout $entry_name" || return 1
-      assert_feed_has_no_untracked_files "$entry" "$entry_name" "feed metadata revalidation" || return 1
       current_identity="$(feed_checkout_identity "$entry")" || return 1
       ;;
     other)
@@ -354,15 +807,7 @@ assert_source_and_feed_history_is_unmodified() {
         result=1
         break
       }
-      if ! assert_feed_has_no_untracked_files "$entry" "$entry_name" "initial validation"; then
-        result=1
-        break
-      fi
       if ! git_history_overrides_absent "$entry" "feed checkout $entry_name"; then
-        result=1
-        break
-      fi
-      if ! assert_feed_has_no_untracked_files "$entry" "$entry_name" "post-metadata validation"; then
         result=1
         break
       fi
@@ -504,11 +949,9 @@ revalidate_top_level_feed_entries || fail "feed state changed before SOURCE-STAT
         fail "feed checkout $feed commit could not be rechecked after origin collection"
       [[ "$feed_head_after_origin" == "$feed_commit" ]] ||
         fail "feed checkout $feed HEAD changed during origin collection"
-      diff_hash="$(git -C "$checkout" diff --binary --no-ext-diff "$feed_commit" -- | hash_file /dev/stdin | awk '{print $1}')" ||
-        fail "feed checkout $feed worktree diff could not be hashed"
-      [[ "$diff_hash" =~ ^[0-9a-f]{64}$ ]] || fail "feed checkout $feed worktree diff hash is invalid"
-      assert_feed_has_no_untracked_files "$checkout" "$feed" "after worktree diff collection" ||
-        fail "feed checkout $feed contains untracked files after worktree diff collection"
+      diff_hash="$(feed_worktree_state_hash "$checkout" "$feed" "$feed_commit" "initial worktree state collection")" ||
+        fail "feed checkout $feed worktree state could not be hashed"
+      [[ "$diff_hash" =~ ^[0-9a-f]{64}$ ]] || fail "feed checkout $feed worktree state hash is invalid"
       feed_head_after_diff="$(git -C "$checkout" rev-parse --verify 'HEAD^{commit}')" ||
         fail "feed checkout $feed commit could not be rechecked after diff collection"
       [[ "$feed_head_after_diff" == "$feed_commit" ]] ||
@@ -530,11 +973,9 @@ revalidate_top_level_feed_entries || fail "feed state changed before SOURCE-STAT
         fail "feed checkout $feed commit could not be finally rechecked"
       [[ "$feed_head_final" == "$feed_commit" ]] ||
         fail "feed checkout $feed HEAD changed before final diff collection"
-      final_diff_hash="$(git -C "$checkout" diff --binary --no-ext-diff "$feed_commit" -- | hash_file /dev/stdin | awk '{print $1}')" ||
-        fail "feed checkout $feed final worktree diff could not be hashed"
-      [[ "$final_diff_hash" =~ ^[0-9a-f]{64}$ ]] || fail "feed checkout $feed final worktree diff hash is invalid"
-      assert_feed_has_no_untracked_files "$checkout" "$feed" "after final worktree diff collection" ||
-        fail "feed checkout $feed contains untracked files after final worktree diff collection"
+      final_diff_hash="$(feed_worktree_state_hash "$checkout" "$feed" "$feed_commit" "final worktree state collection")" ||
+        fail "feed checkout $feed final worktree state could not be hashed"
+      [[ "$final_diff_hash" =~ ^[0-9a-f]{64}$ ]] || fail "feed checkout $feed final worktree state hash is invalid"
       feed_head_after_final_diff="$(git -C "$checkout" rev-parse --verify 'HEAD^{commit}')" ||
         fail "feed checkout $feed commit could not be rechecked after final diff collection"
       [[ "$feed_head_after_final_diff" == "$feed_commit" ]] ||
@@ -544,7 +985,7 @@ revalidate_top_level_feed_entries || fail "feed state changed before SOURCE-STAT
       [[ "$feed_origin_after_final_diff" == "$feed_origin" ]] ||
         fail "feed checkout $feed origin changed during final diff collection"
       [[ "$final_diff_hash" == "$diff_hash" ]] ||
-        fail "feed checkout $feed worktree diff changed before recording evidence"
+        fail "feed checkout $feed worktree state changed before recording evidence"
       printf 'feed.%s.commit=%s\n' "$feed" "$feed_commit"
       printf 'feed.%s.origin=%s\n' "$feed" "$feed_origin"
       printf 'feed.%s.worktree_diff_sha256=%s\n' "$feed" "$diff_hash"
