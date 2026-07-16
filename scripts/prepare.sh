@@ -15,6 +15,7 @@ NEXAWRT_FLAVOR="${NEXAWRT_FLAVOR:-official}"
 WITH_FEEDS=1
 CLEAN=0
 NSS_PACKAGES_SOURCE_PATCH="$ROOT_DIR/patches/nss/001-pin-codelinaro-source-archives.patch"
+COMPLETE_GIT_WORKTREE_DIFF="$ROOT_DIR/scripts/complete-git-worktree-diff.sh"
 APK_REPRO_SOURCE_PATCH="package/system/apk/patches/0011-genhelp-reproducible-gzip.patch"
 APK_REPRO_UPSTREAM_SHA256="a338662ccbef6b916b7cb2e32c91ef981b9f8e69fe056ad0513fd384ee152d1c"
 
@@ -238,8 +239,8 @@ feed_checkout_is_clean() {
     return 1
   }
   if [[ "$NEXAWRT_FLAVOR" == nss && "$feed" == "$NSS_PACKAGES_FEED" ]]; then
-    [[ -f "$NSS_PACKAGES_SOURCE_PATCH" ]] || return 1
-    [[ "$(git -C "$checkout" diff --binary --no-ext-diff HEAD --)" ==       "$(cat "$NSS_PACKAGES_SOURCE_PATCH")" ]] || {
+    [[ -f "$NSS_PACKAGES_SOURCE_PATCH" && -x "$COMPLETE_GIT_WORKTREE_DIFF" ]] || return 1
+    [[ "$("$COMPLETE_GIT_WORKTREE_DIFF" "$checkout")" == "$(cat "$NSS_PACKAGES_SOURCE_PATCH")" ]] || {
       echo "feed checkout $feed does not contain the exact NexaWrt source archive patch" >&2
       return 1
     }
@@ -248,11 +249,11 @@ feed_checkout_is_clean() {
       echo "feed checkout $feed is not clean" >&2
       return 1
     }
-  fi
-  untracked="$(git -C "$checkout" ls-files --others --exclude-standard)" || return 1
-  if [[ -n "$untracked" ]]; then
-    echo "feed checkout $feed is not clean" >&2
-    return 1
+    untracked="$(git -C "$checkout" ls-files --others --exclude-standard)" || return 1
+    if [[ -n "$untracked" ]]; then
+      echo "feed checkout $feed is not clean" >&2
+      return 1
+    fi
   fi
   ignored="$(git -C "$checkout" ls-files --others --ignored --exclude-standard)" || return 1
   if [[ -n "$ignored" ]]; then

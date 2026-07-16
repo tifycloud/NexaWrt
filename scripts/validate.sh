@@ -18,6 +18,7 @@ CHECK_ARTIFACTS=0
 FEED_POLICY_ONLY=0
 REVISION_POLICY_ONLY=0
 NSS_PACKAGES_SOURCE_PATCH="$ROOT_DIR/patches/nss/001-pin-codelinaro-source-archives.patch"
+COMPLETE_GIT_WORKTREE_DIFF="$ROOT_DIR/scripts/complete-git-worktree-diff.sh"
 
 case "$NEXAWRT_FLAVOR" in
   official)
@@ -333,16 +334,17 @@ assert_feed_checkout_clean() {
   git -C "$checkout" diff-index --quiet --cached HEAD -- ||
     fail "feed checkout $feed has staged changes"
   if [[ "$NEXAWRT_FLAVOR" == nss && "$feed" == "$NSS_PACKAGES_FEED" ]]; then
-    [[ -f "$NSS_PACKAGES_SOURCE_PATCH" ]] || fail "NSS source archive patch is missing"
-    [[ "$(git -C "$checkout" diff --binary --no-ext-diff HEAD --)" ==       "$(cat "$NSS_PACKAGES_SOURCE_PATCH")" ]] ||
+    [[ -f "$NSS_PACKAGES_SOURCE_PATCH" && -x "$COMPLETE_GIT_WORKTREE_DIFF" ]] ||
+      fail "NSS source archive patch or complete-diff helper is missing"
+    [[ "$("$COMPLETE_GIT_WORKTREE_DIFF" "$checkout")" == "$(cat "$NSS_PACKAGES_SOURCE_PATCH")" ]] ||
       fail "feed checkout $feed does not contain the exact NexaWrt source archive patch"
   else
     git -C "$checkout" diff-files --quiet --ignore-submodules -- ||
       fail "feed checkout $feed is not clean"
+    untracked="$(git -C "$checkout" ls-files --others --exclude-standard)" ||
+      fail "unable to inspect untracked files in feed checkout $feed"
+    [[ -z "$untracked" ]] || fail "feed checkout $feed is not clean"
   fi
-  untracked="$(git -C "$checkout" ls-files --others --exclude-standard)" ||
-    fail "unable to inspect untracked files in feed checkout $feed"
-  [[ -z "$untracked" ]] || fail "feed checkout $feed is not clean"
   ignored="$(git -C "$checkout" ls-files --others --ignored --exclude-standard | LC_ALL=C sort)" ||
     fail "unable to inspect ignored files in feed checkout $feed"
   if [[ -n "$ignored" ]]; then

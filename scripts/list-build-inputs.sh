@@ -25,6 +25,7 @@ inputs = [
     "scripts/list-build-inputs.sh",
     "scripts/sanitize-git-environment.sh",
     "scripts/git-metadata-policy.sh",
+    "scripts/complete-git-worktree-diff.sh",
     "scripts/lock-file-policy.sh",
     "scripts/check-kernel-build-identity.sh",
     "scripts/compare-reproducible-builds.sh",

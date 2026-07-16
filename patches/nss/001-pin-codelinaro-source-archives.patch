@@ -31,7 +31,7 @@ index f172027..f911ae3 100644
  ifeq ($(CONFIG_TARGET_SUBTARGET), "ipq807x")
 diff --git a/qca-nss-clients/patches/0033-reproducible-build-id.patch b/qca-nss-clients/patches/0033-reproducible-build-id.patch
 new file mode 100644
-index 0000000..1a231b1
+index 0000000..16dfacf
 --- /dev/null
 +++ b/qca-nss-clients/patches/0033-reproducible-build-id.patch
 @@ -0,0 +1,51 @@

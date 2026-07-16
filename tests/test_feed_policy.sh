@@ -356,4 +356,36 @@ for expected in \
   }
 done
 echo 'NSS archive extraction directory policy: OK'
+
+# Ordinary git diff omits untracked additions, but the NSS feed patch creates a
+# package-local source patch. The complete-diff helper must bind both tracked
+# edits and new files without changing the checkout's real index.
+COMPLETE_DIFF_FIXTURE="$TMP_DIR/complete-diff-fixture"
+mkdir -p "$COMPLETE_DIFF_FIXTURE"
+git -C "$COMPLETE_DIFF_FIXTURE" init -q
+git -C "$COMPLETE_DIFF_FIXTURE" config user.name 'NexaWrt complete diff fixture'
+git -C "$COMPLETE_DIFF_FIXTURE" config user.email fixture@example.invalid
+printf 'before\n' > "$COMPLETE_DIFF_FIXTURE/tracked.txt"
+git -C "$COMPLETE_DIFF_FIXTURE" add tracked.txt
+git -C "$COMPLETE_DIFF_FIXTURE" commit -qm initial
+printf 'after\n' > "$COMPLETE_DIFF_FIXTURE/tracked.txt"
+printf 'new file\n' > "$COMPLETE_DIFF_FIXTURE/added.txt"
+if git -C "$COMPLETE_DIFF_FIXTURE" diff --binary --no-ext-diff HEAD -- | grep -Fq 'added.txt'; then
+  echo 'ordinary Git diff unexpectedly included the untracked fixture' >&2
+  exit 1
+fi
+git -C "$COMPLETE_DIFF_FIXTURE" add -A -- .
+EXPECTED_COMPLETE_DIFF="$(git -C "$COMPLETE_DIFF_FIXTURE" diff --cached --binary --no-ext-diff HEAD --)"
+git -C "$COMPLETE_DIFF_FIXTURE" reset -q HEAD --
+ACTUAL_COMPLETE_DIFF="$("$ROOT_DIR/scripts/complete-git-worktree-diff.sh" "$COMPLETE_DIFF_FIXTURE")"
+[[ "$ACTUAL_COMPLETE_DIFF" == "$EXPECTED_COMPLETE_DIFF" ]] || {
+  echo 'complete Git worktree diff omitted or changed a tracked/untracked edit' >&2
+  exit 1
+}
+git -C "$COMPLETE_DIFF_FIXTURE" diff-index --quiet --cached HEAD -- || {
+  echo 'complete Git worktree diff changed the real checkout index' >&2
+  exit 1
+}
+echo 'complete Git worktree diff includes untracked patch additions without index mutation: OK'
+
 echo 'feed policy tests: OK'

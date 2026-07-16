@@ -41,6 +41,7 @@ for required in \
   scripts/list-build-inputs.sh \
   scripts/apk-signing-key.sh \
   scripts/sanitize-git-environment.sh \
+  scripts/complete-git-worktree-diff.sh \
   scripts/lock-file-policy.sh \
   scripts/git-metadata-policy.sh \
   scripts/check-kernel-build-identity.sh \
