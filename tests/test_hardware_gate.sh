@@ -42,8 +42,11 @@ source "$PROJECT/manifests/nss.lock"
 EMPTY_SHA="$(printf '' | sha256sum | awk '{print $1}')"
 NSS_PATCH_SHA="$(sha256sum "$PROJECT/patches/nss/001-pin-codelinaro-source-archives.patch" | awk '{print $1}')"
 git -C "$PROJECT" init -q
-git -C "$PROJECT" fetch -q "$ROOT_DIR" HEAD
-git -C "$PROJECT" reset -q --mixed FETCH_HEAD
+git -C "$PROJECT" config user.name nexawrt-fixture
+git -C "$PROJECT" config user.email nexawrt-fixture@example.invalid
+git -C "$PROJECT" add -A
+GIT_AUTHOR_DATE='1700000000 +0000' GIT_COMMITTER_DATE='1700000000 +0000' \
+  git -C "$PROJECT" commit -qm 'fixture project state'
 PROJECT_COMMIT="$(git -C "$PROJECT" rev-parse HEAD)"
 MANIFEST='openwrt-qualcommax-ipq807x-xiaomi_ax9000_single_ubi.manifest'
 SBOM='openwrt-qualcommax-ipq807x-xiaomi_ax9000_single_ubi.bom.cdx.json'
