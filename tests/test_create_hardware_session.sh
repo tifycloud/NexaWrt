@@ -1,5 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
+# Repository policy tests run as local fixtures unless a case injects a complete
+# synthetic GitHub context explicitly. Do not inherit the enclosing CI run identity.
+unset GITHUB_ACTIONS GITHUB_REF GITHUB_REPOSITORY GITHUB_RUN_ATTEMPT \
+  GITHUB_RUN_ID GITHUB_SHA GITHUB_WORKFLOW_REF GITHUB_WORKFLOW_SHA
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
 TMP="$(mktemp -d "${TMPDIR:-/tmp}/nexawrt-session.XXXXXX")"
 TMP="$(cd "$TMP" && pwd -P)"

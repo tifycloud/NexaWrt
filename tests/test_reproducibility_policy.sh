@@ -4,6 +4,10 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
 TMP="$(mktemp -d "${TMPDIR:-/tmp}/nexawrt-repro.XXXXXX")"
 TMP="$(cd "$TMP" && pwd -P)"
 trap 'rm -rf "$TMP"' EXIT
+# Keep local-policy cases independent from an enclosing GitHub Actions job. Tests
+# that exercise the hosted path inject a complete synthetic GitHub context below.
+unset GITHUB_ACTIONS GITHUB_REF GITHUB_REPOSITORY GITHUB_RUN_ATTEMPT \
+  GITHUB_RUN_ID GITHUB_SHA GITHUB_WORKFLOW_REF GITHUB_WORKFLOW_SHA
 fail() { echo "test_reproducibility_policy: $*" >&2; exit 1; }
 expect_rejected() {
   local label="$1"; shift
