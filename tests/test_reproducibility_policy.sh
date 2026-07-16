@@ -9,6 +9,11 @@ expect_rejected() {
   local label="$1"; shift
   if "$@" >"$TMP/stdout" 2>"$TMP/stderr"; then fail "$label unexpectedly passed"; fi
 }
+expect_rejected_matching() {
+  local label="$1" pattern="$2"; shift 2
+  expect_rejected "$label" "$@"
+  grep -Eq "$pattern" "$TMP/stderr" || fail "$label was rejected by the wrong policy: $(cat "$TMP/stderr")"
+}
 
 PROJECT="$TMP/project"
 mkdir -p "$PROJECT/scripts" "$PROJECT/release-staging"
@@ -33,6 +38,9 @@ source "$PROJECT/manifests/upstream.lock"
 source "$PROJECT/manifests/nss.lock"
 EMPTY_SHA="$(printf '' | sha256sum | awk '{print $1}')"
 NSS_PATCH_SHA="$(sha256sum "$PROJECT/patches/nss/001-pin-codelinaro-source-archives.patch" | awk '{print $1}')"
+NSS_WORKTREE_STATE_SHA="$(printf 'nss generated feed state v4' | sha256sum | awk '{print $1}')"
+NSS_ALTERNATE_WORKTREE_STATE_SHA="$(printf 'different nss generated feed state v4' | sha256sum | awk '{print $1}')"
+[[ "$NSS_WORKTREE_STATE_SHA" != "$NSS_PATCH_SHA" ]] || fail 'NSS fixture state must not equal the declared patch digest'
 git -C "$PROJECT" init -q
 git -C "$PROJECT" fetch -q "$ROOT_DIR" HEAD
 git -C "$PROJECT" reset -q --mixed FETCH_HEAD
@@ -61,7 +69,7 @@ write_source_state() {
     done < "$PROJECT/manifests/feeds.lock"
     if [[ "$flavor" == nss ]]; then
       printf 'feed.%s.commit=%s\nfeed.%s.origin=%s\nfeed.%s.worktree_diff_sha256=%s\n' \
-        "$NSS_PACKAGES_FEED" "$NSS_PACKAGES_COMMIT" "$NSS_PACKAGES_FEED" "$NSS_PACKAGES_REPO" "$NSS_PACKAGES_FEED" "$NSS_PATCH_SHA"
+        "$NSS_PACKAGES_FEED" "$NSS_PACKAGES_COMMIT" "$NSS_PACKAGES_FEED" "$NSS_PACKAGES_REPO" "$NSS_PACKAGES_FEED" "$NSS_WORKTREE_STATE_SHA"
       printf 'feed.%s.commit=%s\nfeed.%s.origin=%s\nfeed.%s.worktree_diff_sha256=%s\n' \
         "$NSS_SQM_FEED" "$NSS_SQM_COMMIT" "$NSS_SQM_FEED" "$NSS_SQM_REPO" "$NSS_SQM_FEED" "$EMPTY_SHA"
     fi
@@ -326,15 +334,83 @@ expect_rejected 'stale project commit' "$SCRIPT" official "$PROJECT/a" "$PROJECT
 
 make_replica "$PROJECT/nss-a" urn:uuid:a 2026-01-01T00:00:00Z nss
 make_replica "$PROJECT/nss-b" urn:uuid:b 2026-01-02T00:00:00Z nss
-sed -i.bak "s/feed.$NSS_PACKAGES_FEED.worktree_diff_sha256=$NSS_PATCH_SHA/feed.$NSS_PACKAGES_FEED.worktree_diff_sha256=$EMPTY_SHA/" "$PROJECT/nss-b/EVIDENCE/SOURCE-STATE.txt"; rm "$PROJECT/nss-b/EVIDENCE/SOURCE-STATE.txt.bak"
+sed -i.bak "s/feed.$NSS_PACKAGES_FEED.worktree_diff_sha256=$NSS_WORKTREE_STATE_SHA/feed.$NSS_PACKAGES_FEED.worktree_diff_sha256=$NSS_ALTERNATE_WORKTREE_STATE_SHA/" "$PROJECT/nss-b/EVIDENCE/SOURCE-STATE.txt"; rm "$PROJECT/nss-b/EVIDENCE/SOURCE-STATE.txt.bak"
 write_checksums "$PROJECT/nss-b"
-expect_rejected 'wrong feed patch lock' "$SCRIPT" nss "$PROJECT/nss-a" "$PROJECT/nss-b" "$PROJECT/release-staging/wrong-feed-patch/verified-dist"
+expect_rejected 'different feed worktree state' "$SCRIPT" nss "$PROJECT/nss-a" "$PROJECT/nss-b" "$PROJECT/release-staging/wrong-feed-patch/verified-dist"
+make_replica "$PROJECT/nss-b" urn:uuid:b 2026-01-02T00:00:00Z nss
+sed -i.bak "s/feed.$NSS_PACKAGES_FEED.worktree_diff_sha256=$NSS_WORKTREE_STATE_SHA/feed.$NSS_PACKAGES_FEED.worktree_diff_sha256=not-a-sha256/" "$PROJECT/nss-b/EVIDENCE/SOURCE-STATE.txt"; rm "$PROJECT/nss-b/EVIDENCE/SOURCE-STATE.txt.bak"
+write_checksums "$PROJECT/nss-b"
+expect_rejected 'invalid feed worktree state digest' "$SCRIPT" nss "$PROJECT/nss-a" "$PROJECT/nss-b" "$PROJECT/release-staging/invalid-feed-state/verified-dist"
 make_replica "$PROJECT/nss-b" urn:uuid:b 2026-01-02T00:00:00Z nss
 sed -i.bak "s/feed.$NSS_PACKAGES_FEED.commit=$NSS_PACKAGES_COMMIT/feed.$NSS_PACKAGES_FEED.commit=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb/" "$PROJECT/nss-b/EVIDENCE/SOURCE-STATE.txt"; rm "$PROJECT/nss-b/EVIDENCE/SOURCE-STATE.txt.bak"
 write_checksums "$PROJECT/nss-b"
 expect_rejected 'wrong feed commit lock' "$SCRIPT" nss "$PROJECT/nss-a" "$PROJECT/nss-b" "$PROJECT/release-staging/wrong-feed-commit/verified-dist"
 make_replica "$PROJECT/nss-b" urn:uuid:b 2026-01-02T00:00:00Z nss
-"$SCRIPT" nss "$PROJECT/nss-a" "$PROJECT/nss-b" "$PROJECT/release-staging/nss/verified-dist" >/dev/null
+NSS_OUT="$PROJECT/release-staging/nss/verified-dist"
+"$SCRIPT" nss "$PROJECT/nss-a" "$PROJECT/nss-b" "$NSS_OUT" >/dev/null
+"$SCRIPT" --verify-verified-dist "$NSS_OUT" >/dev/null
+
+forge_retained_evidence() {
+  local source="$1" name="$2" retained_filename="$3" receipt_key="$4" old_value="$5" new_value="$6" rejection_pattern="$7"
+  local target="$PROJECT/release-staging/$name/verified-dist"
+  rm -rf "$PROJECT/release-staging/$name"; mkdir -p "$PROJECT/release-staging/$name"; cp -a "$source" "$target"
+  python3 - "$target" "$retained_filename" "$receipt_key" "$old_value" "$new_value" <<'PY'
+import hashlib, json, pathlib, sys
+root = pathlib.Path(sys.argv[1])
+retained_filename, receipt_key, old_value, new_value = sys.argv[2:]
+retained = root / "REPRODUCIBILITY" / retained_filename
+raw = retained.read_text(encoding="utf-8")
+if raw.count(old_value) != 1:
+    raise SystemExit("fixture replacement must match exactly once")
+retained.write_text(raw.replace(old_value, new_value), encoding="utf-8")
+
+def digest(path):
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+def replace_checksum(path, wanted, value):
+    output = []
+    found = 0
+    for line in path.read_text(encoding="ascii").splitlines():
+        checksum, filename = line.split(None, 1)
+        marker = "*" if filename.startswith("*") else ""
+        clean = filename[1:] if marker else filename
+        normalized = clean[2:] if clean.startswith("./") else clean
+        if normalized == wanted:
+            checksum = value
+            found += 1
+        output.append(f"{checksum}  {marker}{clean}")
+    if found != 1:
+        raise SystemExit(f"checksum fixture did not bind {wanted!r} exactly once")
+    path.write_text("\n".join(output) + "\n", encoding="ascii")
+
+slot = retained_filename.split(".", 1)[0]
+field = "source_state" if retained_filename.endswith("SOURCE-STATE.txt") else "inputs"
+evidence_receipt = root / "REPRODUCIBILITY" / f"{slot}.EVIDENCE.sha256"
+input_receipt = root / "REPRODUCIBILITY" / f"{slot}.SHA256SUMS"
+retained_sha = digest(retained)
+replace_checksum(evidence_receipt, receipt_key, retained_sha)
+evidence_sha = digest(evidence_receipt)
+replace_checksum(input_receipt, f"EVIDENCE/{receipt_key}", retained_sha)
+replace_checksum(input_receipt, "EVIDENCE/EVIDENCE.sha256", evidence_sha)
+receipt_sha = digest(input_receipt)
+metadata = root / "REPRODUCIBILITY.json"
+value = json.loads(metadata.read_text(encoding="utf-8"))
+item = next(item for item in value["input_builds"] if item["slot"] == slot)
+item[f"{field}_sha256"] = retained_sha
+item["evidence_receipt_sha256"] = evidence_sha
+item["receipt_sha256"] = receipt_sha
+metadata.write_text(json.dumps(value, sort_keys=True, separators=(",", ":")) + "\n", encoding="utf-8")
+PY
+  write_checksums "$target"
+  expect_rejected_matching "$name" "$rejection_pattern" "$SCRIPT" --verify-verified-dist "$target"
+}
+
+forge_retained_evidence "$NSS_OUT" forged-right-feed-state right.SOURCE-STATE.txt SOURCE-STATE.txt \
+  "$NSS_WORKTREE_STATE_SHA" "$NSS_ALTERNATE_WORKTREE_STATE_SHA" \
+  'input build retained repository input receipt mismatch'
+forge_retained_evidence "$NSS_OUT" forged-right-input-receipt right.INPUTS.sha256 INPUTS.sha256 \
+  "$NSS_PATCH_SHA" "$NSS_ALTERNATE_WORKTREE_STATE_SHA" \
+  'right repository build input digest mismatch'
 
 cp -a "$OUT" "$PROJECT/release-staging/missing-repro-verified-dist"
 expect_rejected 'misnamed verified dist' "$SCRIPT" --verify-verified-dist "$PROJECT/release-staging/missing-repro-verified-dist"
@@ -359,4 +435,4 @@ mutate_output replaced-comparison-receipt 'value["comparison_receipt_sha256"]="0
 rm "$OUT/REPRODUCIBILITY.json"; write_checksums "$OUT"
 expect_rejected 'missing reproducibility metadata' "$SCRIPT" --verify-verified-dist "$OUT"
 
-echo 'reproducibility schema-4 signed producer descriptors, dual-build receipts, repository locks, exact artifacts, and fail-closed verified-dist policy: OK'
+echo 'reproducibility schema-4 signed producer descriptors, dual-build receipts, repository locks, complete feed-state receipts, exact artifacts, and fail-closed verified-dist policy: OK'

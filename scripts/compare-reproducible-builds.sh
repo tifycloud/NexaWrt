@@ -150,6 +150,10 @@ if mode == "output":
         "REPRODUCIBILITY/right.BUILD-IDENTITY.txt",
         "REPRODUCIBILITY/left.EVIDENCE.sha256",
         "REPRODUCIBILITY/right.EVIDENCE.sha256",
+        "REPRODUCIBILITY/left.SOURCE-STATE.txt",
+        "REPRODUCIBILITY/right.SOURCE-STATE.txt",
+        "REPRODUCIBILITY/left.INPUTS.sha256",
+        "REPRODUCIBILITY/right.INPUTS.sha256",
     })
     if platform_provenance_expected:
         files.update({
@@ -365,12 +369,17 @@ for key, expected_value in expected_manifest.items():
         raise SystemExit(f"build manifest does not match repository lock: {key}")
 
 expected_feeds = dict(feeds)
-feed_patch_hashes = {name: hashlib.sha256(b"").hexdigest() for name in feeds}
+# A declared patch receipt proves which reviewed repository patch the preparation
+# policy was expected to apply.  It is intentionally distinct from the complete
+# post-preparation worktree-state digest collected from each build: feed update /
+# install may create deterministic ignored or untracked state that cannot equal a
+# raw patch-file digest.
+feed_declared_patch_hashes = {name: hashlib.sha256(b"").hexdigest() for name in feeds}
 if flavor == "nss":
     expected_feeds[nss["NSS_PACKAGES_FEED"]] = (nss["NSS_PACKAGES_REPO"], nss["NSS_PACKAGES_COMMIT"])
     expected_feeds[nss["NSS_SQM_FEED"]] = (nss["NSS_SQM_REPO"], nss["NSS_SQM_COMMIT"])
-    feed_patch_hashes[nss["NSS_PACKAGES_FEED"]] = digest_file(repo / "patches/nss/001-pin-codelinaro-source-archives.patch")
-    feed_patch_hashes[nss["NSS_SQM_FEED"]] = hashlib.sha256(b"").hexdigest()
+    feed_declared_patch_hashes[nss["NSS_PACKAGES_FEED"]] = digest_file(repo / "patches/nss/001-pin-codelinaro-source-archives.patch")
+    feed_declared_patch_hashes[nss["NSS_SQM_FEED"]] = hashlib.sha256(b"").hexdigest()
 source_keys = {"flavor", "project_commit", "project_tree_state", "source_commit", "source_origin"}
 for name in expected_feeds:
     source_keys.update({f"feed.{name}.commit", f"feed.{name}.origin", f"feed.{name}.worktree_diff_sha256"})
@@ -395,11 +404,14 @@ for key in ("run_id", "run_attempt"):
         raise SystemExit(f"build identity {key} is invalid")
 if build_identity["project_commit"] != manifest["project_commit"] or build_identity["source_commit"] != manifest["source_commit"]:
     raise SystemExit("build identity commit binding mismatch")
+feed_worktree_state_hashes = {}
 for name, (repository, commit) in expected_feeds.items():
     if source_state[f"feed.{name}.origin"] != repository or source_state[f"feed.{name}.commit"] != commit:
         raise SystemExit(f"source state does not match locked feed: {name}")
-    if source_state[f"feed.{name}.worktree_diff_sha256"] != feed_patch_hashes[name]:
-        raise SystemExit(f"source state feed patch digest mismatch: {name}")
+    worktree_state_hash = source_state[f"feed.{name}.worktree_diff_sha256"]
+    if not re.fullmatch(r"[0-9a-f]{64}", worktree_state_hash):
+        raise SystemExit(f"source state feed worktree digest is invalid: {name}")
+    feed_worktree_state_hashes[name] = worktree_state_hash
 
 input_lines = (dist / "EVIDENCE/INPUTS.sha256").read_text(encoding="ascii").splitlines()
 input_pattern = re.compile(r"^([0-9a-f]{64})  ([A-Za-z0-9_.+/-]+)$")
@@ -475,9 +487,71 @@ for name in sorted(expected_feeds):
     repository_lines.extend([
         f"feed.{name}.repository={repository}",
         f"feed.{name}.commit={commit}",
-        f"feed.{name}.patch_sha256={feed_patch_hashes[name]}",
+        f"feed.{name}.declared_patch_sha256={feed_declared_patch_hashes[name]}",
+        f"feed.{name}.worktree_state_sha256={feed_worktree_state_hashes[name]}",
     ])
 repository_inputs_sha256 = hashlib.sha256(("\n".join(repository_lines) + "\n").encode()).hexdigest()
+
+def recompute_repository_inputs(source_state_path, inputs_path, label):
+    retained_source = parse_key_values(source_state_path, source_keys, f"{label} SOURCE-STATE.txt")
+    if retained_source["flavor"] != flavor or retained_source["project_commit"] != manifest["project_commit"]:
+        raise SystemExit(f"{label} source state flavor or project commit mismatch")
+    if retained_source["project_tree_state"] != "clean":
+        raise SystemExit(f"{label} source state must come from a clean project tree")
+    if retained_source["source_commit"] != manifest["source_commit"] or retained_source["source_origin"] != manifest["source_repository"]:
+        raise SystemExit(f"{label} source state does not match locked source")
+    retained_feed_hashes = {}
+    for name, (repository, commit) in expected_feeds.items():
+        if retained_source[f"feed.{name}.origin"] != repository or retained_source[f"feed.{name}.commit"] != commit:
+            raise SystemExit(f"{label} source state does not match locked feed: {name}")
+        state_hash = retained_source[f"feed.{name}.worktree_diff_sha256"]
+        if not re.fullmatch(r"[0-9a-f]{64}", state_hash):
+            raise SystemExit(f"{label} source state feed worktree digest is invalid: {name}")
+        retained_feed_hashes[name] = state_hash
+
+    try:
+        retained_input_lines = inputs_path.read_text(encoding="ascii").splitlines()
+    except (UnicodeDecodeError, OSError) as error:
+        raise SystemExit(f"cannot read {label} INPUTS.sha256 safely: {error}")
+    retained_inputs = {}
+    for line_number, line in enumerate(retained_input_lines, 1):
+        match = input_pattern.fullmatch(line)
+        if match is None:
+            raise SystemExit(f"malformed {label} INPUTS.sha256 line {line_number}")
+        digest, raw_name = match.groups()
+        pure = pathlib.PurePosixPath(raw_name)
+        if pure.is_absolute() or any(part in {"", ".", ".."} for part in pure.parts) or pure.as_posix() != raw_name or raw_name in retained_inputs:
+            raise SystemExit(f"unsafe or duplicate {label} INPUTS.sha256 path: {raw_name}")
+        retained_inputs[raw_name] = digest
+    if set(retained_inputs) != set(expected_inputs):
+        missing = sorted(set(expected_inputs) - set(retained_inputs))
+        extra = sorted(set(retained_inputs) - set(expected_inputs))
+        raise SystemExit(f"{label} repository build input set mismatch; missing={missing}, extra={extra}")
+    for name in sorted(expected_inputs):
+        if retained_inputs[name] != expected_inputs[name]:
+            raise SystemExit(f"{label} repository build input digest mismatch: {name}")
+
+    retained_lines = [
+        "schema=1",
+        f"flavor={flavor}",
+        f"source_repository={manifest['source_repository']}",
+        f"source_commit={manifest['source_commit']}",
+        f"source_ref={source_ref}",
+    ]
+    for name in sorted(expected_inputs):
+        retained_lines.append(f"input.{name}.sha256={retained_inputs[name]}")
+    for name in sorted(expected_feeds):
+        repository, commit = expected_feeds[name]
+        retained_lines.extend([
+            f"feed.{name}.repository={repository}",
+            f"feed.{name}.commit={commit}",
+            f"feed.{name}.declared_patch_sha256={feed_declared_patch_hashes[name]}",
+            f"feed.{name}.worktree_state_sha256={retained_feed_hashes[name]}",
+        ])
+    return hashlib.sha256(("\n".join(retained_lines) + "\n").encode()).hexdigest()
+
+if recompute_repository_inputs(dist / "EVIDENCE/SOURCE-STATE.txt", dist / "EVIDENCE/INPUTS.sha256", "primary") != repository_inputs_sha256:
+    raise SystemExit("internal repository input receipt mismatch")
 
 if mode == "replica":
     print(f"repository_inputs_sha256={repository_inputs_sha256}")
@@ -535,7 +609,8 @@ by_slot = {}
 for item in input_builds:
     if not isinstance(item, dict) or set(item) != {
         "slot", "receipt_filename", "receipt_sha256", "evidence_receipt_filename", "evidence_receipt_sha256",
-        "identity_filename", "identity_sha256", "replica_id", "producer_id", "artifact_id", "artifact_name",
+        "identity_filename", "identity_sha256", "source_state_filename", "source_state_sha256",
+        "inputs_filename", "inputs_sha256", "replica_id", "producer_id", "artifact_id", "artifact_name",
         "producer_descriptor_filename", "producer_descriptor_sha256",
         "provenance_bundle_filename", "provenance_bundle_sha256",
     }:
@@ -570,6 +645,23 @@ for item in input_builds:
         raise SystemExit("input build identity digest mismatch")
     if receipt["EVIDENCE/BUILD-IDENTITY.txt"] != item["identity_sha256"] or input_evidence_receipt["BUILD-IDENTITY.txt"] != item["identity_sha256"]:
         raise SystemExit("input build receipts do not bind the build identity")
+    expected_source_state_name = f"REPRODUCIBILITY/{slot}.SOURCE-STATE.txt"
+    expected_inputs_name = f"REPRODUCIBILITY/{slot}.INPUTS.sha256"
+    if item["source_state_filename"] != expected_source_state_name or item["inputs_filename"] != expected_inputs_name:
+        raise SystemExit("input build retained repository evidence filename mismatch")
+    source_state_path = dist / expected_source_state_name
+    inputs_path = dist / expected_inputs_name
+    if not re.fullmatch(r"[0-9a-f]{64}", item["source_state_sha256"] or "") or digest_file(source_state_path) != item["source_state_sha256"]:
+        raise SystemExit("input build retained source state digest mismatch")
+    if not re.fullmatch(r"[0-9a-f]{64}", item["inputs_sha256"] or "") or digest_file(inputs_path) != item["inputs_sha256"]:
+        raise SystemExit("input build retained input receipt digest mismatch")
+    if receipt["EVIDENCE/SOURCE-STATE.txt"] != item["source_state_sha256"] or input_evidence_receipt["SOURCE-STATE.txt"] != item["source_state_sha256"]:
+        raise SystemExit("input build receipts do not bind retained source state")
+    if receipt["EVIDENCE/INPUTS.sha256"] != item["inputs_sha256"] or input_evidence_receipt["INPUTS.sha256"] != item["inputs_sha256"]:
+        raise SystemExit("input build receipts do not bind retained repository inputs")
+    retained_repository_inputs_sha256 = recompute_repository_inputs(source_state_path, inputs_path, slot)
+    if retained_repository_inputs_sha256 != reproduction["repository_inputs_sha256"]:
+        raise SystemExit("input build retained repository input receipt mismatch")
     identity = parse_key_values(
         identity_path,
         {"schema", "flavor", "replica_id", "run_id", "run_attempt", "project_commit", "source_commit"},
@@ -667,13 +759,15 @@ for item in input_builds:
         raise SystemExit("input build identity commit binding mismatch")
     if receipt[image] != actual_image_sha or receipt["BUILD-MANIFEST.txt"] != digest_file(dist / "BUILD-MANIFEST.txt"):
         raise SystemExit("input build receipt is not bound to the selected artifact and manifest")
-    by_slot[slot] = (item, receipt)
+    by_slot[slot] = (item, receipt, retained_repository_inputs_sha256)
 if by_slot["left"][0]["receipt_sha256"] == by_slot["right"][0]["receipt_sha256"]:
     raise SystemExit("input build receipts must be distinct")
 if by_slot["left"][0]["evidence_receipt_sha256"] == by_slot["right"][0]["evidence_receipt_sha256"]:
     raise SystemExit("input build evidence receipts must be distinct")
 if by_slot["left"][0]["producer_id"] == by_slot["right"][0]["producer_id"]:
     raise SystemExit("input build producer identities must be distinct")
+if by_slot["left"][2] != by_slot["right"][2]:
+    raise SystemExit("retained input build repository receipts disagree")
 for name, expected_hash in by_slot["left"][1].items():
     if digest_file(dist.joinpath(*pathlib.PurePosixPath(name).parts)) != expected_hash:
         raise SystemExit(f"left input receipt no longer matches verified output: {name}")
@@ -704,6 +798,10 @@ for slot in ("left", "right"):
         f"{slot}_evidence_receipt_sha256={item['evidence_receipt_sha256']}",
         f"{slot}_identity_filename={item['identity_filename']}",
         f"{slot}_identity_sha256={item['identity_sha256']}",
+        f"{slot}_source_state_filename={item['source_state_filename']}",
+        f"{slot}_source_state_sha256={item['source_state_sha256']}",
+        f"{slot}_inputs_filename={item['inputs_filename']}",
+        f"{slot}_inputs_sha256={item['inputs_sha256']}",
         f"{slot}_replica_id={item['replica_id']}",
         f"{slot}_producer_id={item['producer_id']}",
         f"{slot}_artifact_id={item['artifact_id']}",
@@ -1059,6 +1157,14 @@ cp "$LEFT/EVIDENCE/BUILD-IDENTITY.txt" "$OUTPUT/REPRODUCIBILITY/left.BUILD-IDENT
 cp "$RIGHT/EVIDENCE/BUILD-IDENTITY.txt" "$OUTPUT/REPRODUCIBILITY/right.BUILD-IDENTITY.txt"
 cp "$LEFT/EVIDENCE/EVIDENCE.sha256" "$OUTPUT/REPRODUCIBILITY/left.EVIDENCE.sha256"
 cp "$RIGHT/EVIDENCE/EVIDENCE.sha256" "$OUTPUT/REPRODUCIBILITY/right.EVIDENCE.sha256"
+cp "$LEFT/EVIDENCE/SOURCE-STATE.txt" "$OUTPUT/REPRODUCIBILITY/left.SOURCE-STATE.txt"
+cp "$RIGHT/EVIDENCE/SOURCE-STATE.txt" "$OUTPUT/REPRODUCIBILITY/right.SOURCE-STATE.txt"
+cp "$LEFT/EVIDENCE/INPUTS.sha256" "$OUTPUT/REPRODUCIBILITY/left.INPUTS.sha256"
+cp "$RIGHT/EVIDENCE/INPUTS.sha256" "$OUTPUT/REPRODUCIBILITY/right.INPUTS.sha256"
+left_source_state_sha="$(hash_file "$LEFT/EVIDENCE/SOURCE-STATE.txt" | awk '{print $1}')"
+right_source_state_sha="$(hash_file "$RIGHT/EVIDENCE/SOURCE-STATE.txt" | awk '{print $1}')"
+left_inputs_sha="$(hash_file "$LEFT/EVIDENCE/INPUTS.sha256" | awk '{print $1}')"
+right_inputs_sha="$(hash_file "$RIGHT/EVIDENCE/INPUTS.sha256" | awk '{print $1}')"
 if [[ -n "$left_bundle" ]]; then
   cp "$left_descriptor" "$OUTPUT/REPRODUCIBILITY/left.producer-descriptor.json"
   cp "$right_descriptor" "$OUTPUT/REPRODUCIBILITY/right.producer-descriptor.json"
@@ -1068,6 +1174,7 @@ fi
 python3 - "$OUTPUT/REPRODUCIBILITY.json" "$FLAVOR" "$EXPECTED_IMAGE" "$image_sha" "$image_size" \
   "$repository_inputs_sha256" "$left_receipt_sha" "$left_evidence_receipt_sha" \
   "$right_receipt_sha" "$right_evidence_receipt_sha" "$left_identity_sha" "$right_identity_sha" \
+  "$left_source_state_sha" "$right_source_state_sha" "$left_inputs_sha" "$right_inputs_sha" \
   "$run_id" "$run_attempt" "$left_producer_id" "$right_producer_id" \
   "$left_artifact_id" "$right_artifact_id" "$left_artifact_name" "$right_artifact_name" \
   "$left_descriptor_sha" "$right_descriptor_sha" "$left_bundle_sha" "$right_bundle_sha" <<'PY'
@@ -1079,6 +1186,7 @@ import sys
 (path, flavor, image, image_sha, image_size, repository_inputs_sha256,
  left_receipt_sha, left_evidence_receipt_sha, right_receipt_sha,
  right_evidence_receipt_sha, left_identity_sha, right_identity_sha,
+ left_source_state_sha, right_source_state_sha, left_inputs_sha, right_inputs_sha,
  run_id, run_attempt, left_producer_id, right_producer_id,
  left_artifact_id, right_artifact_id, left_artifact_name, right_artifact_name,
  left_descriptor_sha, right_descriptor_sha, left_bundle_sha, right_bundle_sha) = sys.argv[1:]
@@ -1096,6 +1204,10 @@ lines = [
     f"left_evidence_receipt_sha256={left_evidence_receipt_sha}",
     "left_identity_filename=REPRODUCIBILITY/left.BUILD-IDENTITY.txt",
     f"left_identity_sha256={left_identity_sha}",
+    "left_source_state_filename=REPRODUCIBILITY/left.SOURCE-STATE.txt",
+    f"left_source_state_sha256={left_source_state_sha}",
+    "left_inputs_filename=REPRODUCIBILITY/left.INPUTS.sha256",
+    f"left_inputs_sha256={left_inputs_sha}",
     "left_replica_id=a",
     f"left_producer_id={left_producer_id}",
     f"left_artifact_id={left_artifact_id}",
@@ -1110,6 +1222,10 @@ lines = [
     f"right_evidence_receipt_sha256={right_evidence_receipt_sha}",
     "right_identity_filename=REPRODUCIBILITY/right.BUILD-IDENTITY.txt",
     f"right_identity_sha256={right_identity_sha}",
+    "right_source_state_filename=REPRODUCIBILITY/right.SOURCE-STATE.txt",
+    f"right_source_state_sha256={right_source_state_sha}",
+    "right_inputs_filename=REPRODUCIBILITY/right.INPUTS.sha256",
+    f"right_inputs_sha256={right_inputs_sha}",
     "right_replica_id=b",
     f"right_producer_id={right_producer_id}",
     f"right_artifact_id={right_artifact_id}",
@@ -1137,6 +1253,10 @@ document = {
             "evidence_receipt_sha256": left_evidence_receipt_sha,
             "identity_filename": "REPRODUCIBILITY/left.BUILD-IDENTITY.txt",
             "identity_sha256": left_identity_sha,
+            "source_state_filename": "REPRODUCIBILITY/left.SOURCE-STATE.txt",
+            "source_state_sha256": left_source_state_sha,
+            "inputs_filename": "REPRODUCIBILITY/left.INPUTS.sha256",
+            "inputs_sha256": left_inputs_sha,
             "replica_id": "a",
             "producer_id": left_producer_id,
             "artifact_id": left_artifact_id,
@@ -1154,6 +1274,10 @@ document = {
             "evidence_receipt_sha256": right_evidence_receipt_sha,
             "identity_filename": "REPRODUCIBILITY/right.BUILD-IDENTITY.txt",
             "identity_sha256": right_identity_sha,
+            "source_state_filename": "REPRODUCIBILITY/right.SOURCE-STATE.txt",
+            "source_state_sha256": right_source_state_sha,
+            "inputs_filename": "REPRODUCIBILITY/right.INPUTS.sha256",
+            "inputs_sha256": right_inputs_sha,
             "replica_id": "b",
             "producer_id": right_producer_id,
             "artifact_id": right_artifact_id,

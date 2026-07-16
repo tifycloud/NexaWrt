@@ -147,7 +147,7 @@ firmware_size=<真实 ITB 十进制字节数>
 verified_dist_sha256sums_sha256=<verified dist/SHA256SUMS 的 SHA-256>
 reproducibility_sha256=<REPRODUCIBILITY.json 的 SHA-256>
 build_manifest_sha256=<BUILD-MANIFEST.txt 的 SHA-256>
-repository_inputs_sha256=<source/feed locks 与 reviewed patches 的规范 receipt SHA-256>
+repository_inputs_sha256=<source/feed locks、reviewed patches 与双构建完整 feed 工作树状态的规范 receipt SHA-256>
 comparison_receipt_sha256=<两个 input build receipts 的规范比较 receipt SHA-256>
 ```
 
@@ -345,7 +345,7 @@ comparison_receipt_sha256=<双构建 comparison receipt SHA-256>
 ```
 
 除 reviewer、时间和 evidence 摘要外，所有 candidate 字段都必须与 `CANDIDATE.txt` 完全相同；签名因而
-覆盖精确 artifact、双构建 receipts、source/feed locks、reviewed patches 以及三个受控文件摘要。使用 SSH
+覆盖精确 artifact、双构建 receipts、source/feed locks、reviewed patches、完整 feed 工作树状态以及三个受控文件摘要。使用 SSH
 signature namespace `nexawrt-hardware-approval` 签名。缺失 receipt 绑定、重复/额外字段、错误镜像/证据
 摘要、不受信任签名、未来时间或超过 30 天均拒绝；最大有效期只能缩短，不能延长。
 
