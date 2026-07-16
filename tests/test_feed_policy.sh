@@ -96,8 +96,10 @@ SOURCE="$TMP_DIR/source"
 mkdir -p "$SOURCE/feeds" "$SOURCE/package/feeds" "$TMP_DIR/origins"
 : > "$SOURCE/feeds.conf.default"
 : > "$POLICY_REPO/manifests/feeds.lock"
+PACKAGES_POLICY_PATCH="$POLICY_REPO/patches/packages/001-iperf3-avoid-libtool-absolute-rpath.patch"
 
 first_feed=""
+packages_checkout=""
 while read -r feed; do
   [[ -n "$feed" ]] || continue
   checkout="$SOURCE/feeds/$feed"
@@ -122,6 +124,19 @@ LUCI_BUILD_IGNORES
   fi
   mkdir -p "$checkout/package-$feed"
   printf '# fixture package for %s\n' "$feed" > "$checkout/package-$feed/Makefile"
+  if [[ "$feed" == packages ]]; then
+    mkdir -p "$checkout/net/iperf3"
+    cat > "$checkout/net/iperf3/Makefile" <<'IPERF_FIXTURE'
+TARGET_CFLAGS += -D_GNU_SOURCE
+TARGET_LDFLAGS += -latomic
+
+ifeq ($(BUILD_VARIANT),ssl)
+	CONFIGURE_ARGS += --with-openssl
+else
+	CONFIGURE_ARGS += --without-openssl
+endif
+IPERF_FIXTURE
+  fi
   git -C "$checkout" add .
   git -C "$checkout" commit -qm "fixture: $feed"
   revision="$(git -C "$checkout" rev-parse HEAD)"
@@ -132,7 +147,18 @@ LUCI_BUILD_IGNORES
   mkdir -p "$SOURCE/package/feeds/$feed"
   ln -s "../../../feeds/$feed/package-$feed" \
     "$SOURCE/package/feeds/$feed/package-$feed"
-  [[ -n "$first_feed" ]] || first_feed="$feed"
+  if [[ "$feed" == packages ]]; then
+    sed 's/TARGET_LDFLAGS += -latomic/TARGET_LDFLAGS += -Wl,-latomic/' \
+      "$checkout/net/iperf3/Makefile" > "$checkout/net/iperf3/Makefile.tmp"
+    mv "$checkout/net/iperf3/Makefile.tmp" "$checkout/net/iperf3/Makefile"
+    git -C "$checkout" diff --binary --no-ext-diff -- net/iperf3/Makefile \
+      > "$PACKAGES_POLICY_PATCH"
+    git -C "$checkout" reset --hard -q HEAD
+    git -C "$checkout" apply "$PACKAGES_POLICY_PATCH"
+    packages_checkout="$checkout"
+  elif [[ -z "$first_feed" ]]; then
+    first_feed="$feed"
+  fi
 done <<'FEEDS'
 packages
 luci
@@ -144,6 +170,36 @@ FEEDS
 printf 'version=1\nflavor=official\nstate=feeds-installed\n' > "$SOURCE/.nexawrt-feeds-state"
 NEXAWRT_FLAVOR=official "$POLICY_REPO/scripts/validate.sh" \
   --source "$SOURCE" --feed-policy-only >/dev/null
+
+# The standard packages feed is intentionally dirty by exactly one reviewed
+# patch. Missing, altered, or additional worktree changes must all fail closed.
+git -C "$packages_checkout" apply --reverse "$PACKAGES_POLICY_PATCH"
+expect_failure "missing packages iperf3 patch diff" \
+  "feed checkout packages does not contain the exact NexaWrt iperf3 link-stage RPATH patch" \
+  env NEXAWRT_FLAVOR=official "$POLICY_REPO/scripts/validate.sh" \
+  --source "$SOURCE" --feed-policy-only
+git -C "$packages_checkout" apply "$PACKAGES_POLICY_PATCH"
+
+sed 's/TARGET_LDFLAGS += -Wl,-latomic/TARGET_LDFLAGS += -Wl,--no-as-needed,-latomic/' \
+  "$packages_checkout/net/iperf3/Makefile" > \
+  "$packages_checkout/net/iperf3/Makefile.tmp"
+mv "$packages_checkout/net/iperf3/Makefile.tmp" \
+  "$packages_checkout/net/iperf3/Makefile"
+expect_failure "tampered packages iperf3 patch diff" \
+  "feed checkout packages does not contain the exact NexaWrt iperf3 link-stage RPATH patch" \
+  env NEXAWRT_FLAVOR=official "$POLICY_REPO/scripts/validate.sh" \
+  --source "$SOURCE" --feed-policy-only
+git -C "$packages_checkout" checkout -q -- net/iperf3/Makefile
+git -C "$packages_checkout" apply "$PACKAGES_POLICY_PATCH"
+
+printf 'extra packages diff\n' >> "$packages_checkout/tracked.txt"
+expect_failure "extra packages feed diff" \
+  "feed checkout packages does not contain the exact NexaWrt iperf3 link-stage RPATH patch" \
+  env NEXAWRT_FLAVOR=official "$POLICY_REPO/scripts/validate.sh" \
+  --source "$SOURCE" --feed-policy-only
+git -C "$packages_checkout" checkout -q -- tracked.txt
+
+echo 'exact packages iperf3 worktree diff negatives: OK'
 
 ln -s ../package "$SOURCE/feeds/base"
 NEXAWRT_FLAVOR=official "$POLICY_REPO/scripts/validate.sh" \
@@ -317,7 +373,7 @@ for checkout in "$SOURCE"/feeds/*; do
   feed="$(basename "$checkout")"
   mv "$checkout/.git" "$TMP_DIR/feed-git-metadata/$feed"
 done
-expect_failure "feeds directory without Git metadata" "feed checkout missing Git metadata: $first_feed" \
+expect_failure "feeds directory without Git metadata" "feed checkout missing Git metadata: packages" \
   env NEXAWRT_FLAVOR=official "$POLICY_REPO/scripts/validate.sh" \
   --source "$SOURCE" --feed-policy-only
 for checkout in "$SOURCE"/feeds/*; do
@@ -356,6 +412,18 @@ for expected in \
   }
 done
 echo 'NSS archive extraction directory policy: OK'
+[[ "$(grep -c '^diff --git a/net/iperf3/Makefile b/net/iperf3/Makefile$' \
+  "$ROOT_DIR/patches/packages/001-iperf3-avoid-libtool-absolute-rpath.patch")" == 1 ]]
+grep -Fq -- '-TARGET_LDFLAGS += -latomic' \
+  "$ROOT_DIR/patches/packages/001-iperf3-avoid-libtool-absolute-rpath.patch"
+grep -Fq -- '+TARGET_LDFLAGS += -Wl,-latomic' \
+  "$ROOT_DIR/patches/packages/001-iperf3-avoid-libtool-absolute-rpath.patch"
+if grep -Fqi patchelf \
+  "$ROOT_DIR/patches/packages/001-iperf3-avoid-libtool-absolute-rpath.patch"; then
+  echo 'iperf3 packages patch must not use install-time patchelf' >&2
+  exit 1
+fi
+echo 'iperf3 link-stage RPATH patch intent: OK'
 
 # Ordinary git diff omits untracked additions, but the NSS feed patch creates a
 # package-local source patch. The complete-diff helper must bind both tracked

@@ -14,6 +14,7 @@ source "$ROOT_DIR/manifests/upstream.lock"
 NEXAWRT_FLAVOR="${NEXAWRT_FLAVOR:-official}"
 WITH_FEEDS=1
 CLEAN=0
+PACKAGES_IPERF3_RPATH_PATCH="$ROOT_DIR/patches/packages/001-iperf3-avoid-libtool-absolute-rpath.patch"
 NSS_PACKAGES_SOURCE_PATCH="$ROOT_DIR/patches/nss/001-pin-codelinaro-source-archives.patch"
 COMPLETE_GIT_WORKTREE_DIFF="$ROOT_DIR/scripts/complete-git-worktree-diff.sh"
 APK_REPRO_SOURCE_PATCH="package/system/apk/patches/0011-genhelp-reproducible-gzip.patch"
@@ -238,10 +239,22 @@ feed_checkout_is_clean() {
     echo "feed checkout $feed has staged changes" >&2
     return 1
   }
-  if [[ "$NEXAWRT_FLAVOR" == nss && "$feed" == "$NSS_PACKAGES_FEED" ]]; then
-    [[ -f "$NSS_PACKAGES_SOURCE_PATCH" && -x "$COMPLETE_GIT_WORKTREE_DIFF" ]] || return 1
-    [[ "$("$COMPLETE_GIT_WORKTREE_DIFF" "$checkout")" == "$(cat "$NSS_PACKAGES_SOURCE_PATCH")" ]] || {
-      echo "feed checkout $feed does not contain the exact NexaWrt source archive patch" >&2
+  local expected_patch="" patch_description=""
+  if [[ "$feed" == packages ]]; then
+    expected_patch="$PACKAGES_IPERF3_RPATH_PATCH"
+    patch_description="iperf3 link-stage RPATH patch"
+  elif [[ "$NEXAWRT_FLAVOR" == nss && "$feed" == "$NSS_PACKAGES_FEED" ]]; then
+    expected_patch="$NSS_PACKAGES_SOURCE_PATCH"
+    patch_description="source archive patch"
+  fi
+
+  if [[ -n "$expected_patch" ]]; then
+    [[ -f "$expected_patch" && -x "$COMPLETE_GIT_WORKTREE_DIFF" ]] || {
+      echo "required $patch_description or complete-diff helper is missing" >&2
+      return 1
+    }
+    [[ "$("$COMPLETE_GIT_WORKTREE_DIFF" "$checkout")" == "$(cat "$expected_patch")" ]] || {
+      echo "feed checkout $feed does not contain the exact NexaWrt $patch_description" >&2
       return 1
     }
   else
@@ -647,6 +660,8 @@ if ((WITH_FEEDS)); then
       update_one_pinned_feed "$feed"
     done < <(awk '$1 ~ /^src-git(-full)?$/ { print $2 }' feeds.conf.default)
 
+    git -C feeds/packages apply --check "$PACKAGES_IPERF3_RPATH_PATCH"
+    git -C feeds/packages apply "$PACKAGES_IPERF3_RPATH_PATCH"
     if [[ "$NEXAWRT_FLAVOR" == nss ]]; then
       git -C "feeds/$NSS_PACKAGES_FEED" apply --check "$NSS_PACKAGES_SOURCE_PATCH"
       git -C "feeds/$NSS_PACKAGES_FEED" apply "$NSS_PACKAGES_SOURCE_PATCH"

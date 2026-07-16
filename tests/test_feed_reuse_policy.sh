@@ -78,17 +78,25 @@ printf 'fixture package\n' > "$FEED_REPO/pkg/Makefile"
 "$REAL_GIT" -C "$FEED_REPO" add pkg/Makefile
 "$REAL_GIT" -C "$FEED_REPO" commit -qm 'fixture feed'
 FEED_COMMIT="$("$REAL_GIT" -C "$FEED_REPO" rev-parse HEAD)"
+PACKAGES_POLICY_PATCH="$POLICY_REPO/patches/packages/001-iperf3-avoid-libtool-absolute-rpath.patch"
 
 mkdir -p \
   "$POLICY_REPO/scripts" \
   "$POLICY_REPO/manifests" \
   "$POLICY_REPO/configs" \
   "$POLICY_REPO/files" \
-  "$POLICY_REPO/patches"
+  "$POLICY_REPO/patches" \
+  "$POLICY_REPO/patches/packages"
 cp "$ROOT_DIR/scripts/prepare.sh" "$POLICY_REPO/scripts/prepare.sh"
+cp "$ROOT_DIR/scripts/complete-git-worktree-diff.sh" \
+  "$POLICY_REPO/scripts/complete-git-worktree-diff.sh"
 cp "$ROOT_DIR/scripts/sanitize-git-environment.sh" "$POLICY_REPO/scripts/sanitize-git-environment.sh"
 cp "$ROOT_DIR/scripts/git-metadata-policy.sh" "$POLICY_REPO/scripts/git-metadata-policy.sh"
 cp "$ROOT_DIR/scripts/lock-file-policy.sh" "$POLICY_REPO/scripts/lock-file-policy.sh"
+printf 'fixture package patched\n' > "$FEED_REPO/pkg/Makefile"
+"$REAL_GIT" -C "$FEED_REPO" diff --binary --no-ext-diff -- pkg/Makefile \
+  > "$PACKAGES_POLICY_PATCH"
+"$REAL_GIT" -C "$FEED_REPO" reset -q --hard HEAD
 cat > "$POLICY_REPO/manifests/upstream.lock" <<LOCK
 OPENWRT_REPO="https://example.invalid/openwrt.git"
 OPENWRT_TAG="fixture"
@@ -182,6 +190,7 @@ create_prepared_work() {
   "$REAL_GIT" clone -q "$SOURCE_REPO" "$work_dir"
   mkdir -p "$work_dir/feeds" "$work_dir/package/feeds/packages"
   "$REAL_GIT" clone -q "$FEED_REPO" "$work_dir/feeds/packages"
+  "$REAL_GIT" -C "$work_dir/feeds/packages" apply "$PACKAGES_POLICY_PATCH"
   ln -s ../../../feeds/packages/pkg "$work_dir/package/feeds/packages/pkg"
   printf 'version=1\nflavor=official\nstate=feeds-installed\n' \
     > "$work_dir/.nexawrt-feeds-state"
@@ -240,9 +249,28 @@ run_prepare "$REUSE_WORK" "$REUSE_FETCH_LOG" "$REUSE_HELPER_LOG" >/dev/null
 }
 echo 'fully verified installed feed state offline reuse: OK'
 
+MISSING_PACKAGES_PATCH_WORK="$TMP_DIR/missing-packages-patch-work"
+create_prepared_work "$MISSING_PACKAGES_PATCH_WORK"
+"$REAL_GIT" -C "$MISSING_PACKAGES_PATCH_WORK/feeds/packages" \
+  apply --reverse "$PACKAGES_POLICY_PATCH"
+expect_rebuild_attempt 'missing packages iperf3 patch diff' "$MISSING_PACKAGES_PATCH_WORK"
+echo 'missing packages iperf3 patch diff rebuild fallback: OK'
+
+TAMPERED_PACKAGES_PATCH_WORK="$TMP_DIR/tampered-packages-patch-work"
+create_prepared_work "$TAMPERED_PACKAGES_PATCH_WORK"
+printf 'fixture package differently patched\n' \
+  > "$TAMPERED_PACKAGES_PATCH_WORK/feeds/packages/pkg/Makefile"
+expect_rebuild_attempt 'tampered packages iperf3 patch diff' "$TAMPERED_PACKAGES_PATCH_WORK"
+echo 'tampered packages iperf3 patch diff rebuild fallback: OK'
+
 VALIDATE_POLICY_REPO="$TMP_DIR/validate-policy-repo"
-mkdir -p "$VALIDATE_POLICY_REPO/scripts" "$VALIDATE_POLICY_REPO/manifests"
+mkdir -p "$VALIDATE_POLICY_REPO/scripts" "$VALIDATE_POLICY_REPO/manifests" \
+  "$VALIDATE_POLICY_REPO/patches/packages"
 cp "$ROOT_DIR/scripts/validate.sh" "$VALIDATE_POLICY_REPO/scripts/validate.sh"
+cp "$ROOT_DIR/scripts/complete-git-worktree-diff.sh" \
+  "$VALIDATE_POLICY_REPO/scripts/complete-git-worktree-diff.sh"
+cp "$PACKAGES_POLICY_PATCH" \
+  "$VALIDATE_POLICY_REPO/patches/packages/001-iperf3-avoid-libtool-absolute-rpath.patch"
 cp "$ROOT_DIR/scripts/sanitize-git-environment.sh" "$VALIDATE_POLICY_REPO/scripts/sanitize-git-environment.sh"
 cp "$ROOT_DIR/scripts/git-metadata-policy.sh" "$VALIDATE_POLICY_REPO/scripts/git-metadata-policy.sh"
 cp "$ROOT_DIR/scripts/lock-file-policy.sh" "$VALIDATE_POLICY_REPO/scripts/lock-file-policy.sh"

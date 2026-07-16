@@ -17,6 +17,7 @@ SOURCE_DIR=""
 CHECK_ARTIFACTS=0
 FEED_POLICY_ONLY=0
 REVISION_POLICY_ONLY=0
+PACKAGES_IPERF3_RPATH_PATCH="$ROOT_DIR/patches/packages/001-iperf3-avoid-libtool-absolute-rpath.patch"
 NSS_PACKAGES_SOURCE_PATCH="$ROOT_DIR/patches/nss/001-pin-codelinaro-source-archives.patch"
 COMPLETE_GIT_WORKTREE_DIFF="$ROOT_DIR/scripts/complete-git-worktree-diff.sh"
 
@@ -333,11 +334,20 @@ assert_feed_checkout_clean() {
 
   git -C "$checkout" diff-index --quiet --cached HEAD -- ||
     fail "feed checkout $feed has staged changes"
-  if [[ "$NEXAWRT_FLAVOR" == nss && "$feed" == "$NSS_PACKAGES_FEED" ]]; then
-    [[ -f "$NSS_PACKAGES_SOURCE_PATCH" && -x "$COMPLETE_GIT_WORKTREE_DIFF" ]] ||
-      fail "NSS source archive patch or complete-diff helper is missing"
-    [[ "$("$COMPLETE_GIT_WORKTREE_DIFF" "$checkout")" == "$(cat "$NSS_PACKAGES_SOURCE_PATCH")" ]] ||
-      fail "feed checkout $feed does not contain the exact NexaWrt source archive patch"
+  local expected_patch="" patch_description=""
+  if [[ "$feed" == packages ]]; then
+    expected_patch="$PACKAGES_IPERF3_RPATH_PATCH"
+    patch_description="iperf3 link-stage RPATH patch"
+  elif [[ "$NEXAWRT_FLAVOR" == nss && "$feed" == "$NSS_PACKAGES_FEED" ]]; then
+    expected_patch="$NSS_PACKAGES_SOURCE_PATCH"
+    patch_description="source archive patch"
+  fi
+
+  if [[ -n "$expected_patch" ]]; then
+    [[ -f "$expected_patch" && -x "$COMPLETE_GIT_WORKTREE_DIFF" ]] ||
+      fail "required $patch_description or complete-diff helper is missing"
+    [[ "$("$COMPLETE_GIT_WORKTREE_DIFF" "$checkout")" == "$(cat "$expected_patch")" ]] ||
+      fail "feed checkout $feed does not contain the exact NexaWrt $patch_description"
   else
     git -C "$checkout" diff-files --quiet --ignore-submodules -- ||
       fail "feed checkout $feed is not clean"
@@ -534,6 +544,21 @@ assert_official_nss_matcher() {
     fail "official NSS matcher does not reject the third-party NSS stack"
 }
 
+assert_enabled_kconfig_bool() {
+  local config="$1"
+  local symbol="$2"
+  local description="$3"
+
+  awk -v symbol="$symbol" '
+    $0 == symbol "=y" { enabled++; next }
+    $0 ~ ("^" symbol "=") ||
+      $0 == "# " symbol " is not set" ||
+      $0 ~ ("^# " symbol "=") { unexpected++ }
+    END { exit !(enabled == 1 && unexpected == 0) }
+  ' "$config" ||
+    fail "$description must contain exactly $symbol=y with no conflicting assignment"
+}
+
 assert_common_config() {
   local config="$1"
   local description="$2"
@@ -560,6 +585,8 @@ assert_common_config() {
     fail "$description lost the squashfs target rootfs"
   grep -Fq 'CONFIG_JSON_CYCLONEDX_SBOM=y' "$config" ||
     fail "$description does not enable the CycloneDX image SBOM"
+  assert_enabled_kconfig_bool "$config" CONFIG_REPRODUCIBLE_DEBUG_INFO \
+    "$description reproducible debug information policy"
   grep -Fq 'CONFIG_LUCI_LANG_zh_Hans=y' "$config" ||
     fail "$description lost Simplified Chinese LuCI language"
   for package in luci luci-ssl ca-bundle curl ethtool htop iperf3 nano tcpdump-mini; do
@@ -670,11 +697,31 @@ patch_001="$ROOT_DIR/patches/001-ax9000-single-large-ubi-layout.patch"
 patch_002="$ROOT_DIR/patches/002-ax9000-block-persistent-upgrade.patch"
 patch_003="$ROOT_DIR/patches/003-uboot-envtools-read-only.patch"
 patch_004="$ROOT_DIR/patches/004-reproducible-package-build-inputs.patch"
+patch_005="$ROOT_DIR/patches/005-reproducible-kernel-assembly-debug-paths.patch"
 
+[[ -f "$PACKAGES_IPERF3_RPATH_PATCH" ]] || fail "packages iperf3 RPATH patch is missing"
+assert_patch_has_context "$PACKAGES_IPERF3_RPATH_PATCH"
 assert_patch_has_context "$patch_001"
 assert_patch_has_context "$patch_002"
 assert_patch_has_context "$patch_003"
 assert_patch_has_context "$patch_004"
+assert_patch_has_context "$patch_005"
+[[ "$(grep -c '^diff --git a/net/iperf3/Makefile b/net/iperf3/Makefile$' "$PACKAGES_IPERF3_RPATH_PATCH")" == 1 &&
+   "$(grep -c '^diff --git ' "$PACKAGES_IPERF3_RPATH_PATCH")" == 1 ]] ||
+  fail "packages iperf3 RPATH patch must modify only net/iperf3/Makefile"
+[[ "$(patch_removed_lines "$PACKAGES_IPERF3_RPATH_PATCH")" == 'TARGET_LDFLAGS += -latomic' ]] ||
+  fail "packages iperf3 RPATH patch must remove only the libtool-visible -latomic flag"
+[[ "$(patch_added_lines "$PACKAGES_IPERF3_RPATH_PATCH")" == 'TARGET_LDFLAGS += -Wl,-latomic' ]] ||
+  fail "packages iperf3 RPATH patch must add only the linker-forwarded -latomic flag"
+if grep -Fqi 'patchelf' "$PACKAGES_IPERF3_RPATH_PATCH"; then
+  fail "packages iperf3 RPATH patch must fix linking rather than mutate installed ELF files"
+fi
+[[ "$(grep -c '^diff --git a/include/kernel.mk b/include/kernel.mk$' "$patch_005")" == 1 &&
+   "$(grep -c '^diff --git ' "$patch_005")" == 1 ]] ||
+  fail "kernel assembly debug path patch must modify only include/kernel.mk"
+expected_kernel_asm_remap=$'\tKAFLAGS="$(call iremap,$(BUILD_DIR),$(notdir $(BUILD_DIR)))" \\'
+[[ "$(patch_added_lines "$patch_005")" == "$expected_kernel_asm_remap" ]] ||
+  fail "kernel assembly debug path patch must pass the canonical source remap to KAFLAGS"
 if [[ "$NEXAWRT_FLAVOR" == nss ]]; then
   [[ -f "$NSS_PACKAGES_SOURCE_PATCH" ]] || fail "NSS source archive patch is missing"
   assert_patch_has_context "$NSS_PACKAGES_SOURCE_PATCH"

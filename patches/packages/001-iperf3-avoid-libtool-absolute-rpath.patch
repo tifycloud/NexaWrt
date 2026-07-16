@@ -1,0 +1,13 @@
+diff --git a/net/iperf3/Makefile b/net/iperf3/Makefile
+index 4bd3f7e..75e7a35 100644
+--- a/net/iperf3/Makefile
++++ b/net/iperf3/Makefile
+@@ -58,7 +58,7 @@ define Package/libiperf3
+ endef
+ 
+ TARGET_CFLAGS += -D_GNU_SOURCE
+-TARGET_LDFLAGS += -latomic
++TARGET_LDFLAGS += -Wl,-latomic
+ 
+ ifeq ($(BUILD_VARIANT),ssl)
+ 	CONFIGURE_ARGS += --with-openssl="$(STAGING_DIR)/usr" --disable-shared
