@@ -1,6 +1,7 @@
 .work/
 build.log
 build-nss.log
+/build-*.log
 dist/*
 !dist/.gitkeep
 dist-nss/

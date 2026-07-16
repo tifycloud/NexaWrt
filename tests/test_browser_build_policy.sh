@@ -4,11 +4,13 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
 WORKFLOW="$ROOT_DIR/.github/workflows/build.yml"
 COMPARATOR="$ROOT_DIR/scripts/compare-reproducible-builds.sh"
 HARDWARE_GATE="$ROOT_DIR/scripts/verify-hardware-evidence.sh"
+GITIGNORE="$ROOT_DIR/.gitignore"
 fail() { echo "test_browser_build_policy: $*" >&2; exit 1; }
 require_fixed() { grep -Fq -- "$2" "$1" || fail "missing policy text in ${1#$ROOT_DIR/}: $2"; }
 reject_pattern() { if grep -Eiq -- "$2" "$1"; then fail "forbidden policy pattern in ${1#$ROOT_DIR/}: $2"; fi; }
 
 [[ -f "$WORKFLOW" && ! -L "$WORKFLOW" ]] || fail 'browser build workflow is missing or unsafe'
+[[ -f "$GITIGNORE" && ! -L "$GITIGNORE" ]] || fail '.gitignore is missing or unsafe'
 [[ -x "$COMPARATOR" && -x "$HARDWARE_GATE" ]] || fail 'verification scripts are missing or not executable'
 
 require_fixed "$WORKFLOW" 'workflow_dispatch:'
@@ -18,6 +20,7 @@ require_fixed "$WORKFLOW" 'replica: [a, b]'
 require_fixed "$WORKFLOW" "CLEAN_BUILD: '1'"
 require_fixed "$WORKFLOW" 'WORK_DIR: .work/${{ needs.preflight.outputs.work_basename }}-${{ matrix.replica }}'
 require_fixed "$WORKFLOW" 'BUILD_LOG: ${{ github.workspace }}/build-browser-${{ needs.preflight.outputs.flavor }}-${{ matrix.replica }}.log'
+require_fixed "$GITIGNORE" '/build-*.log'
 require_fixed "$WORKFLOW" "if: github.event_name == 'workflow_dispatch'"
 require_fixed "$WORKFLOW" 'NEXAWRT_APK_SIGNING_PROFILE: production'
 require_fixed "$WORKFLOW" 'manifests/apk-signing-public.pem'
