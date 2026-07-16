@@ -1,23 +1,17 @@
 diff --git a/package/kernel/qca-ssdk/patches/001-reproducible-build-date.patch b/package/kernel/qca-ssdk/patches/001-reproducible-build-date.patch
 new file mode 100644
-index 0000000..7c43a12
+index 0000000..b0caf31
 --- /dev/null
 +++ b/package/kernel/qca-ssdk/patches/001-reproducible-build-date.patch
-@@ -0,0 +1,14 @@
+@@ -0,0 +1,8 @@
 +--- a/make/config.mk
 ++++ b/make/config.mk
-+@@ -136,7 +136,10 @@ endif
-+ VERSION=2.0.0
-+ SUB_VERSION=0
-+ BUILD_NUMBER=0
++@@ -139 +139,4 @@
 +-BUILD_DATE=$(shell date -u  +%F-%T)
 ++ifeq ($(strip $(SOURCE_DATE_EPOCH)),)
 ++$(error SOURCE_DATE_EPOCH is required for reproducible qca-ssdk builds)
 ++endif
 ++BUILD_DATE := $(shell date -u -d "@$(SOURCE_DATE_EPOCH)" +%F-%T)
-+ 
-+ ifeq (TRUE, $(IN_SFP_PHY))
-+   MODULE_TYPE=KSLIB
 diff --git a/package/network/utils/nftables/Makefile b/package/network/utils/nftables/Makefile
 index 0147c4d..ca028f3 100644
 --- a/package/network/utils/nftables/Makefile

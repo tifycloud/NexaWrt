@@ -187,4 +187,32 @@ grep -Fq '+  APK_INDEX_SIGNATURE_ARGS = $(if $(CONFIG_SIGNED_PACKAGES),--sign $(
 grep -Fq '+$(error SOURCE_DATE_EPOCH is required for reproducible qca-ssdk builds)' "$PATCH" || fail 'qca-ssdk does not fail closed without SOURCE_DATE_EPOCH'
 ! sed -n 's/^+//p' "$PATCH" | grep -Fq 'BUILD_DATE := $(shell date -u +%F-%T)' || fail 'qca-ssdk still falls back to wall clock time'
 
+QCA_PATCH="$TMP/qca-reproducible-build-date.patch"
+awk '
+  /^@@ -0,0 \+1,8 @@$/ { capture=1; next }
+  capture && /^diff --git / { exit }
+  capture && /^\+/ { print substr($0, 2) }
+' "$PATCH" > "$QCA_PATCH"
+[[ "$(wc -l < "$QCA_PATCH" | tr -d ' ')" == 8 ]] || fail 'failed to extract qca-ssdk nested patch'
+for qca_variant in legacy current; do
+  qca_root="$TMP/qca-$qca_variant"
+  mkdir -p "$qca_root/make"
+  python3 - "$qca_root/make/config.mk" "$qca_variant" <<'PY'
+from pathlib import Path
+import sys
+path = Path(sys.argv[1])
+variant = sys.argv[2]
+lines = [f"PRELUDE_{index}=1\n" for index in range(1, 136)]
+if variant == "legacy":
+    lines += ["VERSION=2.0.0\n", "SUB_VERSION=0\n", "BUILD_NUMBER=0\n"]
+else:
+    lines += ["VER=3.1.0\n", "BUILD_NUMBER=$(shell cat $(PRJ_PATH)/make/.build_number)\n", "VERSION=$(VER).$(BUILD_NUMBER)\n"]
+lines += ["BUILD_DATE=$(shell date -u  +%F-%T)\n", "POSTLUDE=1\n"]
+path.write_text("".join(lines), encoding="utf-8")
+PY
+  patch -s -d "$qca_root" -p1 < "$QCA_PATCH" || fail "qca-ssdk nested patch rejected $qca_variant source layout"
+  grep -Fq '$(error SOURCE_DATE_EPOCH is required for reproducible qca-ssdk builds)' "$qca_root/make/config.mk" ||
+    fail "qca-ssdk nested patch omitted fail-closed guard for $qca_variant source layout"
+done
+
 echo 'public-only APK identity, committed production anchor, path/tamper safety, and OpenWrt override policy: OK'
