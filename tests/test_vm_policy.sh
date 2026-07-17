@@ -18,6 +18,13 @@ assert_contains() {
   grep -Fq -- "$needle" "$file" || fail "$file is missing required policy text: $needle"
 }
 
+assert_not_contains() {
+  local needle="$1" file="$2"
+  if grep -Fq -- "$needle" "$file"; then
+    fail "$file contains forbidden policy text: $needle"
+  fi
+}
+
 for required in "$LOCK_FILE" "$BUILD_SCRIPT" "$SMOKE_SCRIPT" "$WORKFLOW" \
   "$OVERLAY/etc/nexawrt-vm-smoke" "$OVERLAY/etc/banner" \
   "$OVERLAY/etc/uci-defaults/10-vm-smoke" \
@@ -117,7 +124,10 @@ for required_text in \
   'nss_validation=false'; do
   assert_contains "$required_text" "$SMOKE_SCRIPT"
 done
-assert_contains 'for service_name in ubus dropbear rpcd uhttpd' "$SMOKE_SCRIPT"
+assert_contains 'for service_name in dropbear rpcd uhttpd' "$SMOKE_SCRIPT"
+assert_contains 'test -x "/etc/init.d/$service_name"' "$SMOKE_SCRIPT"
+assert_not_contains 'for service_name in ubus' "$SMOKE_SCRIPT"
+assert_not_contains '/etc/init.d/ubus' "$SMOKE_SCRIPT"
 assert_contains 'http=PASS' "$SMOKE_SCRIPT"
 assert_contains 'ssh=PASS' "$SMOKE_SCRIPT"
 assert_contains 'network=PASS' "$SMOKE_SCRIPT"

@@ -199,7 +199,8 @@ test -n "$gateway"
 ping -c 1 -W 5 "$gateway" >/dev/null
 pass network
 
-for service_name in ubus dropbear rpcd uhttpd; do
+for service_name in dropbear rpcd uhttpd; do
+  test -x "/etc/init.d/$service_name"
   "/etc/init.d/$service_name" running
   printf 'service %s running\n' "$service_name"
 done
