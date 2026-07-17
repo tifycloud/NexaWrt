@@ -128,6 +128,62 @@ assert_contains 'for service_name in dropbear rpcd uhttpd' "$SMOKE_SCRIPT"
 assert_contains 'test -x "/etc/init.d/$service_name"' "$SMOKE_SCRIPT"
 assert_not_contains 'for service_name in ubus' "$SMOKE_SCRIPT"
 assert_not_contains '/etc/init.d/ubus' "$SMOKE_SCRIPT"
+assert_not_contains 'wget ' "$SMOKE_SCRIPT"
+assert_not_contains 'pass http-local' "$SMOKE_SCRIPT"
+for http_policy_text in \
+  'HTTP_STATUS="$OUTPUT_DIR/http-status.txt"' \
+  'HTTP_ERROR="$OUTPUT_DIR/http-error.txt"' \
+  '--location' \
+  '--max-redirs 5' \
+  '--dump-header "$HTTP_HEADERS"' \
+  '--output "$HTTP_BODY"' \
+  '--write-out '"'"'%{http_code}'"'"'' \
+  'curl_status=$?' \
+  'printf '"'"'%s\n'"'"' "$http_status" > "$HTTP_STATUS"' \
+  'dump_http_diagnostics'; do
+  assert_contains "$http_policy_text" "$SMOKE_SCRIPT"
+done
+
+python3 - "$SMOKE_SCRIPT" <<'PY'
+import pathlib
+import re
+import sys
+
+path = pathlib.Path(sys.argv[1])
+text = path.read_text()
+
+def fail(message):
+    print(f"VM policy test failed: {message}", file=sys.stderr)
+    raise SystemExit(1)
+
+function_match = re.search(
+    r"^fail_http\(\) \{\n(?P<body>.*?)^\}$",
+    text,
+    flags=re.MULTILINE | re.DOTALL,
+)
+if function_match is None:
+    fail("smoke script is missing fail_http()")
+function_body = function_match.group("body")
+dump_match = re.search(r"^\s*dump_http_diagnostics\s*$", function_body, re.MULTILINE)
+fail_match = re.search(r'^\s*fail \"\$@\"\s*$', function_body, re.MULTILINE)
+if dump_match is None or fail_match is None:
+    fail("fail_http() must call dump_http_diagnostics and fail \"$@\"")
+if dump_match.start() > fail_match.start():
+    fail("fail_http() must dump HTTP diagnostics before calling fail")
+
+http_start = text.find('http_status="$(curl')
+http_end = text.find('\nSMOKE_STATUS=PASS', http_start)
+if http_start < 0 or http_end < 0:
+    fail("could not isolate runner-side HTTP validation block")
+http_block = text[http_start:http_end]
+fail_http_calls = re.findall(r"^\s*fail_http(?:\s|$)", http_block, re.MULTILINE)
+if len(fail_http_calls) != 3:
+    fail(f"runner-side HTTP validation must contain exactly three fail_http calls, found {len(fail_http_calls)}")
+if re.search(r"^\s*fail(?:\s|$)", http_block, re.MULTILINE):
+    fail("runner-side HTTP validation must not bypass fail_http")
+if re.search(r"^\s*dump_http_diagnostics\s*$", http_block, re.MULTILINE):
+    fail("HTTP failure branches must centralize diagnostic ordering in fail_http")
+PY
 assert_contains 'http=PASS' "$SMOKE_SCRIPT"
 assert_contains 'ssh=PASS' "$SMOKE_SCRIPT"
 assert_contains 'network=PASS' "$SMOKE_SCRIPT"

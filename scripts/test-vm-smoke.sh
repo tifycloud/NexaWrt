@@ -16,6 +16,26 @@ fail() {
   return 1
 }
 
+dump_http_diagnostics() {
+  printf '%s\n' '--- LuCI HTTP diagnostics ---' >&2
+  for diagnostic_file in "$HTTP_STATUS" "$HTTP_ERROR" "$HTTP_HEADERS"; do
+    if [[ -s "$diagnostic_file" ]]; then
+      printf '%s\n' "--- $(basename "$diagnostic_file") ---" >&2
+      cat "$diagnostic_file" >&2 || true
+    fi
+  done
+  if [[ -s "$HTTP_BODY" ]]; then
+    printf '%s\n' '--- http-body.html (last 4096 bytes) ---' >&2
+    tail -c 4096 "$HTTP_BODY" >&2 || true
+    printf '\n' >&2
+  fi
+}
+
+fail_http() {
+  dump_http_diagnostics
+  fail "$@"
+}
+
 [[ $# -eq 3 ]] || { usage; exit 2; }
 TARGET="$1"
 IMAGE_GZ="$(cd "$(dirname "$2")" 2>/dev/null && pwd)/$(basename "$2")"
@@ -27,6 +47,8 @@ SERIAL_LOG="$OUTPUT_DIR/serial.log"
 SSH_LOG="$OUTPUT_DIR/ssh-checks.log"
 HTTP_HEADERS="$OUTPUT_DIR/http-headers.txt"
 HTTP_BODY="$OUTPUT_DIR/http-body.html"
+HTTP_STATUS="$OUTPUT_DIR/http-status.txt"
+HTTP_ERROR="$OUTPUT_DIR/http-error.txt"
 REPORT="$OUTPUT_DIR/smoke-report.txt"
 DISK_IMAGE="$OUTPUT_DIR/disk.img"
 QEMU_PID=""
@@ -56,6 +78,10 @@ cleanup() {
       printf 'nss_validation=false\n'
       printf 'serial_log=%s\n' "$SERIAL_LOG"
       printf 'ssh_log=%s\n' "$SSH_LOG"
+      printf 'http_status_file=%s\n' "$HTTP_STATUS"
+      printf 'http_error_file=%s\n' "$HTTP_ERROR"
+      printf 'http_headers_file=%s\n' "$HTTP_HEADERS"
+      printf 'http_body_file=%s\n' "$HTTP_BODY"
     } > "$REPORT"
     if [[ -s "$SERIAL_LOG" ]]; then
       printf '%s\n' '--- QEMU serial tail ---' >&2
@@ -206,10 +232,8 @@ for service_name in dropbear rpcd uhttpd; do
 done
 pass services
 
-wget -qO /tmp/vm-smoke-luci.html http://127.0.0.1/cgi-bin/luci/
-grep -Eqi 'luci|<html' /tmp/vm-smoke-luci.html
-rm -f /tmp/vm-smoke-luci.html
-pass http-local
+# HTTP is checked once from the runner through QEMU host forwarding. Keeping the
+# request out of the guest avoids depending on minimal-client redirect/status quirks.
 
 check_guard() {
   guard_path="$1"
@@ -240,11 +264,28 @@ then
   exit 1
 fi
 
-http_status="$(curl --silent --show-error --max-time 20 \
+set +e
+http_status="$(curl --silent --show-error \
+  --connect-timeout 5 --max-time 30 \
+  --retry 4 --retry-delay 1 --retry-all-errors \
+  --location --max-redirs 5 \
   --dump-header "$HTTP_HEADERS" --output "$HTTP_BODY" --write-out '%{http_code}' \
-  "http://127.0.0.1:${HTTP_PORT}/cgi-bin/luci/")"
-[[ "$http_status" =~ ^(200|30[1278])$ ]] || { fail "unexpected LuCI HTTP status: $http_status"; exit 1; }
-grep -Eqi 'luci|<html|location:' "$HTTP_BODY" "$HTTP_HEADERS" || { fail "LuCI HTTP response was not recognizable"; exit 1; }
+  "http://127.0.0.1:${HTTP_PORT}/cgi-bin/luci/" 2> "$HTTP_ERROR")"
+curl_status=$?
+set -e
+printf '%s\n' "$http_status" > "$HTTP_STATUS"
+if (( curl_status != 0 )); then
+  fail_http "LuCI HTTP request failed: curl exit $curl_status, HTTP status ${http_status:-unknown}"
+  exit 1
+fi
+if [[ "$http_status" != 200 ]]; then
+  fail_http "unexpected final LuCI HTTP status after redirects: ${http_status:-unknown}"
+  exit 1
+fi
+if ! grep -Eqi 'luci|<html' "$HTTP_BODY"; then
+  fail_http "LuCI HTTP response body was not recognizable"
+  exit 1
+fi
 
 SMOKE_STATUS=PASS
 {
