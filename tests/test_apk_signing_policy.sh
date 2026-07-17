@@ -185,7 +185,48 @@ grep -Fq '+  APK_ROOTFS_TRUST_ARGS := --allow-untrusted' "$PATCH" || fail 'publi
 grep -Fq '+  APK_BUILD_KEY_PREREQUISITES := $(BUILD_KEY_APK_SEC) $(BUILD_KEY_APK_PUB)' "$PATCH" || fail 'default upstream key prerequisites were not preserved'
 grep -Fq '+  APK_INDEX_SIGNATURE_ARGS = $(if $(CONFIG_SIGNED_PACKAGES),--sign $(BUILD_KEY_APK_SEC),)' "$PATCH" || fail 'default upstream index signing was not preserved'
 grep -Fq '+$(error SOURCE_DATE_EPOCH is required for reproducible qca-ssdk builds)' "$PATCH" || fail 'qca-ssdk does not fail closed without SOURCE_DATE_EPOCH'
+grep -Fq $'+\tSOURCE_DATE_EPOCH=0 $(FAKEROOT) $(STAGING_DIR_HOST)/bin/apk mkpkg \\' "$PATCH" ||
+  fail 'OpenWrt patch lacks the APK timestamp-elision backport'
 ! sed -n 's/^+//p' "$PATCH" | grep -Fq 'BUILD_DATE := $(shell date -u +%F-%T)' || fail 'qca-ssdk still falls back to wall clock time'
+
+APK_PACKAGE_PACK_PATCH="$TMP/apk-package-pack-reproducibility.patch"
+awk '
+  $0 == "diff --git a/include/package-pack.mk b/include/package-pack.mk" { capture=1 }
+  capture && /^diff --git / && $0 != "diff --git a/include/package-pack.mk b/include/package-pack.mk" { exit }
+  capture { print }
+' "$PATCH" > "$APK_PACKAGE_PACK_PATCH"
+grep -Fq 'diff --git a/include/package-pack.mk b/include/package-pack.mk' "$APK_PACKAGE_PACK_PATCH" ||
+  fail 'failed to extract APK package timestamp backport'
+
+APK_PACKAGE_PACK_ROOT="$TMP/apk-package-pack-root"
+mkdir -p "$APK_PACKAGE_PACK_ROOT/include"
+awk 'BEGIN { for (i = 1; i <= 588; i++) print "# fixture padding" }' \
+  > "$APK_PACKAGE_PACK_ROOT/include/package-pack.mk"
+cat >> "$APK_PACKAGE_PACK_ROOT/include/package-pack.mk" <<'EOF'
+else
+
+	if [ -z "$$$$(ls -A $$(IDIR_$(1))/CONTROL 2>/dev/null)" ]; then \
+		rm -rf $$(IDIR_$(1))/CONTROL; \
+	else \
+		echo "CONTROL directory $$(IDIR_$(1))/CONTROL is not empty! This is not right and should be checked!" >&2; \
+		exit 1; \
+	fi
+
+	$(FAKEROOT) $(STAGING_DIR_HOST)/bin/apk mkpkg \
+	  --info "name:$(1)$$(ABIV_$(1))" \
+	  --info "version:$(VERSION)" \
+	  $$(if $$(ABIV_$(1)),--info "tags:openwrt:abiversion=$$(ABIV_$(1))") \
+	  --output "$$(PACK_$(1))"
+endif
+EOF
+patch -s -d "$APK_PACKAGE_PACK_ROOT" -p1 < "$APK_PACKAGE_PACK_PATCH" ||
+  fail 'APK timestamp-elision backport rejected the locked package-pack source layout'
+grep -Fq $'\tSOURCE_DATE_EPOCH=0 $(FAKEROOT) $(STAGING_DIR_HOST)/bin/apk mkpkg \\' \
+  "$APK_PACKAGE_PACK_ROOT/include/package-pack.mk" ||
+  fail 'applied package-pack source does not suppress APK entry timestamps'
+! grep -Fq $'\t$(FAKEROOT) $(STAGING_DIR_HOST)/bin/apk mkpkg \\' \
+  "$APK_PACKAGE_PACK_ROOT/include/package-pack.mk" ||
+  fail 'applied package-pack source still invokes apk mkpkg without timestamp suppression'
 
 QCA_PATCH="$TMP/qca-reproducible-build-date.patch"
 awk '
@@ -215,4 +256,4 @@ PY
     fail "qca-ssdk nested patch omitted fail-closed guard for $qca_variant source layout"
 done
 
-echo 'public-only APK identity, committed production anchor, path/tamper safety, and OpenWrt override policy: OK'
+echo 'public-only APK identity, timestamp-free package metadata, committed production anchor, path/tamper safety, and OpenWrt override policy: OK'

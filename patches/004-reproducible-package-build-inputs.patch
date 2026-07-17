@@ -25,6 +25,19 @@ index 0147c4d..ca028f3 100644
  CONFIGURE_ARGS += \
          --disable-debug \
          --disable-man-doc \
+diff --git a/include/package-pack.mk b/include/package-pack.mk
+index 9cb64d3..7c2998f 100644
+--- a/include/package-pack.mk
++++ b/include/package-pack.mk
+@@ -589,7 +589,7 @@ else
+ 		exit 1; \
+ 	fi
+ 
+-	$(FAKEROOT) $(STAGING_DIR_HOST)/bin/apk mkpkg \
++	SOURCE_DATE_EPOCH=0 $(FAKEROOT) $(STAGING_DIR_HOST)/bin/apk mkpkg \
+ 	  --info "name:$(1)$$(ABIV_$(1))" \
+ 	  --info "version:$(VERSION)" \
+ 	  $$(if $$(ABIV_$(1)),--info "tags:openwrt:abiversion=$$(ABIV_$(1))") \
 diff --git a/package/Makefile b/package/Makefile
 index c50f81b..5defeb4 100644
 --- a/package/Makefile
