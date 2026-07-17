@@ -1,0 +1,7 @@
+# shellcheck shell=sh
+# OpenWrt ImageBuilders used only for architecture-neutral VM smoke images.
+VM_OPENWRT_VERSION="25.12.5"
+VM_X86_64_IMAGEBUILDER_URL="https://downloads.openwrt.org/releases/25.12.5/targets/x86/64/openwrt-imagebuilder-25.12.5-x86-64.Linux-x86_64.tar.zst"
+VM_X86_64_IMAGEBUILDER_SHA256="313221253d9bac534e4a4ee6492a4941b4ba0f43200eceb8d16a4785470ae9df"
+VM_ARMSR_ARMV8_IMAGEBUILDER_URL="https://downloads.openwrt.org/releases/25.12.5/targets/armsr/armv8/openwrt-imagebuilder-25.12.5-armsr-armv8.Linux-x86_64.tar.zst"
+VM_ARMSR_ARMV8_IMAGEBUILDER_SHA256="225243a1963f05c98f6d0f3a0c4b62c5a267ef505fc6df0c262a588603f53c4c"

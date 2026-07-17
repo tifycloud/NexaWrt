@@ -1,0 +1,15 @@
+{
+  "flavors": {
+    "nss": {
+      "history": [],
+      "latest": null
+    },
+    "official": {
+      "history": [],
+      "latest": null
+    }
+  },
+  "generated_at": "1970-01-01T00:00:00Z",
+  "repository": "tifycloud/NexaWrt",
+  "schema_version": 1
+}

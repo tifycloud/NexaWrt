@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
-ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"; BUILD="$ROOT_DIR/.github/workflows/build.yml"; RELEASE="$ROOT_DIR/.github/workflows/release.yml"
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"; BUILD="$ROOT_DIR/.github/workflows/build.yml"; RELEASE="$ROOT_DIR/.github/workflows/release.yml"; RELEASE_DOCS="$ROOT_DIR/docs/RELEASES.md"
 for workflow in "$BUILD" "$RELEASE"; do
   while read -r use; do
     [[ "$use" =~ @[0-9a-f]{40}$ ]] || { echo "workflow action is not pinned to a full commit: $use" >&2; exit 1; }
@@ -13,21 +13,120 @@ grep -Fq 'shellcheck -S warning' "$RELEASE"
 grep -Fq 'merge_group:' "$BUILD"
 grep -Fq 'branches: [main]' "$BUILD"
 grep -Fq 'permissions: {}' "$RELEASE"
+grep -Fq -- "-H 'X-GitHub-Api-Version: 2026-03-10'" "$RELEASE"
+grep -Fq 'IMMUTABLE_RELEASES_READ_TOKEN: ${{ secrets.IMMUTABLE_RELEASES_READ_TOKEN }}' "$RELEASE"
+grep -Fq 'test -n "$IMMUTABLE_RELEASES_READ_TOKEN"' "$RELEASE"
+grep -Fq 'GH_TOKEN="$IMMUTABLE_RELEASES_READ_TOKEN" gh api \' "$RELEASE"
+grep -Fq '"repos/$GITHUB_REPOSITORY/immutable-releases"' "$RELEASE"
+grep -Fq -- "--jq 'select(.enabled == true) | .enabled' | grep -Fxq true" "$RELEASE"
+[[ "$(grep -Fc 'IMMUTABLE_RELEASES_READ_TOKEN' "$RELEASE")" == 3 ]] || {
+  echo 'immutable releases read secret is referenced outside its isolated step contract' >&2; exit 1
+}
+python3 - "$RELEASE" <<'PY_IMMUTABLE_STEP_POLICY'
+import pathlib
+import sys
+
+lines = pathlib.Path(sys.argv[1]).read_text(encoding="utf-8").splitlines()
+step_starts = [i for i, line in enumerate(lines) if line.startswith("      - name: ")]
+
+def step(name: str) -> tuple[int, int, list[str]]:
+    start = next(i for i in step_starts if lines[i] == f"      - name: {name}")
+    end = next((i for i in step_starts if i > start), len(lines))
+    return start, end, lines[start:end]
+
+checkout_start, checkout_end, checkout = step("Checkout trusted tag")
+immutable_start, immutable_end, immutable = step("Require repository immutable releases")
+tag_start, tag_end, tag_policy = step("Verify trusted tag, derive flavor, and run policy tests")
+if not checkout_start < immutable_start < tag_start:
+    raise SystemExit("immutable secret step is not between trusted checkout and tag policy")
+secret_name = "IMMUTABLE_RELEASES_READ_TOKEN"
+secret_lines = [i for i, line in enumerate(lines) if secret_name in line]
+if len(secret_lines) != 3 or not all(immutable_start < i < immutable_end for i in secret_lines):
+    raise SystemExit("immutable releases secret escaped its dedicated step")
+if any(secret_name in line for line in checkout + tag_policy):
+    raise SystemExit("checkout or tag policy step inherited the immutable releases secret")
+immutable_text = "\n".join(immutable)
+tag_text = "\n".join(tag_policy)
+for required in (
+    "IMMUTABLE_RELEASES_READ_TOKEN: ${{ secrets.IMMUTABLE_RELEASES_READ_TOKEN }}",
+    'test -n "$IMMUTABLE_RELEASES_READ_TOKEN"',
+    'GH_TOKEN="$IMMUTABLE_RELEASES_READ_TOKEN" gh api',
+    '"repos/$GITHUB_REPOSITORY/immutable-releases"',
+):
+    if required not in immutable_text:
+        raise SystemExit(f"immutable step is missing required isolation control: {required}")
+if "GH_TOKEN: ${{ github.token }}" in immutable_text:
+    raise SystemExit("immutable secret step also received the normal workflow token")
+for required in (
+    "id: release_identity",
+    "GH_TOKEN: ${{ github.token }}",
+    "official_tag_pattern=",
+    "release_tag_is_absent()",
+    'release_tag_is_absent "$GITHUB_REF_NAME"',
+    'NEXAWRT_FLAVOR="$flavor" ./tests/test_static.sh',
+):
+    if required not in tag_text:
+        raise SystemExit(f"tag policy step is missing required operation: {required}")
+PY_IMMUTABLE_STEP_POLICY
 grep -Fq 'cancel-in-progress: false' "$RELEASE"
 tag_entry_count="$(awk '/^    tags:/{tags=1; next} tags && /^      - /{count++; next} tags{exit} END{print count+0}' "$RELEASE")"
 [[ "$tag_entry_count" == 2 ]] || { echo 'release workflow exposes an unexpected tag trigger' >&2; exit 1; }
 [[ "$(grep -Ec "^[[:space:]]+- 'ram-test(-nss)?-v\*'" "$RELEASE")" == 2 ]] || { echo 'release workflow does not expose exactly the official and NSS tag families' >&2; exit 1; }
 grep -Fq -- "- 'ram-test-v*'" "$RELEASE"
 grep -Fq -- "- 'ram-test-nss-v*'" "$RELEASE"
-grep -Fq '^ram-test-v[0-9][0-9A-Za-z._-]*$' "$RELEASE"
-grep -Fq '^ram-test-nss-v[0-9][0-9A-Za-z._-]*$' "$RELEASE"
-official_tag_pattern='^ram-test-v[0-9][0-9A-Za-z._-]*$'
-nss_tag_pattern='^ram-test-nss-v[0-9][0-9A-Za-z._-]*$'
-[[ ram-test-v1.2.3 =~ $official_tag_pattern ]]
-[[ ram-test-nss-v1.2.3-rc1 =~ $nss_tag_pattern ]]
-for untrusted_tag in ram-test-v ram-test-nss-v ram-test-debug-v1 ram-test-v1/other ram-test-nss-v1/other; do
+official_tag_pattern='^ram-test-(v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)-rc\.(0|[1-9][0-9]*))$'
+nss_tag_pattern='^ram-test-nss-(v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)-rc\.(0|[1-9][0-9]*))$'
+grep -Fq "official_tag_pattern='$official_tag_pattern'" "$RELEASE"
+grep -Fq "nss_tag_pattern='$nss_tag_pattern'" "$RELEASE"
+while IFS='|' read -r trusted_tag expected_flavor expected_version; do
+  if [[ "$trusted_tag" =~ $official_tag_pattern ]]; then
+    actual_flavor=official
+    actual_version="${BASH_REMATCH[1]}"
+  elif [[ "$trusted_tag" =~ $nss_tag_pattern ]]; then
+    actual_flavor=nss
+    actual_version="${BASH_REMATCH[1]}"
+  else
+    echo "trusted versioned prerelease tag was rejected: $trusted_tag" >&2
+    exit 1
+  fi
+  [[ "$actual_flavor" == "$expected_flavor" ]] || { echo "wrong flavor for $trusted_tag" >&2; exit 1; }
+  [[ "$actual_version" == "$expected_version" ]] || { echo "wrong release version for $trusted_tag" >&2; exit 1; }
+done <<'TRUSTED_TAGS'
+ram-test-v0.0.0-rc.0|official|v0.0.0-rc.0
+ram-test-v1.2.3-rc.4|official|v1.2.3-rc.4
+ram-test-v10.20.300-rc.40|official|v10.20.300-rc.40
+ram-test-nss-v0.0.0-rc.0|nss|v0.0.0-rc.0
+ram-test-nss-v1.2.3-rc.4|nss|v1.2.3-rc.4
+ram-test-nss-v10.20.300-rc.40|nss|v10.20.300-rc.40
+TRUSTED_TAGS
+while IFS= read -r untrusted_tag; do
   ! [[ "$untrusted_tag" =~ $official_tag_pattern || "$untrusted_tag" =~ $nss_tag_pattern ]] || { echo "untrusted tag matches a release flavor: $untrusted_tag" >&2; exit 1; }
-done
+done <<'UNTRUSTED_TAGS'
+ram-test-v
+ram-test-nss-v
+ram-test-v1
+ram-test-v1.2.3
+ram-test-v1.2.3-rc
+ram-test-v1.2.3-rc1
+ram-test-v1.2.3-rc.
+ram-test-v1.2.3-rc.01
+ram-test-v01.2.3-rc.1
+ram-test-v1.02.3-rc.1
+ram-test-v1.2.03-rc.1
+ram-test-v1.2.3-rc.1-extra
+ram-test-v1.2.3-RC.1
+ram-test-v1_2_3-rc.1
+ram-test-v1.2.3.rc.1
+ram-test-v1.2.3-rc.-1
+ram-test-v1.2.3-rc.+1
+ram-test-v1.2.3-rc.1/other
+ram-test-nss-v01.2.3-rc.1
+ram-test-nss-v1.02.3-rc.1
+ram-test-nss-v1.2.03-rc.1
+ram-test-nss-v1.2.3-rc.01
+ram-test-nss-v1.2.3-rc.1-extra
+ram-test-debug-v1.2.3-rc.1
+UNTRUSTED_TAGS
 workflow_tmp="$(mktemp -d)"
 trap 'rm -rf "$workflow_tmp"' EXIT
 python3 - "$RELEASE" "$workflow_tmp/release-helper.sh" <<'PY_RELEASE_HELPER'
@@ -78,6 +177,76 @@ for fixture in auth network rate-limit host-not-found; do
   fi
   grep -Fq 'Unable to determine whether release exists' "$workflow_tmp/stderr"
 done
+python3 - "$RELEASE" "$workflow_tmp/final-release-check.py" <<'PY_FINAL_RELEASE_HELPER'
+import pathlib
+import sys
+
+source = pathlib.Path(sys.argv[1]).read_text(encoding="utf-8").splitlines()
+start = next(
+    i for i, line in enumerate(source)
+    if line.strip() == "python3 - \"$final_release\" \"$GITHUB_REF_NAME\" \"$RELEASE_FLAVOR\" \"$RELEASE_VERSION\" <<'PY'"
+)
+body = []
+for line in source[start + 1:]:
+    if line.strip() == "PY":
+        break
+    if not line:
+        body.append("")
+        continue
+    if not line.startswith("          "):
+        raise SystemExit("final release assertion indentation is unsafe")
+    body.append(line[10:])
+else:
+    raise SystemExit("final release assertion terminator is missing")
+pathlib.Path(sys.argv[2]).write_text("\n".join(body) + "\n", encoding="utf-8")
+PY_FINAL_RELEASE_HELPER
+python3 - "$workflow_tmp" <<'PY_FINAL_RELEASE_FIXTURES'
+import json
+import pathlib
+import sys
+
+root = pathlib.Path(sys.argv[1])
+tag = "ram-test-v1.2.3-rc.4"
+archive = "NexaWrt-AX9000-official-v1.2.3-rc.4-verified-dist.tar.gz"
+assets = [
+    {"name": archive, "state": "uploaded", "size": 100},
+    {"name": f"{archive}.sha256", "state": "uploaded", "size": 101},
+    {"name": "archive.provenance.bundle.json", "state": "uploaded", "size": 102},
+    {"name": "checksums.provenance.bundle.json", "state": "uploaded", "size": 103},
+    {"name": "firmware.provenance.bundle.json", "state": "uploaded", "size": 104},
+    {"name": "sbom.provenance.bundle.json", "state": "uploaded", "size": 105},
+]
+valid = {
+    "draft": False,
+    "prerelease": True,
+    "immutable": True,
+    "tag_name": tag,
+    "published_at": "2026-07-17T01:02:03Z",
+    "assets": assets,
+}
+fixtures = {
+    "valid": valid,
+    "draft": {**valid, "draft": True},
+    "prerelease": {**valid, "prerelease": False},
+    "mutable": {**valid, "immutable": False},
+    "tag": {**valid, "tag_name": "ram-test-v1.2.3-rc.5"},
+    "published-null": {**valid, "published_at": None},
+    "published-format": {**valid, "published_at": "2026-07-17"},
+    "asset-extra": {**valid, "assets": [*assets, {"name": "sysupgrade.bin", "state": "uploaded", "size": 1}]},
+    "asset-missing": {**valid, "assets": assets[:-1]},
+    "asset-duplicate": {**valid, "assets": [*assets[:-1], assets[-2]]},
+    "asset-state": {**valid, "assets": [*assets[:-1], {**assets[-1], "state": "new"}]},
+    "asset-size": {**valid, "assets": [*assets[:-1], {**assets[-1], "size": 0}]},
+}
+for name, value in fixtures.items():
+    (root / f"final-{name}.json").write_text(json.dumps(value), encoding="utf-8")
+PY_FINAL_RELEASE_FIXTURES
+python3 "$workflow_tmp/final-release-check.py" "$workflow_tmp/final-valid.json" ram-test-v1.2.3-rc.4 official v1.2.3-rc.4
+for fixture in draft prerelease mutable tag published-null published-format asset-extra asset-missing asset-duplicate asset-state asset-size; do
+  if python3 "$workflow_tmp/final-release-check.py" "$workflow_tmp/final-$fixture.json" ram-test-v1.2.3-rc.4 official v1.2.3-rc.4 >"$workflow_tmp/stdout" 2>"$workflow_tmp/stderr"; then
+    echo "final release assertion accepted invalid state: $fixture" >&2; exit 1
+  fi
+done
 grep -Fq 'Untrusted release tag name' "$RELEASE"
 grep -Fq 'flavor=official' "$RELEASE"
 grep -Fq 'flavor=nss' "$RELEASE"
@@ -86,7 +255,12 @@ grep -Fq 'work_basename=openwrt-nss' "$RELEASE"
 grep -Fq 'staging_basename=dist' "$RELEASE"
 grep -Fq 'staging_basename=dist-nss' "$RELEASE"
 grep -Fq 'flavor: ${{ steps.release_identity.outputs.flavor }}' "$RELEASE"
+grep -Fq 'release_version: ${{ steps.release_identity.outputs.release_version }}' "$RELEASE"
+grep -Fq 'release_version="${BASH_REMATCH[1]}"' "$RELEASE"
+grep -Fq "printf 'flavor=%s\nrelease_version=%s\nwork_basename=%s\nstaging_basename=%s\n'" "$RELEASE"
+grep -Fq '"$flavor" "$release_version" "$work_basename" "$staging_basename" >> "$GITHUB_OUTPUT"' "$RELEASE"
 grep -Fq 'NEXAWRT_FLAVOR: ${{ needs.preflight.outputs.flavor }}' "$RELEASE"
+grep -Fq 'RELEASE_VERSION: ${{ needs.preflight.outputs.release_version }}' "$RELEASE"
 grep -Fq 'NEXAWRT_BUILD_REPLICA: ${{ matrix.replica }}' "$RELEASE"
 ! grep -Eq 'NEXAWRT_APK_SIGNING_KEY_PEM|NEXAWRT_APK_SIGNING_KEY_FILE|BUILD_KEY_APK_SEC|secrets\.NEXAWRT_APK_SIGNING' "$RELEASE" || {
   echo 'release workflow still references APK private or secret signing material' >&2; exit 1
@@ -118,10 +292,36 @@ grep -Fq 'release-staging/verified-dist' "$RELEASE"
 grep -Fq 'environment: ram-test-release' "$RELEASE"
 grep -Fq 'grep -Fxq "flavor=$RELEASE_FLAVOR"' "$RELEASE"
 grep -Fq "grep -Fq 'initramfs RAM-boot candidate only.'" "$RELEASE"
-grep -Fq 'git cat-file -t "refs/tags/$GITHUB_REF_NAME"' "$RELEASE"
+grep -Fq 'test "$(git cat-file -t "refs/tags/$GITHUB_REF_NAME")" = commit' "$RELEASE"
+grep -Fq 'test "$(git rev-parse "refs/tags/$GITHUB_REF_NAME")" = "$GITHUB_SHA"' "$RELEASE"
 grep -Fq 'git/ref/tags/$GITHUB_REF_NAME' "$RELEASE"
+grep -Fq 'test "$remote_type" = commit' "$RELEASE"
 grep -Fq 'test "$remote_sha" = "$GITHUB_SHA"' "$RELEASE"
-grep -Fq 'gh release create "$GITHUB_REF_NAME" --verify-tag --draft --prerelease' "$RELEASE"
+grep -Fq 'gh release create "$GITHUB_REF_NAME" --verify-tag --draft --prerelease --latest=false' "$RELEASE"
+grep -Fq 'gh release edit "$GITHUB_REF_NAME" --draft=false --prerelease --latest=false' "$RELEASE"
+[[ "$(grep -Fc -- '--latest=false' "$RELEASE")" == 2 ]] || { echo 'release create and publish do not both explicitly disable latest' >&2; exit 1; }
+grep -Fq 'official) release_title="NexaWrt AX9000 $RELEASE_VERSION RAM-test prerelease"' "$RELEASE"
+grep -Fq 'nss) release_title="NexaWrt AX9000 NSS $RELEASE_VERSION RAM-test prerelease"' "$RELEASE"
+grep -Fq -- '--title "$release_title"' "$RELEASE"
+! grep -Fq -- '--title "$GITHUB_REF_NAME"' "$RELEASE"
+grep -Fq 'release.get("draft") is not False' "$RELEASE"
+grep -Fq 'release.get("prerelease") is not True' "$RELEASE"
+grep -Fq 'release.get("immutable") is not True' "$RELEASE"
+grep -Fq 'published release asset count is not exact' "$RELEASE"
+grep -Fq 'published release asset names are not the exact expected set' "$RELEASE"
+grep -Fq 'release.get("tag_name") != expected_tag' "$RELEASE"
+grep -Fq 'published_at = release.get("published_at")' "$RELEASE"
+grep -Fq 'published release has no valid published_at timestamp' "$RELEASE"
+grep -Fq '"repos/$GITHUB_REPOSITORY/releases/tags/$GITHUB_REF_NAME" > "$final_release"' "$RELEASE"
+test -f "$RELEASE_DOCS"
+grep -Fq 'ram-test-vMAJOR.MINOR.PATCH-rc.N' "$RELEASE_DOCS"
+grep -Fq 'ram-test-nss-vMAJOR.MINOR.PATCH-rc.N' "$RELEASE_DOCS"
+grep -Fq 'lightweight tags' "$RELEASE_DOCS"
+grep -Fq 'NexaWrt-AX9000-official-v1.4.0-rc.1-verified-dist.tar.gz.sha256' "$RELEASE_DOCS"
+grep -Fq 'NexaWrt-AX9000-nss-v1.4.0-rc.1-verified-dist.tar.gz.sha256' "$RELEASE_DOCS"
+grep -Fq '## Release procedure' "$RELEASE_DOCS"
+grep -Fq '## Draft recovery' "$RELEASE_DOCS"
+grep -Fq 'gh release delete "$tag" --yes' "$RELEASE_DOCS"
 grep -Fq 'attestations: write' "$RELEASE"
 [[ "$(grep -c '^      artifact-metadata: write$' "$RELEASE")" == 2 ]] || { echo 'release artifact metadata write permission is not limited to producer and publish jobs' >&2; exit 1; }
 grep -Fq 'actions/attest-build-provenance@96278af6caaf10aea03fd8d33a09a777ca52d62f' "$RELEASE"
@@ -196,7 +396,10 @@ grep -Fq -- '-C release-staging -cf - verified-dist | gzip -9n > "release-stagin
 grep -Fq 'sha256sum "$archive_basename" > "$archive_basename.sha256"' "$RELEASE"
 grep -Fq 'sha256sum -c "$archive_basename.sha256"' "$RELEASE"
 grep -Fq 'tar -xzf "release-staging/publish/$archive_basename" -C "$extract_dir"' "$RELEASE"
-grep -Fq 'subject-path: release-staging/publish/NexaWrt-AX9000-${{ needs.preflight.outputs.flavor }}-verified-dist.tar.gz' "$RELEASE"
+grep -Fq 'archive_basename="NexaWrt-AX9000-${RELEASE_FLAVOR}-${RELEASE_VERSION}-verified-dist.tar.gz"' "$RELEASE"
+grep -Fq 'subject-path: release-staging/publish/NexaWrt-AX9000-${{ needs.preflight.outputs.flavor }}-${{ needs.preflight.outputs.release_version }}-verified-dist.tar.gz' "$RELEASE"
+! grep -Fq 'NexaWrt-AX9000-${RELEASE_FLAVOR}-verified-dist.tar.gz' "$RELEASE"
+! grep -Fq 'NexaWrt-AX9000-${{ needs.preflight.outputs.flavor }}-verified-dist.tar.gz' "$RELEASE"
 [[ "$(grep -Ec "cp .*release-staging/publish/[a-z]+\.provenance\.bundle\.json$" "$RELEASE")" == 4 ]] || {
   echo 'all provenance bundles are not copied into publish' >&2; exit 1
 }
@@ -217,8 +420,12 @@ extract_line="$(awk 'index($0, "tar -xzf \"release-staging/publish/$archive_base
 unpacked_verify_line="$(awk 'index($0, "--verify-verified-dist \"$extract_dir/verified-dist\"") { print NR; exit }' "$RELEASE")"
 last_bundle_copy_line="$(awk 'index($0, "release-staging/publish/archive.provenance.bundle.json") { print NR; exit }' "$RELEASE")"
 release_create_line="$(awk 'index($0, "gh release create \"$GITHUB_REF_NAME\"") { print NR; exit }' "$RELEASE")"
-(( publish_line < checkout_policy_line && checkout_policy_line < source_verify_first_line && source_verify_first_line < archive_line && archive_line < checksum_line && checksum_line < extract_line && extract_line < unpacked_verify_line && unpacked_verify_line < last_bundle_copy_line && last_bundle_copy_line < source_verify_last_line && source_verify_last_line < release_create_line )) || {
-  echo 'verified-dist archive/checksum/unpack/reverification/release ordering is unsafe' >&2; exit 1
+release_edit_line="$(awk 'index($0, "gh release edit \"$GITHUB_REF_NAME\"") { print NR; exit }' "$RELEASE")"
+final_fetch_line="$(awk 'index($0, "releases/tags/$GITHUB_REF_NAME\" > \"$final_release\"") { print NR; exit }' "$RELEASE")"
+final_state_line="$(awk 'index($0, "release.get(\"draft\") is not False") { print NR; exit }' "$RELEASE")"
+published_at_line="$(awk 'index($0, "published_at = release.get(\"published_at\")") { print NR; exit }' "$RELEASE")"
+(( publish_line < checkout_policy_line && checkout_policy_line < source_verify_first_line && source_verify_first_line < archive_line && archive_line < checksum_line && checksum_line < extract_line && extract_line < unpacked_verify_line && unpacked_verify_line < last_bundle_copy_line && last_bundle_copy_line < source_verify_last_line && source_verify_last_line < release_create_line && release_create_line < release_edit_line && release_edit_line < final_fetch_line && final_fetch_line < final_state_line && final_state_line < published_at_line )) || {
+  echo 'verified-dist packaging, exact asset verification, publication, and final-state verification ordering is unsafe' >&2; exit 1
 }
 
 [[ "$(grep -c 'contents: write' "$RELEASE")" == 1 ]] || { echo 'release write permission is not isolated to one job' >&2; exit 1; }

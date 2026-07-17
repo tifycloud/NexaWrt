@@ -1,0 +1,19 @@
+#!/bin/sh
+set -eu
+
+uci -q batch <<'UCI'
+set system.@system[0].hostname='nexawrt-vm-smoke'
+delete network.lan
+set network.lan='interface'
+set network.lan.device='eth0'
+set network.lan.proto='dhcp'
+set uhttpd.main.redirect_https='0'
+set dropbear.@dropbear[0].PasswordAuth='off'
+set dropbear.@dropbear[0].RootPasswordAuth='off'
+commit system
+commit network
+commit uhttpd
+commit dropbear
+UCI
+
+exit 0

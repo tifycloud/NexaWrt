@@ -1,0 +1,4 @@
+#!/bin/sh
+command_name="${1##*/}"
+printf '%s\n' "NexaWrt VM-only safety guard: ${command_name} is disabled (NOT-AX9000; not hardware/NSS validation)." >&2
+exit 74
