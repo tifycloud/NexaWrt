@@ -36,6 +36,48 @@ fail_http() {
   fail "$@"
 }
 
+http_status_is_healthy() {
+  local status="$1"
+  local auth_challenge="$2"
+
+  [[ "$status" == 200 || ( "$status" == 403 && "$auth_challenge" == true ) ]]
+}
+
+luci_auth_challenge_from_headers() {
+  python3 - "$1" <<'PY'
+import pathlib
+import re
+import sys
+
+header_path = pathlib.Path(sys.argv[1])
+try:
+    header_bytes = header_path.read_bytes()
+except OSError:
+    print("false")
+    raise SystemExit(0)
+
+final_headers = None
+for block in re.split(br"\r?\n\r?\n", header_bytes):
+    lines = block.splitlines()
+    if lines and re.match(br"^HTTP/\S+\s+\d{3}(?:\s|$)", lines[0], re.IGNORECASE):
+        final_headers = lines[1:]
+
+auth_challenge = False
+if final_headers is not None:
+    for line in final_headers:
+        name, separator, value = line.partition(b":")
+        if (
+            separator
+            and name.strip().lower() == b"x-luci-login-required"
+            and value.strip().lower() == b"yes"
+        ):
+            auth_challenge = True
+            break
+
+print("true" if auth_challenge else "false")
+PY
+}
+
 [[ $# -eq 3 ]] || { usage; exit 2; }
 TARGET="$1"
 IMAGE_GZ="$(cd "$(dirname "$2")" 2>/dev/null && pwd)/$(basename "$2")"
@@ -53,6 +95,8 @@ REPORT="$OUTPUT_DIR/smoke-report.txt"
 DISK_IMAGE="$OUTPUT_DIR/disk.img"
 QEMU_PID=""
 SMOKE_STATUS="FAIL"
+http_status="unknown"
+auth_challenge="false"
 
 cleanup() {
   rc=$?
@@ -82,6 +126,8 @@ cleanup() {
       printf 'http_error_file=%s\n' "$HTTP_ERROR"
       printf 'http_headers_file=%s\n' "$HTTP_HEADERS"
       printf 'http_body_file=%s\n' "$HTTP_BODY"
+      printf 'http_status=%s\n' "${http_status:-unknown}"
+      printf 'auth_challenge=%s\n' "$auth_challenge"
     } > "$REPORT"
     if [[ -s "$SERIAL_LOG" ]]; then
       printf '%s\n' '--- QEMU serial tail ---' >&2
@@ -274,12 +320,13 @@ http_status="$(curl --silent --show-error \
 curl_status=$?
 set -e
 printf '%s\n' "$http_status" > "$HTTP_STATUS"
+auth_challenge="$(luci_auth_challenge_from_headers "$HTTP_HEADERS")"
 if (( curl_status != 0 )); then
   fail_http "LuCI HTTP request failed: curl exit $curl_status, HTTP status ${http_status:-unknown}"
   exit 1
 fi
-if [[ "$http_status" != 200 ]]; then
-  fail_http "unexpected final LuCI HTTP status after redirects: ${http_status:-unknown}"
+if ! http_status_is_healthy "$http_status" "$auth_challenge"; then
+  fail_http "unexpected final LuCI HTTP response: status ${http_status:-unknown}, auth challenge $auth_challenge"
   exit 1
 fi
 if ! grep -Eqi 'luci|<html' "$HTTP_BODY"; then
@@ -305,5 +352,6 @@ SMOKE_STATUS=PASS
   printf 'services=PASS\n'
   printf 'dangerous_command_guards=PASS\n'
   printf 'http_status=%s\n' "$http_status"
+  printf 'auth_challenge=%s\n' "$auth_challenge"
 } > "$REPORT"
 printf 'VM smoke test PASS for %s. This is not hardware or NSS validation.\n' "$TARGET"

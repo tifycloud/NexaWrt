@@ -140,6 +140,9 @@ for http_policy_text in \
   '--write-out '"'"'%{http_code}'"'"'' \
   'curl_status=$?' \
   'printf '"'"'%s\n'"'"' "$http_status" > "$HTTP_STATUS"' \
+  'x-luci-login-required' \
+  'http_status_is_healthy' \
+  'printf '"'"'auth_challenge=%s\n'"'"' "$auth_challenge"' \
   'dump_http_diagnostics'; do
   assert_contains "$http_policy_text" "$SMOKE_SCRIPT"
 done
@@ -147,7 +150,9 @@ done
 python3 - "$SMOKE_SCRIPT" <<'PY'
 import pathlib
 import re
+import subprocess
 import sys
+import tempfile
 
 path = pathlib.Path(sys.argv[1])
 text = path.read_text()
@@ -170,6 +175,111 @@ if dump_match is None or fail_match is None:
     fail("fail_http() must call dump_http_diagnostics and fail \"$@\"")
 if dump_match.start() > fail_match.start():
     fail("fail_http() must dump HTTP diagnostics before calling fail")
+
+health_function_match = re.search(
+    r"^http_status_is_healthy\(\) \{\n.*?^\}$",
+    text,
+    flags=re.MULTILINE | re.DOTALL,
+)
+if health_function_match is None:
+    fail("smoke script is missing http_status_is_healthy()")
+health_function = health_function_match.group(0)
+health_cases = (
+    ("200", "false", True),
+    ("200", "true", True),
+    ("403", "true", True),
+    ("403", "false", False),
+    ("403", "", False),
+    ("401", "true", False),
+    ("500", "true", False),
+)
+for status, auth_challenge, expected_healthy in health_cases:
+    result = subprocess.run(
+        [
+            "/bin/bash",
+            "-c",
+            f'{health_function}\nhttp_status_is_healthy "$1" "$2"',
+            "http-health-policy",
+            status,
+            auth_challenge,
+        ],
+        check=False,
+    )
+    actual_healthy = result.returncode == 0
+    if actual_healthy != expected_healthy:
+        fail(
+            "http_status_is_healthy returned "
+            f"{actual_healthy} for status={status!r}, auth_challenge={auth_challenge!r}; "
+            f"expected {expected_healthy}"
+        )
+
+header_function_match = re.search(
+    r"^luci_auth_challenge_from_headers\(\) \{\n.*?^\}$",
+    text,
+    flags=re.MULTILINE | re.DOTALL,
+)
+if header_function_match is None:
+    fail("smoke script is missing luci_auth_challenge_from_headers()")
+header_function = header_function_match.group(0)
+header_cases = (
+    (
+        "early redirect yes, final no header (CRLF)",
+        b"HTTP/1.1 302 Found\r\nX-LuCI-Login-Required: yes\r\nLocation: /login\r\n\r\n"
+        b"HTTP/1.1 403 Forbidden\r\nContent-Type: text/html\r\n\r\n",
+        "false",
+    ),
+    (
+        "early no, final yes (CRLF)",
+        b"HTTP/1.1 302 Found\r\nX-LuCI-Login-Required: no\r\nLocation: /login\r\n\r\n"
+        b"HTTP/1.1 403 Forbidden\r\nx-luci-login-required: yes\r\n\r\n",
+        "true",
+    ),
+    (
+        "final response without auth header (LF)",
+        b"HTTP/1.1 403 Forbidden\nContent-Type: text/html\n\n",
+        "false",
+    ),
+    (
+        "final auth header value no (CRLF)",
+        b"HTTP/1.1 403 Forbidden\r\nx-luci-login-required: no\r\n\r\n",
+        "false",
+    ),
+    (
+        "case-insensitive header with whitespace yes (LF)",
+        b"HTTP/1.1 403 Forbidden\nX-LuCI-LoGiN-ReQuIrEd:   YeS \t\n\n",
+        "true",
+    ),
+    ("empty header file", b"", "false"),
+    ("missing header file", None, "false"),
+)
+with tempfile.TemporaryDirectory(prefix="nexawrt-vm-header-policy-") as temp_dir:
+    for index, (case_name, header_bytes, expected_output) in enumerate(header_cases):
+        header_path = pathlib.Path(temp_dir) / f"headers-{index}.txt"
+        if header_bytes is not None:
+            header_path.write_bytes(header_bytes)
+        result = subprocess.run(
+            [
+                "/bin/bash",
+                "-c",
+                f'{header_function}\nluci_auth_challenge_from_headers "$1"',
+                "luci-header-policy",
+                str(header_path),
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        actual_output = result.stdout.strip()
+        if result.returncode != 0:
+            fail(
+                f"luci_auth_challenge_from_headers failed for {case_name}: "
+                f"exit={result.returncode}, stderr={result.stderr.strip()!r}"
+            )
+        if actual_output != expected_output:
+            fail(
+                f"luci_auth_challenge_from_headers returned {actual_output!r} for {case_name}; "
+                f"expected {expected_output!r}"
+            )
 
 http_start = text.find('http_status="$(curl')
 http_end = text.find('\nSMOKE_STATUS=PASS', http_start)
