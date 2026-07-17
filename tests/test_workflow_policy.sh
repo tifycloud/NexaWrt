@@ -177,6 +177,98 @@ for fixture in auth network rate-limit host-not-found; do
   fi
   grep -Fq 'Unable to determine whether release exists' "$workflow_tmp/stderr"
 done
+python3 - "$RELEASE" "$workflow_tmp/draft-id-check.py" "$workflow_tmp/draft-assets-check.py" <<'PY_DRAFT_RELEASE_HELPERS'
+import pathlib
+import sys
+
+source = pathlib.Path(sys.argv[1]).read_text(encoding="utf-8").splitlines()
+
+def extract(start_text: str, output_path: str) -> None:
+    start = next(i for i, line in enumerate(source) if line.strip() == start_text)
+    body = []
+    for line in source[start + 1:]:
+        if line.strip() == "PY":
+            break
+        if not line:
+            body.append("")
+            continue
+        if not line.startswith("          "):
+            raise SystemExit(f"release assertion indentation is unsafe: {start_text}")
+        body.append(line[10:])
+    else:
+        raise SystemExit(f"release assertion terminator is missing: {start_text}")
+    pathlib.Path(output_path).write_text("\n".join(body) + "\n", encoding="utf-8")
+
+extract(
+    'release_id="$(python3 - "$draft_release" "$GITHUB_REF_NAME" <<\'PY\'',
+    sys.argv[2],
+)
+extract(
+    'DRAFT_EXPECTED_ASSETS="$expected" python3 - "$draft_assets" <<\'PY\'',
+    sys.argv[3],
+)
+PY_DRAFT_RELEASE_HELPERS
+python3 - "$workflow_tmp" <<'PY_DRAFT_RELEASE_FIXTURES'
+import json
+import pathlib
+import sys
+
+root = pathlib.Path(sys.argv[1])
+tag = "ram-test-v1.2.3-rc.4"
+valid_id = {"databaseId": 424242, "isDraft": True, "isPrerelease": True, "tagName": tag}
+id_fixtures = {
+    "valid": valid_id,
+    "id-bool": {**valid_id, "databaseId": True},
+    "id-zero": {**valid_id, "databaseId": 0},
+    "id-string": {**valid_id, "databaseId": "424242"},
+    "draft": {**valid_id, "isDraft": False},
+    "prerelease": {**valid_id, "isPrerelease": False},
+    "tag": {**valid_id, "tagName": "ram-test-v1.2.3-rc.5"},
+}
+for name, value in id_fixtures.items():
+    (root / f"draft-id-{name}.json").write_text(json.dumps(value), encoding="utf-8")
+
+assets = [
+    {"name": "archive.tar.gz", "state": "uploaded", "size": 100},
+    {"name": "archive.tar.gz.sha256", "state": "uploaded", "size": 101},
+    {"name": "archive.provenance.bundle.json", "state": "uploaded", "size": 102},
+    {"name": "checksums.provenance.bundle.json", "state": "uploaded", "size": 103},
+    {"name": "firmware.provenance.bundle.json", "state": "uploaded", "size": 104},
+    {"name": "sbom.provenance.bundle.json", "state": "uploaded", "size": 105},
+]
+asset_fixtures = {
+    "valid": assets,
+    "extra": [*assets, {"name": "unexpected.bin", "state": "uploaded", "size": 1}],
+    "missing": assets[:-1],
+    "duplicate": [*assets[:-1], assets[-2]],
+    "state": [*assets[:-1], {**assets[-1], "state": "new"}],
+    "size-zero": [*assets[:-1], {**assets[-1], "size": 0}],
+    "size-bool": [*assets[:-1], {**assets[-1], "size": True}],
+    "malformed": [*assets[:-1], "not-an-object"],
+    "name": [*assets[:-1], {**assets[-1], "name": ""}],
+}
+for name, value in asset_fixtures.items():
+    (root / f"draft-assets-{name}.json").write_text(json.dumps(value), encoding="utf-8")
+(root / "draft-expected-assets.txt").write_text(
+    "\n".join(asset["name"] for asset in assets) + "\n", encoding="utf-8"
+)
+PY_DRAFT_RELEASE_FIXTURES
+[[ "$(python3 "$workflow_tmp/draft-id-check.py" "$workflow_tmp/draft-id-valid.json" ram-test-v1.2.3-rc.4)" == 424242 ]]
+for fixture in id-bool id-zero id-string draft prerelease tag; do
+  if python3 "$workflow_tmp/draft-id-check.py" "$workflow_tmp/draft-id-$fixture.json" ram-test-v1.2.3-rc.4 >"$workflow_tmp/stdout" 2>"$workflow_tmp/stderr"; then
+    echo "draft release identity assertion accepted invalid state: $fixture" >&2; exit 1
+  fi
+done
+draft_expected_assets="$(cat "$workflow_tmp/draft-expected-assets.txt")"
+DRAFT_EXPECTED_ASSETS="$draft_expected_assets" python3 "$workflow_tmp/draft-assets-check.py" "$workflow_tmp/draft-assets-valid.json"
+for fixture in extra missing duplicate state size-zero size-bool malformed name; do
+  if DRAFT_EXPECTED_ASSETS="$draft_expected_assets" python3 "$workflow_tmp/draft-assets-check.py" "$workflow_tmp/draft-assets-$fixture.json" >"$workflow_tmp/stdout" 2>"$workflow_tmp/stderr"; then
+    echo "draft release asset assertion accepted invalid state: $fixture" >&2; exit 1
+  fi
+done
+if DRAFT_EXPECTED_ASSETS='' python3 "$workflow_tmp/draft-assets-check.py" "$workflow_tmp/draft-assets-valid.json" >"$workflow_tmp/stdout" 2>"$workflow_tmp/stderr"; then
+  echo 'draft release asset assertion accepted an empty expected set' >&2; exit 1
+fi
 python3 - "$RELEASE" "$workflow_tmp/final-release-check.py" <<'PY_FINAL_RELEASE_HELPER'
 import pathlib
 import sys
@@ -184,7 +276,7 @@ import sys
 source = pathlib.Path(sys.argv[1]).read_text(encoding="utf-8").splitlines()
 start = next(
     i for i, line in enumerate(source)
-    if line.strip() == "python3 - \"$final_release\" \"$GITHUB_REF_NAME\" \"$RELEASE_FLAVOR\" \"$RELEASE_VERSION\" <<'PY'"
+    if line.strip() == "python3 - \"$final_release_by_id\" \"$final_release_by_tag\" \"$release_id\" \"$GITHUB_REF_NAME\" \"$RELEASE_FLAVOR\" \"$RELEASE_VERSION\" <<'PY'"
 )
 body = []
 for line in source[start + 1:]:
@@ -217,6 +309,7 @@ assets = [
     {"name": "sbom.provenance.bundle.json", "state": "uploaded", "size": 105},
 ]
 valid = {
+    "id": 424242,
     "draft": False,
     "prerelease": True,
     "immutable": True,
@@ -226,6 +319,7 @@ valid = {
 }
 fixtures = {
     "valid": valid,
+    "id": {**valid, "id": 424243},
     "draft": {**valid, "draft": True},
     "prerelease": {**valid, "prerelease": False},
     "mutable": {**valid, "immutable": False},
@@ -241,12 +335,15 @@ fixtures = {
 for name, value in fixtures.items():
     (root / f"final-{name}.json").write_text(json.dumps(value), encoding="utf-8")
 PY_FINAL_RELEASE_FIXTURES
-python3 "$workflow_tmp/final-release-check.py" "$workflow_tmp/final-valid.json" ram-test-v1.2.3-rc.4 official v1.2.3-rc.4
-for fixture in draft prerelease mutable tag published-null published-format asset-extra asset-missing asset-duplicate asset-state asset-size; do
-  if python3 "$workflow_tmp/final-release-check.py" "$workflow_tmp/final-$fixture.json" ram-test-v1.2.3-rc.4 official v1.2.3-rc.4 >"$workflow_tmp/stdout" 2>"$workflow_tmp/stderr"; then
+python3 "$workflow_tmp/final-release-check.py" "$workflow_tmp/final-valid.json" "$workflow_tmp/final-valid.json" 424242 ram-test-v1.2.3-rc.4 official v1.2.3-rc.4
+for fixture in id draft prerelease mutable tag published-null published-format asset-extra asset-missing asset-duplicate asset-state asset-size; do
+  if python3 "$workflow_tmp/final-release-check.py" "$workflow_tmp/final-$fixture.json" "$workflow_tmp/final-valid.json" 424242 ram-test-v1.2.3-rc.4 official v1.2.3-rc.4 >"$workflow_tmp/stdout" 2>"$workflow_tmp/stderr"; then
     echo "final release assertion accepted invalid state: $fixture" >&2; exit 1
   fi
 done
+if python3 "$workflow_tmp/final-release-check.py" "$workflow_tmp/final-valid.json" "$workflow_tmp/final-id.json" 424242 ram-test-v1.2.3-rc.4 official v1.2.3-rc.4 >"$workflow_tmp/stdout" 2>"$workflow_tmp/stderr"; then
+  echo 'final release assertion accepted a mismatched by-tag release ID' >&2; exit 1
+fi
 grep -Fq 'Untrusted release tag name' "$RELEASE"
 grep -Fq 'flavor=official' "$RELEASE"
 grep -Fq 'flavor=nss' "$RELEASE"
@@ -298,8 +395,23 @@ grep -Fq 'git/ref/tags/$GITHUB_REF_NAME' "$RELEASE"
 grep -Fq 'test "$remote_type" = commit' "$RELEASE"
 grep -Fq 'test "$remote_sha" = "$GITHUB_SHA"' "$RELEASE"
 grep -Fq 'gh release create "$GITHUB_REF_NAME" --verify-tag --draft --prerelease --latest=false' "$RELEASE"
-grep -Fq 'gh release edit "$GITHUB_REF_NAME" --draft=false --prerelease --latest=false' "$RELEASE"
-[[ "$(grep -Fc -- '--latest=false' "$RELEASE")" == 2 ]] || { echo 'release create and publish do not both explicitly disable latest' >&2; exit 1; }
+grep -Fq 'gh release view "$GITHUB_REF_NAME" --json databaseId,isDraft,isPrerelease,tagName > "$draft_release"' "$RELEASE"
+grep -Fq 'release_id = release.get("databaseId")' "$RELEASE"
+grep -Fq 'draft release database ID is invalid' "$RELEASE"
+grep -Fq 'release.get("isDraft") is not True' "$RELEASE"
+grep -Fq 'release.get("isPrerelease") is not True' "$RELEASE"
+grep -Fq '"repos/$GITHUB_REPOSITORY/releases/$release_id/assets?per_page=100" > "$draft_assets"' "$RELEASE"
+grep -Fq 'draft release asset count is not exact' "$RELEASE"
+grep -Fq 'draft release asset names are not the exact expected set' "$RELEASE"
+grep -Fq 'draft release asset is not uploaded' "$RELEASE"
+grep -Fq 'draft release asset size is invalid' "$RELEASE"
+! grep -Fq 'actual="$(gh api "repos/$GITHUB_REPOSITORY/releases/tags/$GITHUB_REF_NAME"' "$RELEASE"
+! grep -Fq 'gh release edit "$GITHUB_REF_NAME"' "$RELEASE"
+grep -Fq -- '--method PATCH' "$RELEASE"
+grep -Fq '"repos/$GITHUB_REPOSITORY/releases/$release_id" \' "$RELEASE"
+grep -Fq 'published release {lookup} does not match the draft release ID' "$RELEASE"
+[[ "$(grep -Fc -- '--latest=false' "$RELEASE")" == 1 ]] || { echo 'draft creation does not explicitly disable latest' >&2; exit 1; }
+grep -Fq -- '-f make_latest=false > /dev/null' "$RELEASE"
 grep -Fq 'official) release_title="NexaWrt AX9000 $RELEASE_VERSION RAM-test prerelease"' "$RELEASE"
 grep -Fq 'nss) release_title="NexaWrt AX9000 NSS $RELEASE_VERSION RAM-test prerelease"' "$RELEASE"
 grep -Fq -- '--title "$release_title"' "$RELEASE"
@@ -307,12 +419,13 @@ grep -Fq -- '--title "$release_title"' "$RELEASE"
 grep -Fq 'release.get("draft") is not False' "$RELEASE"
 grep -Fq 'release.get("prerelease") is not True' "$RELEASE"
 grep -Fq 'release.get("immutable") is not True' "$RELEASE"
-grep -Fq 'published release asset count is not exact' "$RELEASE"
-grep -Fq 'published release asset names are not the exact expected set' "$RELEASE"
+grep -Fq 'published release {lookup} asset count is not exact' "$RELEASE"
+grep -Fq 'published release {lookup} asset names are not the exact expected set' "$RELEASE"
 grep -Fq 'release.get("tag_name") != expected_tag' "$RELEASE"
 grep -Fq 'published_at = release.get("published_at")' "$RELEASE"
-grep -Fq 'published release has no valid published_at timestamp' "$RELEASE"
-grep -Fq '"repos/$GITHUB_REPOSITORY/releases/tags/$GITHUB_REF_NAME" > "$final_release"' "$RELEASE"
+grep -Fq 'published release {lookup} has no valid published_at timestamp' "$RELEASE"
+grep -Fq '"repos/$GITHUB_REPOSITORY/releases/$release_id" > "$final_release_by_id"' "$RELEASE"
+grep -Fq '"repos/$GITHUB_REPOSITORY/releases/tags/$GITHUB_REF_NAME" > "$final_release_by_tag"' "$RELEASE"
 test -f "$RELEASE_DOCS"
 grep -Fq 'ram-test-vMAJOR.MINOR.PATCH-rc.N' "$RELEASE_DOCS"
 grep -Fq 'ram-test-nss-vMAJOR.MINOR.PATCH-rc.N' "$RELEASE_DOCS"
@@ -321,6 +434,8 @@ grep -Fq 'NexaWrt-AX9000-official-v1.4.0-rc.1-verified-dist.tar.gz.sha256' "$REL
 grep -Fq 'NexaWrt-AX9000-nss-v1.4.0-rc.1-verified-dist.tar.gz.sha256' "$RELEASE_DOCS"
 grep -Fq '## Release procedure' "$RELEASE_DOCS"
 grep -Fq '## Draft recovery' "$RELEASE_DOCS"
+grep -Fq 'does not expose draft releases' "$RELEASE_DOCS"
+grep -Fq 'Do not move or recreate the failed tag' "$RELEASE_DOCS"
 grep -Fq 'gh release delete "$tag" --yes' "$RELEASE_DOCS"
 grep -Fq 'attestations: write' "$RELEASE"
 [[ "$(grep -c '^      artifact-metadata: write$' "$RELEASE")" == 2 ]] || { echo 'release artifact metadata write permission is not limited to producer and publish jobs' >&2; exit 1; }
@@ -420,11 +535,17 @@ extract_line="$(awk 'index($0, "tar -xzf \"release-staging/publish/$archive_base
 unpacked_verify_line="$(awk 'index($0, "--verify-verified-dist \"$extract_dir/verified-dist\"") { print NR; exit }' "$RELEASE")"
 last_bundle_copy_line="$(awk 'index($0, "release-staging/publish/archive.provenance.bundle.json") { print NR; exit }' "$RELEASE")"
 release_create_line="$(awk 'index($0, "gh release create \"$GITHUB_REF_NAME\"") { print NR; exit }' "$RELEASE")"
-release_edit_line="$(awk 'index($0, "gh release edit \"$GITHUB_REF_NAME\"") { print NR; exit }' "$RELEASE")"
-final_fetch_line="$(awk 'index($0, "releases/tags/$GITHUB_REF_NAME\" > \"$final_release\"") { print NR; exit }' "$RELEASE")"
+draft_fetch_line="$(awk 'index($0, "gh release view \"$GITHUB_REF_NAME\" --json databaseId,isDraft,isPrerelease,tagName") { print NR; exit }' "$RELEASE")"
+draft_state_line="$(awk 'index($0, "release.get(\"isDraft\") is not True") { print NR; exit }' "$RELEASE")"
+release_upload_line="$(awk 'index($0, "gh release upload \"$GITHUB_REF_NAME\"") { print NR; exit }' "$RELEASE")"
+draft_assets_line="$(awk 'index($0, "releases/$release_id/assets?per_page=100") { print NR; exit }' "$RELEASE")"
+draft_assets_state_line="$(awk 'index($0, "draft release asset count is not exact") { print NR; exit }' "$RELEASE")"
+release_patch_line="$(awk 'index($0, "--method PATCH") { print NR; exit }' "$RELEASE")"
+final_id_fetch_line="$(awk 'index($0, "releases/$release_id\" > \"$final_release_by_id\"") { print NR; exit }' "$RELEASE")"
+final_tag_fetch_line="$(awk 'index($0, "releases/tags/$GITHUB_REF_NAME\" > \"$final_release_by_tag\"") { print NR; exit }' "$RELEASE")"
 final_state_line="$(awk 'index($0, "release.get(\"draft\") is not False") { print NR; exit }' "$RELEASE")"
 published_at_line="$(awk 'index($0, "published_at = release.get(\"published_at\")") { print NR; exit }' "$RELEASE")"
-(( publish_line < checkout_policy_line && checkout_policy_line < source_verify_first_line && source_verify_first_line < archive_line && archive_line < checksum_line && checksum_line < extract_line && extract_line < unpacked_verify_line && unpacked_verify_line < last_bundle_copy_line && last_bundle_copy_line < source_verify_last_line && source_verify_last_line < release_create_line && release_create_line < release_edit_line && release_edit_line < final_fetch_line && final_fetch_line < final_state_line && final_state_line < published_at_line )) || {
+(( publish_line < checkout_policy_line && checkout_policy_line < source_verify_first_line && source_verify_first_line < archive_line && archive_line < checksum_line && checksum_line < extract_line && extract_line < unpacked_verify_line && unpacked_verify_line < last_bundle_copy_line && last_bundle_copy_line < source_verify_last_line && source_verify_last_line < release_create_line && release_create_line < draft_fetch_line && draft_fetch_line < draft_state_line && draft_state_line < release_upload_line && release_upload_line < draft_assets_line && draft_assets_line < draft_assets_state_line && draft_assets_state_line < release_patch_line && release_patch_line < final_id_fetch_line && final_id_fetch_line < final_tag_fetch_line && final_tag_fetch_line < final_state_line && final_state_line < published_at_line )) || {
   echo 'verified-dist packaging, exact asset verification, publication, and final-state verification ordering is unsafe' >&2; exit 1
 }
 

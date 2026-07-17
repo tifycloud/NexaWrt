@@ -97,6 +97,8 @@ The archive provenance attestation subject is the exact version-qualified archiv
 
 The publish job intentionally creates a draft first, uploads every asset, compares the complete remote asset-name set with the local publish directory, and only then publishes it. A failed publish job can therefore leave a partial draft.
 
+Draft creation is immediately resolved with `gh release view` to a positive numeric `databaseId`. All draft asset inspection and publication then use the fixed REST `releases/{release_id}` identity. GitHub's REST `releases/tags/{tag}` endpoint does not expose draft releases and can return `404` until publication; the workflow uses that endpoint only after publication, when it verifies that the by-tag result has the same Release ID and immutable final state.
+
 Do **not** manually publish a partial draft and do not upload replacement assets by hand. Once published, an immutable release cannot be repaired in place; use a new release-candidate tag for corrections. First inspect the release and the failed workflow logs:
 
 ```sh
@@ -116,5 +118,7 @@ If and only if the release is still a draft for the exact triggering tag:
    ```
 
 3. Correct external conditions if needed, then use GitHub Actions to rerun the failed publish job. Its retained verified artifact will be downloaded and reverified before a new draft is created. If the artifacts have expired or the rerun cannot reuse them, delete the draft as above and rerun the complete workflow for the unchanged tag.
+
+If the workflow implementation itself must change, the failed tag still identifies the old workflow commit and must remain immutable evidence. Do not move or recreate the failed tag. Merge the fix to `main`, delete only the draft release, and create the next release-candidate tag (for example, `rc.2`) from the corrected `main` commit.
 
 If the release is already published (`isDraft=false` or `publishedAt` is set), stop. Do not delete or overwrite it as routine draft recovery. Investigate the final-state verification failure and treat any correction as an explicit release-management incident; normally a new release-candidate tag is required.

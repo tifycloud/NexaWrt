@@ -420,40 +420,97 @@ jobs:
           gh release create "$GITHUB_REF_NAME" --verify-tag --draft --prerelease --latest=false \
             --title "$release_title" \
             --notes "Reproducible NexaWrt AX9000 $RELEASE_FLAVOR $RELEASE_VERSION initramfs RAM-boot candidate. NOT FOR FLASHING. Hardware, UART, recovery, and stress-test approval remain mandatory."
+          draft_release="$(mktemp)"
+          draft_assets="$(mktemp)"
+          final_release_by_id="$(mktemp)"
+          final_release_by_tag="$(mktemp)"
+          trap 'rm -f "$draft_release" "$draft_assets" "$final_release_by_id" "$final_release_by_tag"' EXIT
+          gh release view "$GITHUB_REF_NAME" --json databaseId,isDraft,isPrerelease,tagName > "$draft_release"
+          release_id="$(python3 - "$draft_release" "$GITHUB_REF_NAME" <<'PY'
+          import json
+          import pathlib
+          import sys
+
+          release_path, expected_tag = sys.argv[1:]
+          release = json.loads(pathlib.Path(release_path).read_text(encoding="utf-8"))
+          release_id = release.get("databaseId")
+          if isinstance(release_id, bool) or not isinstance(release_id, int) or release_id <= 0:
+              raise SystemExit("draft release database ID is invalid")
+          if release.get("isDraft") is not True:
+              raise SystemExit("draft release is not a draft")
+          if release.get("isPrerelease") is not True:
+              raise SystemExit("draft release is not marked as a prerelease")
+          if release.get("tagName") != expected_tag:
+              raise SystemExit("draft release tag does not match the triggering tag")
+          print(release_id)
+          PY
+          )"
           while IFS= read -r -d '' asset; do
             gh release upload "$GITHUB_REF_NAME" "$asset"
           done < <(find release-staging/publish -maxdepth 1 -type f -print0 | sort -z)
           expected="$(find release-staging/publish -maxdepth 1 -type f -exec basename {} \; | sort)"
-          actual="$(gh api "repos/$GITHUB_REPOSITORY/releases/tags/$GITHUB_REF_NAME" --jq '.assets[].name' | sort)"
-          test "$actual" = "$expected"
-          gh release edit "$GITHUB_REF_NAME" --draft=false --prerelease --latest=false
-          final_release="$(mktemp)"
-          trap 'rm -f "$final_release"' EXIT
           gh api \
             -H 'Accept: application/vnd.github+json' \
             -H 'X-GitHub-Api-Version: 2026-03-10' \
-            "repos/$GITHUB_REPOSITORY/releases/tags/$GITHUB_REF_NAME" > "$final_release"
-          python3 - "$final_release" "$GITHUB_REF_NAME" "$RELEASE_FLAVOR" "$RELEASE_VERSION" <<'PY'
+            "repos/$GITHUB_REPOSITORY/releases/$release_id/assets?per_page=100" > "$draft_assets"
+          DRAFT_EXPECTED_ASSETS="$expected" python3 - "$draft_assets" <<'PY'
+          import json
+          import os
+          import pathlib
+          import sys
+
+          assets = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
+          expected_assets = set(os.environ.get("DRAFT_EXPECTED_ASSETS", "").splitlines())
+          if not expected_assets:
+              raise SystemExit("draft release expected asset set is empty")
+          if not isinstance(assets, list) or len(assets) != len(expected_assets):
+              raise SystemExit("draft release asset count is not exact")
+          names = []
+          for asset in assets:
+              if not isinstance(asset, dict):
+                  raise SystemExit("draft release asset entry is malformed")
+              name = asset.get("name")
+              if not isinstance(name, str) or not name:
+                  raise SystemExit("draft release asset name is invalid")
+              if asset.get("state") != "uploaded":
+                  raise SystemExit(f"draft release asset is not uploaded: {name}")
+              size = asset.get("size")
+              if isinstance(size, bool) or not isinstance(size, int) or size <= 0:
+                  raise SystemExit(f"draft release asset size is invalid: {name}")
+              names.append(name)
+          if len(names) != len(set(names)):
+              raise SystemExit("draft release contains duplicate asset names")
+          if set(names) != expected_assets:
+              raise SystemExit("draft release asset names are not the exact expected set")
+          PY
+          gh api \
+            --method PATCH \
+            -H 'Accept: application/vnd.github+json' \
+            -H 'X-GitHub-Api-Version: 2026-03-10' \
+            "repos/$GITHUB_REPOSITORY/releases/$release_id" \
+            -F draft=false \
+            -F prerelease=true \
+            -f make_latest=false > /dev/null
+          gh api \
+            -H 'Accept: application/vnd.github+json' \
+            -H 'X-GitHub-Api-Version: 2026-03-10' \
+            "repos/$GITHUB_REPOSITORY/releases/$release_id" > "$final_release_by_id"
+          gh api \
+            -H 'Accept: application/vnd.github+json' \
+            -H 'X-GitHub-Api-Version: 2026-03-10' \
+            "repos/$GITHUB_REPOSITORY/releases/tags/$GITHUB_REF_NAME" > "$final_release_by_tag"
+          python3 - "$final_release_by_id" "$final_release_by_tag" "$release_id" "$GITHUB_REF_NAME" "$RELEASE_FLAVOR" "$RELEASE_VERSION" <<'PY'
           import json
           import pathlib
           import re
           import sys
 
-          release_path, expected_tag, flavor, version = sys.argv[1:]
-          release = json.loads(pathlib.Path(release_path).read_text(encoding="utf-8"))
-          if release.get("draft") is not False:
-              raise SystemExit("published release is still a draft")
-          if release.get("prerelease") is not True:
-              raise SystemExit("published release is not marked as a prerelease")
-          if release.get("immutable") is not True:
-              raise SystemExit("published release is not immutable")
-          if release.get("tag_name") != expected_tag:
-              raise SystemExit("published release tag does not match the triggering tag")
-          published_at = release.get("published_at")
-          if not isinstance(published_at, str) or not re.fullmatch(
-              r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z", published_at
-          ):
-              raise SystemExit("published release has no valid published_at timestamp")
+          by_id_path, by_tag_path, expected_id_text, expected_tag, flavor, version = sys.argv[1:]
+          expected_id = int(expected_id_text)
+          releases = {
+              "by ID": json.loads(pathlib.Path(by_id_path).read_text(encoding="utf-8")),
+              "by tag": json.loads(pathlib.Path(by_tag_path).read_text(encoding="utf-8")),
+          }
 
           archive = f"NexaWrt-AX9000-{flavor}-{version}-verified-dist.tar.gz"
           expected_assets = {
@@ -464,22 +521,39 @@ jobs:
               "firmware.provenance.bundle.json",
               "sbom.provenance.bundle.json",
           }
-          assets = release.get("assets")
-          if not isinstance(assets, list) or len(assets) != len(expected_assets):
-              raise SystemExit("published release asset count is not exact")
-          names = []
-          for asset in assets:
-              if not isinstance(asset, dict):
-                  raise SystemExit("published release contains a malformed asset")
-              name = asset.get("name")
-              size = asset.get("size")
-              if not isinstance(name, str):
-                  raise SystemExit("published release contains an invalid asset name")
-              if asset.get("state") != "uploaded":
-                  raise SystemExit(f"published release asset is not uploaded: {name}")
-              if not isinstance(size, int) or isinstance(size, bool) or size <= 0:
-                  raise SystemExit(f"published release asset has invalid size: {name}")
-              names.append(name)
-          if len(names) != len(set(names)) or set(names) != expected_assets:
-              raise SystemExit("published release asset names are not the exact expected set")
+          for lookup, release in releases.items():
+              if release.get("id") != expected_id:
+                  raise SystemExit(f"published release {lookup} does not match the draft release ID")
+              if release.get("draft") is not False:
+                  raise SystemExit(f"published release {lookup} is still a draft")
+              if release.get("prerelease") is not True:
+                  raise SystemExit(f"published release {lookup} is not marked as a prerelease")
+              if release.get("immutable") is not True:
+                  raise SystemExit(f"published release {lookup} is not immutable")
+              if release.get("tag_name") != expected_tag:
+                  raise SystemExit(f"published release {lookup} tag does not match the triggering tag")
+              published_at = release.get("published_at")
+              if not isinstance(published_at, str) or not re.fullmatch(
+                  r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z", published_at
+              ):
+                  raise SystemExit(f"published release {lookup} has no valid published_at timestamp")
+
+              assets = release.get("assets")
+              if not isinstance(assets, list) or len(assets) != len(expected_assets):
+                  raise SystemExit(f"published release {lookup} asset count is not exact")
+              names = []
+              for asset in assets:
+                  if not isinstance(asset, dict):
+                      raise SystemExit(f"published release {lookup} contains a malformed asset")
+                  name = asset.get("name")
+                  size = asset.get("size")
+                  if not isinstance(name, str):
+                      raise SystemExit(f"published release {lookup} contains an invalid asset name")
+                  if asset.get("state") != "uploaded":
+                      raise SystemExit(f"published release {lookup} asset is not uploaded: {name}")
+                  if not isinstance(size, int) or isinstance(size, bool) or size <= 0:
+                      raise SystemExit(f"published release {lookup} asset has invalid size: {name}")
+                  names.append(name)
+              if len(names) != len(set(names)) or set(names) != expected_assets:
+                  raise SystemExit(f"published release {lookup} asset names are not the exact expected set")
           PY
