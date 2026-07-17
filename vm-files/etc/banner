@@ -1,0 +1,9 @@
+ _   _                 __        __    _     __     ____  __
+| \ | | _____  ____ _  \ \      / / __| |_   \ \   / /  \/  |
+|  \| |/ _ \ \/ / _` |  \ \ /\ / / '__| __|   \ \ / /| |\/| |
+| |\  |  __/>  < (_| |   \ V  V /| |  | |_     \ V / | |  | |
+|_| \_|\___/_/\_\__,_|    \_/\_/ |_|   \__|     \_/  |_|  |_|
+
+NexaWrt VM smoke image — VM ONLY — NOT-AX9000 FIRMWARE
+QEMU BOOT/USERSPACE TESTING ONLY.
+THIS IS NOT HARDWARE VALIDATION AND NOT NSS VALIDATION.

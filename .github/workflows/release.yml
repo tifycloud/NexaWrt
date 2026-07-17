@@ -19,6 +19,7 @@ jobs:
       contents: read
     outputs:
       flavor: ${{ steps.release_identity.outputs.flavor }}
+      release_version: ${{ steps.release_identity.outputs.release_version }}
       work_basename: ${{ steps.release_identity.outputs.work_basename }}
       staging_basename: ${{ steps.release_identity.outputs.staging_basename }}
     steps:
@@ -27,21 +28,37 @@ jobs:
         with:
           fetch-depth: 0
           persist-credentials: false
-      - name: Verify immutable release preconditions and derive flavor
+      - name: Require repository immutable releases
+        env:
+          IMMUTABLE_RELEASES_READ_TOKEN: ${{ secrets.IMMUTABLE_RELEASES_READ_TOKEN }}
+        run: |
+          set -euo pipefail
+          test -n "$IMMUTABLE_RELEASES_READ_TOKEN"
+          GH_TOKEN="$IMMUTABLE_RELEASES_READ_TOKEN" gh api \
+            -H 'Accept: application/vnd.github+json' \
+            -H 'X-GitHub-Api-Version: 2026-03-10' \
+            "repos/$GITHUB_REPOSITORY/immutable-releases" \
+            --jq 'select(.enabled == true) | .enabled' | grep -Fxq true
+      - name: Verify trusted tag, derive flavor, and run policy tests
         id: release_identity
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          set -euo pipefail
           test "$GITHUB_REF_TYPE" = tag
           test "$GITHUB_REF" = "refs/tags/$GITHUB_REF_NAME"
           test "$GITHUB_WORKFLOW_REF" = "tifycloud/NexaWrt/.github/workflows/release.yml@$GITHUB_REF"
           test "$GITHUB_WORKFLOW_SHA" = "$GITHUB_SHA"
-          if [[ "$GITHUB_REF_NAME" =~ ^ram-test-v[0-9][0-9A-Za-z._-]*$ ]]; then
+          official_tag_pattern='^ram-test-(v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)-rc\.(0|[1-9][0-9]*))$'
+          nss_tag_pattern='^ram-test-nss-(v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)-rc\.(0|[1-9][0-9]*))$'
+          if [[ "$GITHUB_REF_NAME" =~ $official_tag_pattern ]]; then
             flavor=official
+            release_version="${BASH_REMATCH[1]}"
             work_basename=openwrt
             staging_basename=dist
-          elif [[ "$GITHUB_REF_NAME" =~ ^ram-test-nss-v[0-9][0-9A-Za-z._-]*$ ]]; then
+          elif [[ "$GITHUB_REF_NAME" =~ $nss_tag_pattern ]]; then
             flavor=nss
+            release_version="${BASH_REMATCH[1]}"
             work_basename=openwrt-nss
             staging_basename=dist-nss
           else
@@ -69,8 +86,8 @@ jobs:
             return "$status"
           }
           release_tag_is_absent "$GITHUB_REF_NAME"
-          printf 'flavor=%s\nwork_basename=%s\nstaging_basename=%s\n' \
-            "$flavor" "$work_basename" "$staging_basename" >> "$GITHUB_OUTPUT"
+          printf 'flavor=%s\nrelease_version=%s\nwork_basename=%s\nstaging_basename=%s\n' \
+            "$flavor" "$release_version" "$work_basename" "$staging_basename" >> "$GITHUB_OUTPUT"
           NEXAWRT_FLAVOR="$flavor" ./tests/test_static.sh
 
   build:
@@ -324,6 +341,7 @@ jobs:
       artifact-metadata: write
     env:
       RELEASE_FLAVOR: ${{ needs.preflight.outputs.flavor }}
+      RELEASE_VERSION: ${{ needs.preflight.outputs.release_version }}
     steps:
       - name: Checkout verification policy
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
@@ -346,7 +364,7 @@ jobs:
           grep -Fxq "flavor=$RELEASE_FLAVOR" release-staging/verified-dist/BUILD-MANIFEST.txt
           grep -Fq 'initramfs RAM-boot candidate only.' release-staging/verified-dist/DO-NOT-FLASH.txt
           source_epoch="$(awk -F= '$1 == "source_date_epoch" { count++; value=$2 } END { if (count != 1 || value !~ /^[1-9][0-9]*$/) exit 1; print value }' release-staging/verified-dist/BUILD-MANIFEST.txt)"
-          archive_basename="NexaWrt-AX9000-${RELEASE_FLAVOR}-verified-dist.tar.gz"
+          archive_basename="NexaWrt-AX9000-${RELEASE_FLAVOR}-${RELEASE_VERSION}-verified-dist.tar.gz"
           mkdir release-staging/publish
           tar --sort=name --owner=0 --group=0 --numeric-owner --mtime="@$source_epoch" \
             -C release-staging -cf - verified-dist | gzip -9n > "release-staging/publish/$archive_basename"
@@ -378,7 +396,7 @@ jobs:
         id: archive_attestation
         uses: actions/attest-build-provenance@96278af6caaf10aea03fd8d33a09a777ca52d62f # v3.2.0
         with:
-          subject-path: release-staging/publish/NexaWrt-AX9000-${{ needs.preflight.outputs.flavor }}-verified-dist.tar.gz
+          subject-path: release-staging/publish/NexaWrt-AX9000-${{ needs.preflight.outputs.flavor }}-${{ needs.preflight.outputs.release_version }}-verified-dist.tar.gz
       - name: Attach offline attestation bundles outside verified-dist
         run: |
           cp '${{ steps.firmware_attestation.outputs.bundle-path }}' release-staging/publish/firmware.provenance.bundle.json
@@ -394,13 +412,74 @@ jobs:
           remote_sha="$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$GITHUB_REF_NAME" --jq '.object.sha')"
           test "$remote_type" = commit
           test "$remote_sha" = "$GITHUB_SHA"
-          gh release create "$GITHUB_REF_NAME" --verify-tag --draft --prerelease \
-            --title "$GITHUB_REF_NAME" \
-            --notes "Reproducible NexaWrt AX9000 $RELEASE_FLAVOR initramfs RAM-boot candidate. NOT FOR FLASHING. Hardware, UART, recovery, and stress-test approval remain mandatory."
+          case "$RELEASE_FLAVOR" in
+            official) release_title="NexaWrt AX9000 $RELEASE_VERSION RAM-test prerelease" ;;
+            nss) release_title="NexaWrt AX9000 NSS $RELEASE_VERSION RAM-test prerelease" ;;
+            *) echo "Untrusted release flavor: $RELEASE_FLAVOR" >&2; exit 1 ;;
+          esac
+          gh release create "$GITHUB_REF_NAME" --verify-tag --draft --prerelease --latest=false \
+            --title "$release_title" \
+            --notes "Reproducible NexaWrt AX9000 $RELEASE_FLAVOR $RELEASE_VERSION initramfs RAM-boot candidate. NOT FOR FLASHING. Hardware, UART, recovery, and stress-test approval remain mandatory."
           while IFS= read -r -d '' asset; do
             gh release upload "$GITHUB_REF_NAME" "$asset"
           done < <(find release-staging/publish -maxdepth 1 -type f -print0 | sort -z)
           expected="$(find release-staging/publish -maxdepth 1 -type f -exec basename {} \; | sort)"
           actual="$(gh api "repos/$GITHUB_REPOSITORY/releases/tags/$GITHUB_REF_NAME" --jq '.assets[].name' | sort)"
           test "$actual" = "$expected"
-          gh release edit "$GITHUB_REF_NAME" --draft=false --prerelease
+          gh release edit "$GITHUB_REF_NAME" --draft=false --prerelease --latest=false
+          final_release="$(mktemp)"
+          trap 'rm -f "$final_release"' EXIT
+          gh api \
+            -H 'Accept: application/vnd.github+json' \
+            -H 'X-GitHub-Api-Version: 2026-03-10' \
+            "repos/$GITHUB_REPOSITORY/releases/tags/$GITHUB_REF_NAME" > "$final_release"
+          python3 - "$final_release" "$GITHUB_REF_NAME" "$RELEASE_FLAVOR" "$RELEASE_VERSION" <<'PY'
+          import json
+          import pathlib
+          import re
+          import sys
+
+          release_path, expected_tag, flavor, version = sys.argv[1:]
+          release = json.loads(pathlib.Path(release_path).read_text(encoding="utf-8"))
+          if release.get("draft") is not False:
+              raise SystemExit("published release is still a draft")
+          if release.get("prerelease") is not True:
+              raise SystemExit("published release is not marked as a prerelease")
+          if release.get("immutable") is not True:
+              raise SystemExit("published release is not immutable")
+          if release.get("tag_name") != expected_tag:
+              raise SystemExit("published release tag does not match the triggering tag")
+          published_at = release.get("published_at")
+          if not isinstance(published_at, str) or not re.fullmatch(
+              r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z", published_at
+          ):
+              raise SystemExit("published release has no valid published_at timestamp")
+
+          archive = f"NexaWrt-AX9000-{flavor}-{version}-verified-dist.tar.gz"
+          expected_assets = {
+              archive,
+              f"{archive}.sha256",
+              "archive.provenance.bundle.json",
+              "checksums.provenance.bundle.json",
+              "firmware.provenance.bundle.json",
+              "sbom.provenance.bundle.json",
+          }
+          assets = release.get("assets")
+          if not isinstance(assets, list) or len(assets) != len(expected_assets):
+              raise SystemExit("published release asset count is not exact")
+          names = []
+          for asset in assets:
+              if not isinstance(asset, dict):
+                  raise SystemExit("published release contains a malformed asset")
+              name = asset.get("name")
+              size = asset.get("size")
+              if not isinstance(name, str):
+                  raise SystemExit("published release contains an invalid asset name")
+              if asset.get("state") != "uploaded":
+                  raise SystemExit(f"published release asset is not uploaded: {name}")
+              if not isinstance(size, int) or isinstance(size, bool) or size <= 0:
+                  raise SystemExit(f"published release asset has invalid size: {name}")
+              names.append(name)
+          if len(names) != len(set(names)) or set(names) != expected_assets:
+              raise SystemExit("published release asset names are not the exact expected set")
+          PY

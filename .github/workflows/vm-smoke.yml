@@ -1,0 +1,117 @@
+name: VM smoke (QEMU only)
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - manifests/vm.lock
+      - vm-files/**
+      - scripts/build-vm-image.sh
+      - scripts/test-vm-smoke.sh
+      - tests/test_vm_policy.sh
+      - .github/workflows/vm-smoke.yml
+  pull_request:
+    branches: [main]
+    paths:
+      - manifests/vm.lock
+      - vm-files/**
+      - scripts/build-vm-image.sh
+      - scripts/test-vm-smoke.sh
+      - tests/test_vm_policy.sh
+      - .github/workflows/vm-smoke.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: vm-smoke-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  policy:
+    name: VM policy
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - name: Install policy tools
+        run: sudo apt-get update && sudo apt-get install --yes shellcheck
+      - name: Check VM shell policy
+        run: |
+          shellcheck -S warning \
+            scripts/build-vm-image.sh \
+            scripts/test-vm-smoke.sh \
+            tests/test_vm_policy.sh \
+            vm-files/etc/uci-defaults/10-vm-smoke \
+            vm-files/usr/libexec/nexawrt-vm-dangerous-command-guard \
+            vm-files/sbin/*
+          ./tests/test_vm_policy.sh
+
+  smoke:
+    name: QEMU ${{ matrix.target }}
+    needs: policy
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - x86-64
+          - armsr-armv8
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - name: Install ImageBuilder and QEMU dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes \
+            build-essential \
+            ca-certificates \
+            curl \
+            file \
+            gawk \
+            gzip \
+            libncurses-dev \
+            openssh-client \
+            python3 \
+            qemu-efi-aarch64 \
+            qemu-system-arm \
+            qemu-system-x86 \
+            rsync \
+            unzip \
+            wget \
+            xz-utils \
+            zstd
+      - name: Create ephemeral smoke-test SSH key
+        run: ssh-keygen -q -t ed25519 -N '' -f "$RUNNER_TEMP/vm-smoke-key"
+      - name: Build VM-only image
+        id: build
+        env:
+          VM_SMOKE_AUTHORIZED_KEY_FILE: ${{ runner.temp }}/vm-smoke-key.pub
+          VM_WORK_DIR: ${{ github.workspace }}/.work/vm/${{ matrix.target }}
+          VM_OUTPUT_DIR: ${{ github.workspace }}/dist/vm
+        run: ./scripts/build-vm-image.sh '${{ matrix.target }}'
+      - name: Run QEMU smoke test
+        env:
+          VM_SMOKE_OUTPUT_DIR: ${{ github.workspace }}/vm-smoke-results/${{ matrix.target }}
+        run: ./scripts/test-vm-smoke.sh '${{ matrix.target }}' '${{ steps.build.outputs.image }}' "$RUNNER_TEMP/vm-smoke-key"
+      - name: Upload VM image, logs, and report
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: vm-smoke-${{ matrix.target }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            dist/vm/${{ matrix.target }}/
+            vm-smoke-results/${{ matrix.target }}/
+          if-no-files-found: warn
+          retention-days: 14

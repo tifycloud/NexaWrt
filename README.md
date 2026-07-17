@@ -125,6 +125,7 @@ MTD 备份包含整个 UBI 区域，可能间接包含 `rootfs_data` 中的配�
 - [initramfs 测试流程](docs/TESTING.md)
 - [实验性 NSS flavor、限制与诊断](docs/NSS.md)
 - [生产就绪门禁与真机证据格式](docs/PRODUCTION-READINESS.md)
+- [版本化 RAM-test prerelease 发布说明](docs/RELEASES.md)
 
 
 ## 构建 NexaWrt
@@ -216,8 +217,9 @@ macOS 自带的 Bash、Make 和默认大小写不敏感文件系统通常不满�
 必须能追溯到 flavor，镜像文件名必须能追溯到 profile。当前 profile 明确关闭 sysupgrade 和
 factory 产物，产物门检会拒绝任何可刷写镜像。
 
-候选发布有两个互不重叠的 tag 家族：`ram-test-v*` 只对应 `official`，
-`ram-test-nss-v*` 只对应实验性 `nss`。preflight 会从严格受信任的 tag 名 fail-closed 派生
+候选发布有两个互不重叠且严格版本化的 tag 家族：`ram-test-vMAJOR.MINOR.PATCH-rc.N` 只对应
+`official`，`ram-test-nss-vMAJOR.MINOR.PATCH-rc.N` 只对应实验性 `nss`。例如首个 NSS 测试版本可使用
+`ram-test-nss-v0.1.0-rc.1`。preflight 会从严格受信任的 tag 名 fail-closed 派生
 flavor，不允许未知 tag 回退到默认构建。每个 flavor 都执行两个无共享下载缓存、使用独立
 flavor/replica `WORK_DIR`、构建日志和 staging 目录的干净构建，再把正确 flavor 传给比较器，
 比较精确 ITB、package manifest、解析配置、buildinfo、输入摘要及规范化 CycloneDX SBOM。
@@ -241,6 +243,42 @@ initramfs RAM-boot 候选，不上传整个 OpenWrt target 输出，也不开放
 > sysupgrade/factory 文件，产物门检必须失败。当前候选产物尚未获得真机 RAM 启动批准。
 
 
+## 虚拟机测试、Releases 与下载网站
+
+仓库提供独立的 **VM-only** QEMU 冒烟测试，覆盖 `x86-64` 与 `armsr-armv8` 两个架构。它使用
+SHA-256 锁定的 OpenWrt ImageBuilder，检查启动、SSH、LuCI HTTP、`ubus`、UCI、网络和核心服务，
+并把 VM 镜像、串口日志与结构化报告上传到 Actions。VM 产物会明确标记
+`NOT_AX9000_FIRMWARE=1`、`HARDWARE_VALIDATION=0`、`NSS_VALIDATION=0`：**虚拟机通过只能证明通用
+OpenWrt 用户空间和自动化流程可运行，不能证明 AX9000、Qualcomm NSS、交换芯片、Wi-Fi、温度、
+断电恢复或持久存储安全。**
+
+在浏览器中打开 **Actions → VM smoke (QEMU only) → Run workflow** 即可重新运行；Pull Request 修改
+VM 相关文件时也会自动执行。测试阶段的 AX9000 候选则通过轻量 tag 发布为 GitHub prerelease：
+
+```sh
+tag=ram-test-nss-v0.1.0-rc.1
+commit="$(git rev-parse origin/main)"
+git merge-base --is-ancestor "$commit" origin/main
+git tag "$tag" "$commit"
+git push origin "refs/tags/$tag"
+```
+
+发布流程仍需通过双副本可复现门禁和 `ram-test-release` Environment 审批。仓库必须先启用 GitHub
+Immutable Releases，并配置仅限此仓库、具备 Administration(read) 的 Actions Secret
+`IMMUTABLE_RELEASES_READ_TOKEN`；发布 preflight 会在任何构建开始前调用官方 API 并 fail closed，
+发布后还会验证 `immutable=true`、六个资产名称集合完全一致、状态均为 `uploaded` 且大小有效。最终归档名包含版本，
+例如 `NexaWrt-AX9000-nss-v0.1.0-rc.1-verified-dist.tar.gz`，并附带 SHA-256、SBOM 与 GitHub
+provenance。所有 RC 都是 prerelease 且不会被标记为 Latest。完整规则与失败恢复步骤见
+[版本化发布说明](docs/RELEASES.md)。
+
+GitHub Pages 站点由仓库内 `site/` 提供，合并并启用 Pages 后地址为
+<https://tifycloud.github.io/NexaWrt/>。网站只展示 `immutable=true` 且远端资产集合严格等于六个预期文件的 GitHub prerelease；任何额外、
+缺失、重复、非 `uploaded` 或大小无效的资产都会使整个 Release 被拒绝。站点会在 `main` 更新、
+发布工作流成功后以及每 6 小时周期复验并重新部署。Official 与 NSS 分频道，Release 尚不存在时
+显示安全空状态；它还提供不包含密码、密钥或 Token 的
+RAM 会话 UCI 配置片段生成器。网站不是刷机工具，也不会把配置烘焙进镜像。
+
+
 ## License
 
 除另有明确标注的上游或第三方组件外，本仓库采用 **GNU General Public License v2.0 only
@@ -256,12 +294,16 @@ initramfs RAM-boot 候选，不上传整个 OpenWrt target 输出，也不开放
 configs/                 单设备、按 flavor 隔离的最小包配置
 files/                   两个 flavor 共用、不含密码或订阅的基础 overlay
 files-nss/               仅 NSS flavor 应用的运行时 overlay
-manifests/               OpenWrt/feeds/layout 与 NSS 来源锁定信息
+manifests/               OpenWrt/feeds/layout、NSS 与 VM ImageBuilder 来源锁定信息
 patches/                 RAM-only 安全补丁（含只读 uboot-envtools patch 003）
 scripts/backup-router.sh               只读备份
 scripts/nss-diagnostics.sh             NSS/ECM 只读运行时诊断
 scripts/prepare.sh                     获取、锁定并校验上游
 scripts/build.sh                       Linux 干净构建
+scripts/build-vm-image.sh              构建 x86_64/ARM64 VM-only 测试镜像
+scripts/test-vm-smoke.sh               QEMU 启动、网络、SSH 与 LuCI 冒烟测试
+scripts/generate-pages-data.py         生成严格白名单的 Pages Release 索引
+site/                                  GitHub Pages 下载与安全配置站点
 scripts/check-kernel-build-identity.sh Kconfig 构建身份与带产品前缀的 source-lock revision 门禁
 tests/test_openwrt_defconfig_version.sh 锁定 OpenWrt Kconfig defconfig 保留测试
 scripts/collect-build-evidence.sh      构建输入、环境与日志证据

@@ -15,3 +15,6 @@ ax9000-backup-*/
 hardware-evidence/
 ax9000-hardware-evidence-*/
 release-staging/
+
+# Local QEMU smoke-test logs and decompressed VM disks.
+vm-smoke-results/

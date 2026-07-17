@@ -1,0 +1,199 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="NexaWrt for Xiaomi AX9000 — reproducible initramfs RAM-test releases. Do not flash.">
+  <meta name="color-scheme" content="dark">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self'; object-src 'none'; base-uri 'none'; form-action 'none'">
+  <title>NexaWrt · AX9000 RAM Test</title>
+  <link rel="stylesheet" href="styles.css">
+  <script src="app.js" defer></script>
+</head>
+<body>
+  <a class="skip-link" href="#main">跳至内容 / Skip to content</a>
+
+  <header class="safety-banner" role="alert" aria-labelledby="safety-title">
+    <div class="safety-mark" aria-hidden="true">!</div>
+    <div>
+      <p class="eyebrow">SAFETY GATE · 安全门禁</p>
+      <h1 id="safety-title">仅限 RAM 测试 · RAM TEST ONLY</h1>
+      <p><strong>严禁刷写 · DO NOT FLASH.</strong> 这些是 Xiaomi AX9000 initramfs 候选镜像，不是 sysupgrade / factory 固件。不得写入 NAND、UBI 或任何持久分区。</p>
+    </div>
+  </header>
+
+  <main id="main">
+    <section class="hero" aria-labelledby="hero-title">
+      <nav class="topbar" aria-label="主导航 / Main navigation">
+        <a class="brand" href="#main" aria-label="NexaWrt home">
+          <span class="brand-glyph" aria-hidden="true">N</span>
+          <span>NexaWrt</span>
+        </a>
+        <div class="nav-links">
+          <a href="#releases">下载 / Downloads</a>
+          <a href="#configure">配置 / Configure</a>
+          <a href="https://github.com/tifycloud/NexaWrt" target="_blank" rel="noopener noreferrer">GitHub ↗</a>
+        </div>
+      </nav>
+
+      <div class="hero-grid">
+        <div class="hero-copy">
+          <p class="kicker">XIAOMI AX9000 · IPQ807X · INITRAMFS</p>
+          <h2 id="hero-title">先验证，再启动。<br><span>Verify first. Boot from RAM.</span></h2>
+          <p class="lede">面向 Xiaomi AX9000 的可复现、可追溯 OpenWrt RAM 测试候选。每个可下载版本必须同时具备归档摘要与 GitHub 构建来源证明。</p>
+          <div class="hero-actions">
+            <a class="button button-primary" href="#releases">查看已验证版本</a>
+            <a class="button button-secondary" href="https://github.com/tifycloud/NexaWrt/actions/workflows/build.yml" target="_blank" rel="noopener noreferrer">在 GitHub Actions 构建 ↗</a>
+          </div>
+        </div>
+        <aside class="device-card" aria-label="Supported device">
+          <div class="device-orbit" aria-hidden="true"><span>AX</span></div>
+          <dl>
+            <div><dt>设备 / Device</dt><dd>Xiaomi AX9000</dd></div>
+            <div><dt>目标 / Target</dt><dd>qualcommax / ipq807x</dd></div>
+            <div><dt>启动 / Boot</dt><dd>initramfs · root=/dev/ram0</dd></div>
+            <div><dt>状态 / Status</dt><dd class="warning-text">RAM candidate only</dd></div>
+          </dl>
+        </aside>
+      </div>
+    </section>
+
+    <section class="boundary" aria-label="Safety boundaries">
+      <article><span>01</span><h3>只读边界</h3><p>保持持久 UBI 未附加、未挂载、未写入。</p></article>
+      <article><span>02</span><h3>先验摘要</h3><p>下载归档后，使用配套 SHA-256 文件核验。</p></article>
+      <article><span>03</span><h3>来源证明</h3><p>使用 GitHub provenance bundle 检查构建来源。</p></article>
+    </section>
+
+    <section id="releases" class="section releases-section" aria-labelledby="releases-title">
+      <div class="section-heading">
+        <div>
+          <p class="eyebrow">VERIFIED RELEASES · 已验证发布</p>
+          <h2 id="releases-title">选择构建分支</h2>
+        </div>
+        <p id="data-status" class="data-status" role="status">正在读取发布索引… / Loading release index…</p>
+      </div>
+
+      <div class="release-grid">
+        <article class="release-card official" data-flavor="official">
+          <div class="release-card-top">
+            <span class="flavor-dot" aria-hidden="true"></span>
+            <span class="flavor-label">OFFICIAL · 官方</span>
+            <span class="release-badge">RAM ONLY</span>
+          </div>
+          <h3>官方 OpenWrt 路径</h3>
+          <p>基于锁定上游输入的标准软件转发版本。适合作为首选验证基线。</p>
+          <div class="version-row">
+            <div><span>最新版本 / Latest</span><strong data-field="version">—</strong></div>
+            <time data-field="date" datetime="">等待数据</time>
+          </div>
+          <div class="download-actions" data-field="downloads" aria-live="polite"></div>
+          <details>
+            <summary>Provenance · 来源证明</summary>
+            <div class="provenance-links" data-field="provenance"></div>
+          </details>
+          <a class="release-notes" data-field="release-url" hidden target="_blank" rel="noopener noreferrer">发布说明 / Release notes ↗</a>
+        </article>
+
+        <article class="release-card nss" data-flavor="nss">
+          <div class="release-card-top">
+            <span class="flavor-dot" aria-hidden="true"></span>
+            <span class="flavor-label">NSS · 实验性</span>
+            <span class="release-badge experimental">EXPERIMENTAL</span>
+          </div>
+          <h3>NSS 加速路径</h3>
+          <p>包含锁定的 NSS 组件，供受控网络性能实验。风险与验证范围不同于官方版本。</p>
+          <div class="version-row">
+            <div><span>最新版本 / Latest</span><strong data-field="version">—</strong></div>
+            <time data-field="date" datetime="">等待数据</time>
+          </div>
+          <div class="download-actions" data-field="downloads" aria-live="polite"></div>
+          <details>
+            <summary>Provenance · 来源证明</summary>
+            <div class="provenance-links" data-field="provenance"></div>
+          </details>
+          <a class="release-notes" data-field="release-url" hidden target="_blank" rel="noopener noreferrer">发布说明 / Release notes ↗</a>
+        </article>
+      </div>
+
+      <div class="history-panel">
+        <div class="history-heading">
+          <div><p class="eyebrow">RELEASE HISTORY · 历史版本</p><h3>已完成完整资产校验的候选</h3></div>
+          <a href="https://github.com/tifycloud/NexaWrt/releases" target="_blank" rel="noopener noreferrer">全部 GitHub Releases ↗</a>
+        </div>
+        <div id="release-history" class="history-list">
+          <p class="empty-state">正在加载历史版本… / Loading history…</p>
+        </div>
+      </div>
+    </section>
+
+    <section id="verify" class="section verify-section" aria-labelledby="verify-title">
+      <div class="section-heading compact">
+        <div><p class="eyebrow">THREE-STEP CHECK · 三步核验</p><h2 id="verify-title">下载不等于批准启动</h2></div>
+      </div>
+      <ol class="verify-steps">
+        <li><span>1</span><div><h3>核对归档</h3><p>仅下载卡片中的 <code>verified-dist.tar.gz</code> 与同名 <code>.sha256</code>。</p></div></li>
+        <li><span>2</span><div><h3>验证摘要</h3><pre><code>sha256sum -c NexaWrt-AX9000-*-verified-dist.tar.gz.sha256</code></pre></div></li>
+        <li><span>3</span><div><h3>检查来源并遵循真机门禁</h3><p>下载 archive/checksums/firmware/SBOM provenance；仍需 UART、恢复、运行时与压力测试批准。</p></div></li>
+      </ol>
+    </section>
+
+    <section id="configure" class="section configure-section" aria-labelledby="configure-title">
+      <div class="config-copy">
+        <p class="eyebrow">VOLATILE SETUP · 临时配置</p>
+        <h2 id="configure-title">生成安全的 RAM 会话配置片段</h2>
+        <p>此工具仅生成主机名、LAN IP、时区和无线国家码。<strong>不收集、不生成密码或密钥，不会把任何设置烘焙进下载镜像。</strong></p>
+        <div class="not-baked"><span aria-hidden="true">↯</span><p>复制后由你在已启动的 RAM 测试会话中审阅并执行。重启后不应依赖这些临时设置；该片段不执行刷写或持久分区操作。</p></div>
+      </div>
+
+      <form id="config-form" class="config-form" novalidate>
+        <label>主机名 / Hostname
+          <input id="hostname" name="hostname" value="nexawrt-ax9000" maxlength="63" pattern="[A-Za-z0-9](?:[A-Za-z0-9\-]{0,61}[A-Za-z0-9])?" autocomplete="off" required>
+        </label>
+        <label>LAN IP
+          <input id="lan-ip" name="lan-ip" value="192.168.8.1" inputmode="decimal" autocomplete="off" required aria-describedby="lan-help">
+          <small id="lan-help">仅接受 RFC1918 私有 IPv4 地址 / Private IPv4 only</small>
+        </label>
+        <div class="field-grid">
+          <label>时区 / Timezone
+            <select id="timezone" name="timezone">
+              <option value="Asia/Shanghai">Asia/Shanghai</option>
+              <option value="Asia/Tokyo">Asia/Tokyo</option>
+              <option value="Asia/Singapore">Asia/Singapore</option>
+              <option value="Europe/London">Europe/London</option>
+              <option value="Europe/Berlin">Europe/Berlin</option>
+              <option value="America/New_York">America/New_York</option>
+              <option value="America/Los_Angeles">America/Los_Angeles</option>
+              <option value="Australia/Sydney">Australia/Sydney</option>
+              <option value="UTC">UTC</option>
+            </select>
+          </label>
+          <label>国家码 / Country
+            <select id="country" name="country">
+              <option value="CN">CN · China</option>
+              <option value="US">US · United States</option>
+              <option value="GB">GB · United Kingdom</option>
+              <option value="DE">DE · Germany</option>
+              <option value="JP">JP · Japan</option>
+              <option value="AU">AU · Australia</option>
+              <option value="SG">SG · Singapore</option>
+            </select>
+          </label>
+        </div>
+        <p id="config-error" class="form-error" role="alert" hidden></p>
+        <button class="button button-primary" type="submit">生成片段 / Generate snippet</button>
+      </form>
+
+      <div class="snippet-panel" aria-labelledby="snippet-title">
+        <div class="snippet-toolbar"><span id="snippet-title">nexawrt-session-setup.sh</span><button id="copy-snippet" type="button" disabled>复制 / Copy</button></div>
+        <pre><code id="config-output"># 填写并验证上方字段后生成 / Complete the safe fields above</code></pre>
+      </div>
+    </section>
+  </main>
+
+  <footer>
+    <div><span class="brand-glyph" aria-hidden="true">N</span><strong>NexaWrt</strong></div>
+    <p>Xiaomi AX9000 initramfs RAM-test project · Not affiliated with Xiaomi or OpenWrt.</p>
+    <a href="https://github.com/tifycloud/NexaWrt/actions" target="_blank" rel="noopener noreferrer">Build status ↗</a>
+  </footer>
+</body>
+</html>
