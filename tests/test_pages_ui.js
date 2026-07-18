@@ -25,14 +25,32 @@ class FakeElement {
     this.href = undefined;
     this.target = '';
     this.rel = '';
+    this.value = '';
+    this.disabled = false;
+    this.attributes = new Map();
     this.fields = new Map();
+    this.listeners = new Map();
   }
   querySelector(selector) { return this.fields.get(selector) || null; }
   replaceChildren(...children) {
     this.children = children.flatMap((child) => child?.tagName === '#fragment' ? child.children : [child]);
   }
   append(...children) { this.children.push(...children); }
-  removeAttribute(name) { if (name === 'href') this.href = undefined; }
+  addEventListener(type, listener) {
+    const listeners = this.listeners.get(type) || [];
+    listeners.push(listener);
+    this.listeners.set(type, listeners);
+  }
+  dispatchEvent(event) {
+    event.currentTarget = this;
+    for (const listener of this.listeners.get(event.type) || []) listener.call(this, event);
+  }
+  setAttribute(name, value) { this.attributes.set(name, String(value)); }
+  getAttribute(name) { return this.attributes.has(name) ? this.attributes.get(name) : null; }
+  removeAttribute(name) {
+    this.attributes.delete(name);
+    if (name === 'href') this.href = undefined;
+  }
 }
 
 function makeCard() {
@@ -61,6 +79,24 @@ function makeDom() {
   selectors.set('#device-doc-links', new FakeElement('div'));
   selectors.set('#release-history', new FakeElement('div'));
   selectors.set('#data-status', new FakeElement('p'));
+  const configForm = new FakeElement('form');
+  configForm.elements = {
+    hostname: new FakeElement('input'),
+    'lan-ip': new FakeElement('input'),
+    timezone: new FakeElement('select'),
+    country: new FakeElement('select'),
+  };
+  configForm.elements.hostname.value = 'nexawrt-ax9000';
+  configForm.elements['lan-ip'].value = '192.168.8.1';
+  configForm.elements.timezone.value = 'Asia/Shanghai';
+  configForm.elements.country.value = 'CN';
+  selectors.set('#config-form', configForm);
+  selectors.set('#config-error', new FakeElement('p'));
+  selectors.get('#config-error').hidden = true;
+  selectors.set('#config-output', new FakeElement('code'));
+  selectors.get('#config-output').textContent = '# initial placeholder';
+  selectors.set('#copy-snippet', new FakeElement('button'));
+  selectors.get('#copy-snippet').disabled = true;
   selectors.set('[data-flavor="official"]', makeCard());
   selectors.set('[data-flavor="nss"]', makeCard());
   return {
@@ -73,8 +109,8 @@ function makeDom() {
 
 const root = path.resolve(__dirname, '..');
 const source = fs.readFileSync(path.join(root, 'site/app.js'), 'utf8');
-const testedSource = source.split('\nconst TIMEZONES =', 1)[0] +
-  '\nglobalThis.hooks = { validDevice, validRelease, validReleaseGroup, validUtcTimestamp, compareVersions, loadReleases };\n';
+const testedSource = source.replace(/\nloadReleases\(\);\s*$/, '\n') +
+  '\nglobalThis.hooks = { validDevice, validRelease, validReleaseGroup, validUtcTimestamp, compareVersions, loadReleases, generateSnippet };\n';
 const document = makeDom();
 const loggedErrors = [];
 const context = vm.createContext({
@@ -84,7 +120,7 @@ const context = vm.createContext({
   console: { error: (...args) => loggedErrors.push(args) },
 });
 vm.runInContext(testedSource, context, { filename: 'site/app.js' });
-const { validDevice, validRelease, validReleaseGroup, validUtcTimestamp, compareVersions, loadReleases } = context.hooks;
+const { validDevice, validRelease, validReleaseGroup, validUtcTimestamp, compareVersions, loadReleases, generateSnippet } = context.hooks;
 const clone = (value) => JSON.parse(JSON.stringify(value));
 
 const index = JSON.parse(fs.readFileSync(path.join(root, 'site/releases.json'), 'utf8'));
@@ -195,6 +231,19 @@ async function loadWith(responseFactory) {
 }
 
 function card(flavor) { return document.querySelector(`[data-flavor="${flavor}"]`); }
+function dispatchConfigEvent(type) {
+  document.querySelector('#config-form').dispatchEvent({
+    type,
+    preventDefault() {},
+  });
+}
+function submitConfig() { dispatchConfigEvent('submit'); }
+function assertNoInvalidFields() {
+  const fields = document.querySelector('#config-form').elements;
+  for (const name of ['hostname', 'lan-ip', 'timezone', 'country']) {
+    assert.equal(fields[name].getAttribute('aria-invalid'), null);
+  }
+}
 function assertSafeEmptyState() {
   const build = document.querySelector('#browser-build-link');
   const officialCard = card('official');
@@ -212,6 +261,52 @@ function assertSafeEmptyState() {
 }
 
 (async () => {
+  const configForm = document.querySelector('#config-form');
+  const configOutput = document.querySelector('#config-output');
+  const configError = document.querySelector('#config-error');
+  const copyButton = document.querySelector('#copy-snippet');
+
+  submitConfig();
+  const validSnippet = configOutput.textContent;
+  assert.match(validSnippet, /set network\.lan\.ipaddr='192\.168\.8\.1'/);
+  assert.equal(copyButton.disabled, false);
+  assert.equal(configError.hidden, true);
+  assertNoInvalidFields();
+
+  configForm.elements['lan-ip'].value = '8.8.8.8';
+  dispatchConfigEvent('input');
+  assert.equal(configOutput.textContent, '# 配置尚未通过验证 / Configuration not validated');
+  assert.equal(configOutput.textContent.includes(validSnippet), false);
+  assert.equal(copyButton.disabled, true);
+  assert.equal(configError.hidden, true);
+  assert.equal(configError.textContent, '');
+  assertNoInvalidFields();
+
+  submitConfig();
+  assert.equal(configOutput.textContent, '# 配置尚未通过验证 / Configuration not validated');
+  assert.equal(copyButton.disabled, true);
+  assert.equal(configError.hidden, false);
+  assert.match(configError.textContent, /LAN IP/);
+  assert.equal(configForm.elements['lan-ip'].getAttribute('aria-invalid'), 'true');
+  assert.equal(configForm.elements.hostname.getAttribute('aria-invalid'), null);
+  assert.equal(configForm.elements.timezone.getAttribute('aria-invalid'), null);
+  assert.equal(configForm.elements.country.getAttribute('aria-invalid'), null);
+
+  configForm.elements['lan-ip'].value = '10.0.0.1';
+  dispatchConfigEvent('change');
+  assert.equal(configOutput.textContent, '# 配置尚未通过验证 / Configuration not validated');
+  assert.equal(copyButton.disabled, true);
+  assert.equal(configError.hidden, true);
+  assert.equal(configError.textContent, '');
+  assertNoInvalidFields();
+
+  submitConfig();
+  assert.match(configOutput.textContent, /set network\.lan\.ipaddr='10\.0\.0\.1'/);
+  assert.notEqual(configOutput.textContent, validSnippet);
+  assert.equal(copyButton.disabled, false);
+  assert.equal(configError.hidden, true);
+  assertNoInvalidFields();
+
   await loadWith(async () => ({ ok: true, json: async () => clone(validIndex) }));
   assert.equal(document.querySelector('#browser-build-link').hidden, false);
   assert.equal(document.querySelector('#browser-build-link').href, device.browser_build_workflow_url);
@@ -240,7 +335,7 @@ function assertSafeEmptyState() {
   assertSafeEmptyState();
   assert.equal(loggedErrors.length >= 5, true);
 
-  console.log('Pages UI policy: validators, semantic ordering, and load failures fail closed');
+  console.log('Pages UI policy: edits invalidate stale config and release loading fails closed');
 })().catch((error) => {
   console.error(error);
   process.exitCode = 1;

@@ -321,10 +321,31 @@ function isPrivateIPv4(value) {
   return privateRange && d !== 0 && d !== 255;
 }
 
+const CONFIG_OUTPUT_PLACEHOLDER = '# 配置尚未通过验证 / Configuration not validated';
+const CONFIG_FIELD_NAMES = ['hostname', 'lan-ip', 'timezone', 'country'];
+
+function invalidateConfigSnippet(form) {
+  const error = document.querySelector('#config-error');
+  const output = document.querySelector('#config-output');
+  const copyButton = document.querySelector('#copy-snippet');
+
+  output.textContent = CONFIG_OUTPUT_PLACEHOLDER;
+  copyButton.disabled = true;
+  copyButton.textContent = '复制 / Copy';
+  error.textContent = '';
+  error.hidden = true;
+  for (const name of CONFIG_FIELD_NAMES) form.elements[name].removeAttribute('aria-invalid');
+}
+
 function generateSnippet(event) {
   event.preventDefault();
   const form = event.currentTarget;
+  invalidateConfigSnippet(form);
+
   const error = document.querySelector('#config-error');
+  const output = document.querySelector('#config-output');
+  const copyButton = document.querySelector('#copy-snippet');
+
   const hostname = form.elements.hostname.value.trim().toLowerCase();
   const lanIp = form.elements['lan-ip'].value.trim();
   const zonename = form.elements.timezone.value;
@@ -332,18 +353,27 @@ function generateSnippet(event) {
   const hostnamePattern = /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/;
 
   let problem = '';
-  if (!hostnamePattern.test(hostname)) problem = '主机名必须为 1–63 个字母、数字或中划线，且不能以中划线开头或结尾。';
-  else if (!isPrivateIPv4(lanIp)) problem = 'LAN IP 必须是有效的 RFC1918 私有 IPv4 主机地址。';
-  else if (!Object.hasOwn(TIMEZONES, zonename)) problem = '请选择列表中的时区。';
-  else if (!COUNTRIES.has(country)) problem = '请选择列表中的无线国家码。';
+  let invalidField = '';
+  if (!hostnamePattern.test(hostname)) {
+    problem = '主机名必须为 1–63 个字母、数字或中划线，且不能以中划线开头或结尾。';
+    invalidField = 'hostname';
+  } else if (!isPrivateIPv4(lanIp)) {
+    problem = 'LAN IP 必须是有效的 RFC1918 私有 IPv4 主机地址。';
+    invalidField = 'lan-ip';
+  } else if (!Object.hasOwn(TIMEZONES, zonename)) {
+    problem = '请选择列表中的时区。';
+    invalidField = 'timezone';
+  } else if (!COUNTRIES.has(country)) {
+    problem = '请选择列表中的无线国家码。';
+    invalidField = 'country';
+  }
 
   if (problem) {
+    form.elements[invalidField].setAttribute('aria-invalid', 'true');
     error.textContent = problem;
     error.hidden = false;
-    document.querySelector('#copy-snippet').disabled = true;
     return;
   }
-  error.hidden = true;
 
   const snippet = `# NexaWrt RAM-session configuration — review before running
 # Volatile runtime settings only; this does not modify or rebuild the image.
@@ -364,8 +394,8 @@ NEXAWRT_SAFE_CONFIG
 /etc/init.d/network reload
 wifi reload
 `;
-  document.querySelector('#config-output').textContent = snippet;
-  document.querySelector('#copy-snippet').disabled = false;
+  output.textContent = snippet;
+  copyButton.disabled = false;
 }
 
 async function copySnippet() {
@@ -379,6 +409,9 @@ async function copySnippet() {
   }
 }
 
-document.querySelector('#config-form').addEventListener('submit', generateSnippet);
+const configForm = document.querySelector('#config-form');
+configForm.addEventListener('submit', generateSnippet);
+configForm.addEventListener('input', () => invalidateConfigSnippet(configForm));
+configForm.addEventListener('change', () => invalidateConfigSnippet(configForm));
 document.querySelector('#copy-snippet').addEventListener('click', copySnippet);
 loadReleases();
