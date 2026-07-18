@@ -202,3 +202,28 @@ footer p { margin: 0; text-align: center; }
 /* Keep long verification commands inside their own scroll containers on phones. */
 .verify-steps li > div { min-width: 0; }
 .verify-steps pre, .snippet-panel pre { width: 100%; min-width: 0; }
+
+.device-doc-links,
+.support-links {
+  display: flex;
+  flex-wrap: wrap;
+  gap: .75rem;
+}
+
+.device-doc-links {
+  margin-top: 1rem;
+}
+
+.device-doc-links a,
+.support-links a {
+  color: var(--muted);
+  font-size: .82rem;
+  text-decoration: none;
+  border-bottom: 1px solid rgba(255, 255, 255, .22);
+}
+
+.device-doc-links a:hover,
+.support-links a:hover {
+  color: var(--text);
+  border-bottom-color: currentColor;
+}

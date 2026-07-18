@@ -16,6 +16,7 @@ on:
       - 'THIRD_PARTY_NOTICES.md'
       - 'Makefile'
       - 'docs/**'
+      - 'devices/**'
       - 'tests/**'
       - 'configs/**'
       - 'files/**'
@@ -90,6 +91,10 @@ jobs:
               exit 1
               ;;
           esac
+          python3 scripts/device_metadata.py \
+            --device xiaomi-ax9000 \
+            --flavor "$REQUESTED_FLAVOR" \
+            --channel ram-test
           printf 'flavor=%s\nwork_basename=%s\nstaging_basename=%s\n' \
             "$REQUESTED_FLAVOR" "$work_basename" "$staging_basename" >> "$GITHUB_OUTPUT"
 

@@ -5,7 +5,10 @@ on:
     branches: [main]
     paths:
       - 'site/**'
+      - 'devices/**'
+      - 'scripts/device_metadata.py'
       - 'scripts/generate-pages-data.py'
+      - 'scripts/verify-pages-releases.py'
       - '.github/workflows/pages.yml'
   workflow_run:
     workflows: ['NexaWrt AX9000 reproducible RAM-test release']
@@ -26,20 +29,42 @@ jobs:
       github.repository == 'tifycloud/NexaWrt' &&
       (github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success')
     runs-on: ubuntu-24.04
+    timeout-minutes: 30
     permissions:
       contents: read
+      attestations: read
     steps:
       - name: Checkout trusted site source
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
         with:
           ref: refs/heads/main
+          fetch-depth: 0
           persist-credentials: false
-      - name: Generate allowlisted release index
+      - name: Pin attestation verifier executable
+        run: |
+          test -x /usr/bin/gh
+          test ! -L /usr/bin/gh
+          echo 'NEXAWRT_ATTESTATION_VERIFIER=/usr/bin/gh' >> "$GITHUB_ENV"
+          echo "NEXAWRT_ATTESTATION_VERIFIER_SHA256=$(sha256sum /usr/bin/gh | awk '{print $1}')" >> "$GITHUB_ENV"
+      - name: Generate attestation-gated release index
         env:
           GITHUB_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          python3 scripts/generate-pages-data.py --output site/releases.json
+          mkdir .pages-index
+          gh api \
+            -H 'Accept: application/vnd.github+json' \
+            -H 'X-GitHub-Api-Version: 2026-03-10' \
+            "repos/$GITHUB_REPOSITORY/releases?per_page=100" > .pages-index/releases.json
+          python3 scripts/verify-pages-releases.py \
+            --input .pages-index/releases.json \
+            --output .pages-index/release-proofs.json \
+            --trusted-main HEAD
+          python3 scripts/generate-pages-data.py \
+            --input .pages-index/releases.json \
+            --proofs .pages-index/release-proofs.json \
+            --output site/releases.json
+          python3 -m json.tool .pages-index/release-proofs.json >/dev/null
           python3 -m json.tool site/releases.json >/dev/null
           if find site \( -type l -o -type f -links +1 \) -print -quit | grep -q .; then
             echo 'The Pages artifact must not contain symbolic or hard links.' >&2
