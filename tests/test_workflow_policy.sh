@@ -63,6 +63,10 @@ for required in (
     "official_tag_pattern=",
     "release_tag_is_absent()",
     'release_tag_is_absent "$GITHUB_REF_NAME"',
+    'python3 scripts/device_metadata.py',
+    '--device xiaomi-ax9000',
+    '--flavor "$flavor"',
+    '--channel ram-test',
     'NEXAWRT_FLAVOR="$flavor" ./tests/test_static.sh',
 ):
     if required not in tag_text:
@@ -507,7 +511,9 @@ then
   echo 'release workflow copies a file into verified-dist' >&2; exit 1
 fi
 grep -Fq 'mkdir release-staging/publish' "$RELEASE"
+grep -Fq -- 'tar --format=ustar --sort=name --owner=0 --group=0 --numeric-owner --mtime="@$source_epoch"' "$RELEASE"
 grep -Fq -- '-C release-staging -cf - verified-dist | gzip -9n > "release-staging/publish/$archive_basename"' "$RELEASE"
+! grep -Fq 'tar --sort=name --owner=0 --group=0 --numeric-owner' "$RELEASE"
 grep -Fq 'sha256sum "$archive_basename" > "$archive_basename.sha256"' "$RELEASE"
 grep -Fq 'sha256sum -c "$archive_basename.sha256"' "$RELEASE"
 grep -Fq 'tar -xzf "release-staging/publish/$archive_basename" -C "$extract_dir"' "$RELEASE"

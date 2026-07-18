@@ -7,6 +7,7 @@
   <meta name="color-scheme" content="dark">
   <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self'; object-src 'none'; base-uri 'none'; form-action 'none'">
   <title>NexaWrt · AX9000 RAM Test</title>
+  <link rel="icon" href="favicon.svg" type="image/svg+xml">
   <link rel="stylesheet" href="styles.css">
   <script src="app.js" defer></script>
 </head>
@@ -43,16 +44,17 @@
           <p class="lede">面向 Xiaomi AX9000 的可复现、可追溯 OpenWrt RAM 测试候选。每个可下载版本必须同时具备归档摘要与 GitHub 构建来源证明。</p>
           <div class="hero-actions">
             <a class="button button-primary" href="#releases">查看已验证版本</a>
-            <a class="button button-secondary" href="https://github.com/tifycloud/NexaWrt/actions/workflows/build.yml" target="_blank" rel="noopener noreferrer">在 GitHub Actions 构建 ↗</a>
+            <a id="browser-build-link" class="button button-secondary" hidden target="_blank" rel="noopener noreferrer">在 GitHub Actions 构建 ↗</a>
           </div>
+          <div id="device-doc-links" class="device-doc-links" aria-label="Device documentation"></div>
         </div>
         <aside class="device-card" aria-label="Supported device">
           <div class="device-orbit" aria-hidden="true"><span>AX</span></div>
           <dl>
-            <div><dt>设备 / Device</dt><dd>Xiaomi AX9000</dd></div>
-            <div><dt>目标 / Target</dt><dd>qualcommax / ipq807x</dd></div>
+            <div><dt>设备 / Device</dt><dd data-device-field="name">等待目录 / Loading</dd></div>
+            <div><dt>目标 / Target</dt><dd data-device-field="target">—</dd></div>
             <div><dt>启动 / Boot</dt><dd>initramfs · root=/dev/ram0</dd></div>
-            <div><dt>状态 / Status</dt><dd class="warning-text">RAM candidate only</dd></div>
+            <div><dt>状态 / Status</dt><dd class="warning-text" data-device-field="status">等待验证 / Loading</dd></div>
           </dl>
         </aside>
       </div>
@@ -91,6 +93,7 @@
             <summary>Provenance · 来源证明</summary>
             <div class="provenance-links" data-field="provenance"></div>
           </details>
+          <div class="support-links" data-field="support-links"></div>
           <a class="release-notes" data-field="release-url" hidden target="_blank" rel="noopener noreferrer">发布说明 / Release notes ↗</a>
         </article>
 
@@ -111,6 +114,7 @@
             <summary>Provenance · 来源证明</summary>
             <div class="provenance-links" data-field="provenance"></div>
           </details>
+          <div class="support-links" data-field="support-links"></div>
           <a class="release-notes" data-field="release-url" hidden target="_blank" rel="noopener noreferrer">发布说明 / Release notes ↗</a>
         </article>
       </div>

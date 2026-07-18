@@ -271,12 +271,35 @@ Immutable Releases，并配置仅限此仓库、具备 Administration(read) 的 
 provenance。所有 RC 都是 prerelease 且不会被标记为 Latest。完整规则与失败恢复步骤见
 [版本化发布说明](docs/RELEASES.md)。
 
-GitHub Pages 站点由仓库内 `site/` 提供，合并并启用 Pages 后地址为
-<https://tifycloud.github.io/NexaWrt/>。网站只展示 `immutable=true` 且远端资产集合严格等于六个预期文件的 GitHub prerelease；任何额外、
-缺失、重复、非 `uploaded` 或大小无效的资产都会使整个 Release 被拒绝。站点会在 `main` 更新、
-发布工作流成功后以及每 6 小时周期复验并重新部署。Official 与 NSS 分频道，Release 尚不存在时
-显示安全空状态；它还提供不包含密码、密钥或 Token 的
-RAM 会话 UCI 配置片段生成器。网站不是刷机工具，也不会把配置烘焙进镜像。
+GitHub Pages 站点由仓库内 `site/` 提供，地址为
+<https://tifycloud.github.io/NexaWrt/>。`devices/xiaomi-ax9000/device.json` 是当前设备能力、flavor、
+频道、文档入口和硬件批准状态的单一事实来源；构建、发布、Pages 数据生成和前端展示都会严格复验它。
+目录当前只能声明 `hardware_status=unverified`、`production_ready=false`，并且只允许 RAM 启动，
+`factory`/`sysupgrade` 必须保持关闭。真机证据未通过前，任何把 AX9000 标成已验证或生产可用的改动都会使策略测试失败。
+
+Pages 门禁从 `refs/heads/main` 做 `fetch-depth: 0` 的完整 checkout，并把该 checkout 作为信任根。
+候选 Release 必须是 `immutable=true` 的 prerelease；其发布 tag 必须是直接指向 commit 的轻量 tag，
+且该 commit 必须是当前受信任 `main` 的祖先。门禁按 Release asset ID 下载并校验精确六个资产：带版本的
+verified-dist archive、对应的外部 `.sha256`，以及 `archive`、`checksums`、`firmware`、`sbom` 四个
+provenance bundle。任何额外、缺失、重复、非 `uploaded`、大小无效或内容不匹配的资产都会使整个
+Release 被排除。验证器先只下载 archive 与其 provenance 并立即鉴权，通过后才下载其余四个资产；
+每个 flavor 最多验证 12 个最新候选，单次运行还有 768 MiB 总下载预算和 30 分钟作业上限。
+
+下载后，外部 `.sha256` 必须精确绑定 archive；archive 内的 `SHA256SUMS` 还必须分别绑定其中的
+AX9000 initramfs firmware 与 CycloneDX SBOM。随后四个 provenance bundle 分别验证 archive、归档内
+`SHA256SUMS`、firmware 和 SBOM，并同时约束仓库为 `tifycloud/NexaWrt`、签名工作流为
+`.github/workflows/release.yml`、source ref 为当前 `refs/tags/<tag>`、source digest 为该轻量 tag 指向的
+`main` 祖先提交，并拒绝 self-hosted runner，只接受 GitHub-hosted runner 产生的证明。所有检查通过后，
+`scripts/verify-pages-releases.py` 才生成严格 proof manifest；`scripts/generate-pages-data.py` 必须消费
+匹配 Release ID 的 proof 才会把下载项写入页面索引。因此，即使有人手工创建名称和六资产外观都相同的
+immutable/prerelease lookalike，只要缺少上述可信来源与摘要证明，也会从网站中排除。
+
+站点会在 `main` 更新、发布工作流成功后以及每 6 小时周期复验并重新部署。Official 与 NSS 分频道，
+Release 尚不存在或证明失败时页面会明确显示不可下载。站点从 schema-v2 目录生成浏览器云编译、恢复与
+测试文档的固定链接，并提供只生成易失性 RAM 会话 UCI 配置片段的生成器。前端对异常设备元数据、异常
+URL、历史顺序、重复 tag、`latest` 不一致或非 RAM-only 状态全部 fail-closed。**当前目录仍仅支持
+Xiaomi AX9000 的 RAM-only 候选，硬件状态为未验证，绝非生产可用或可刷写固件。**网站不是刷机工具，
+也不会把配置烘焙进镜像。
 
 
 ## License
@@ -302,8 +325,11 @@ scripts/prepare.sh                     获取、锁定并校验上游
 scripts/build.sh                       Linux 干净构建
 scripts/build-vm-image.sh              构建 x86_64/ARM64 VM-only 测试镜像
 scripts/test-vm-smoke.sh               QEMU 启动、网络、SSH 与 LuCI 冒烟测试
-scripts/generate-pages-data.py         生成严格白名单的 Pages Release 索引
-site/                                  GitHub Pages 下载与安全配置站点
+devices/xiaomi-ax9000/device.json      AX9000 RAM-only 设备目录单一事实来源
+scripts/device_metadata.py              严格设备目录与构建请求校验器
+scripts/verify-pages-releases.py         验证 Release 来源、资产、摘要与 provenance 并生成 proof manifest
+scripts/generate-pages-data.py           生成 schema-v2 严格白名单 Pages Release 索引
+site/                                    GitHub Pages 下载与安全配置站点
 scripts/check-kernel-build-identity.sh Kconfig 构建身份与带产品前缀的 source-lock revision 门禁
 tests/test_openwrt_defconfig_version.sh 锁定 OpenWrt Kconfig defconfig 保留测试
 scripts/collect-build-evidence.sh      构建输入、环境与日志证据

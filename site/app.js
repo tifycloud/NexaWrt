@@ -1,13 +1,30 @@
 'use strict';
 
 const REPOSITORY = 'tifycloud/NexaWrt';
+const DEVICE_ID = 'xiaomi-ax9000';
 const FLAVORS = ['official', 'nss'];
+const BUILD_WORKFLOW_URL = `https://github.com/${REPOSITORY}/actions/workflows/build.yml`;
+const RECOVERY_URL = `https://github.com/${REPOSITORY}/blob/main/docs/RECOVERY.md`;
+const TESTING_URL = `https://github.com/${REPOSITORY}/blob/main/docs/TESTING.md`;
 const PROVENANCE_LABELS = {
   provenance_archive: 'Archive bundle',
   provenance_checksums: 'Checksums bundle',
   provenance_firmware: 'Firmware bundle',
   provenance_sbom: 'SBOM bundle'
 };
+
+function exactKeys(value, expected) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+  const actual = Object.keys(value).sort();
+  const required = [...expected].sort();
+  return actual.length === required.length && actual.every((key, index) => key === required[index]);
+}
+
+function validUtcTimestamp(value) {
+  if (typeof value !== 'string' || !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$/.test(value)) return false;
+  const parsed = new Date(value);
+  return !Number.isNaN(parsed.getTime()) && parsed.toISOString().replace('.000Z', 'Z') === value;
+}
 
 function makeLink(label, url, className = '') {
   const link = document.createElement('a');
@@ -19,27 +36,59 @@ function makeLink(label, url, className = '') {
   return link;
 }
 
-function isSafeGitHubUrl(value) {
+function validHttpsGitHubUrl(value, expectedPath) {
   try {
     const url = new URL(value);
     return url.protocol === 'https:' && url.hostname === 'github.com' &&
-      url.pathname.startsWith(`/${REPOSITORY}/releases/`);
+      url.username === '' && url['password'] === '' && url.port === '' &&
+      url.search === '' && url.hash === '' && url.pathname === expectedPath;
   } catch {
     return false;
   }
 }
 
-function validRelease(release, flavor) {
-  if (!release || typeof release !== 'object') return false;
+function validDevice(device) {
+  const keys = [
+    'schema', 'id', 'display_name', 'vendor', 'model', 'target', 'subtarget', 'profile',
+    'hardware_status', 'production_ready', 'website_visible', 'image_capabilities',
+    'flavors', 'channels', 'browser_build_workflow_url', 'recovery_url', 'testing_url'
+  ];
+  if (!exactKeys(device, keys) || device.schema !== 1 || device.id !== DEVICE_ID ||
+      device.display_name !== 'Xiaomi AX9000' || device.vendor !== 'Xiaomi' || device.model !== 'AX9000' ||
+      device.target !== 'qualcommax' || device.subtarget !== 'ipq807x' || device.profile !== 'xiaomi_ax9000' ||
+      device.hardware_status !== 'unverified' || device.production_ready !== false ||
+      device.website_visible !== true) return false;
+  if (!exactKeys(device.image_capabilities, ['ram_boot', 'factory', 'sysupgrade']) ||
+      device.image_capabilities.ram_boot !== true || device.image_capabilities.factory !== false ||
+      device.image_capabilities.sysupgrade !== false) return false;
+  if (!exactKeys(device.flavors, FLAVORS) ||
+      !exactKeys(device.flavors.official, ['experimental']) || device.flavors.official.experimental !== false ||
+      !exactKeys(device.flavors.nss, ['experimental']) || device.flavors.nss.experimental !== true) return false;
+  if (!Array.isArray(device.channels) || device.channels.length !== 1 || device.channels[0] !== 'ram-test') return false;
+  return device.browser_build_workflow_url === BUILD_WORKFLOW_URL &&
+    device.recovery_url === RECOVERY_URL && device.testing_url === TESTING_URL;
+}
+
+function validRelease(release, flavor, device) {
+  const keys = [
+    'device_id', 'device_name', 'flavor', 'flavor_experimental', 'channel', 'hardware_status',
+    'production_ready', 'ram_only', 'version', 'tag', 'published_at', 'release_url',
+    'browser_build_workflow_url', 'recovery_url', 'testing_url', 'assets'
+  ];
+  if (!validDevice(device) || !exactKeys(release, keys)) return false;
   const versionPattern = /^v(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)-rc\.(?:0|[1-9]\d*)$/;
-  const tagPattern = flavor === 'nss'
-    ? /^ram-test-nss-v(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)-rc\.(?:0|[1-9]\d*)$/
-    : /^ram-test-v(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)-rc\.(?:0|[1-9]\d*)$/;
   const expectedTag = flavor === 'nss' ? `ram-test-nss-${release.version}` : `ram-test-${release.version}`;
-  if (!tagPattern.test(release.tag) || typeof release.version !== 'string' ||
-      !versionPattern.test(release.version) || release.tag !== expectedTag || !isSafeGitHubUrl(release.url)) return false;
-  if (!release.assets || typeof release.assets !== 'object') return false;
-  const archive = `NexaWrt-AX9000-${flavor}-${release.version}-verified-dist.tar.gz`;
+  if (release.device_id !== device.id || release.device_name !== device.display_name ||
+      release.flavor !== flavor || release.flavor_experimental !== device.flavors[flavor].experimental ||
+      release.channel !== 'ram-test' || release.hardware_status !== 'unverified' ||
+      release.production_ready !== false || release.ram_only !== true ||
+      typeof release.version !== 'string' || !versionPattern.test(release.version) || release.tag !== expectedTag ||
+      !validUtcTimestamp(release.published_at) ||
+      release.browser_build_workflow_url !== device.browser_build_workflow_url ||
+      release.recovery_url !== device.recovery_url || release.testing_url !== device.testing_url ||
+      !validHttpsGitHubUrl(release.release_url, `/${REPOSITORY}/releases/tag/${expectedTag}`)) return false;
+
+  const archive = `NexaWrt-${device.model}-${flavor}-${release.version}-verified-dist.tar.gz`;
   const expectedNames = {
     archive,
     checksum: `${archive}.sha256`,
@@ -48,11 +97,51 @@ function validRelease(release, flavor) {
     provenance_firmware: 'firmware.provenance.bundle.json',
     provenance_sbom: 'sbom.provenance.bundle.json'
   };
+  if (!exactKeys(release.assets, Object.keys(expectedNames))) return false;
   return Object.entries(expectedNames).every(([key, expectedName]) => {
     const asset = release.assets[key];
-    return asset && asset.name === expectedName && isSafeGitHubUrl(asset.url) &&
-      new URL(asset.url).pathname.endsWith(`/${expectedName}`);
+    return exactKeys(asset, ['name', 'url', 'size']) && asset.name === expectedName &&
+      Number.isInteger(asset.size) && asset.size > 0 &&
+      validHttpsGitHubUrl(asset.url, `/${REPOSITORY}/releases/download/${expectedTag}/${expectedName}`);
   });
+}
+
+function versionTuple(version) {
+  const match = /^v(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)-rc\.(0|[1-9]\d*)$/.exec(version);
+  return match ? match.slice(1).map((part) => BigInt(part)) : null;
+}
+
+function compareVersions(left, right) {
+  const leftParts = versionTuple(left);
+  const rightParts = versionTuple(right);
+  if (!leftParts || !rightParts) return 0;
+  for (let index = 0; index < leftParts.length; index += 1) {
+    if (leftParts[index] < rightParts[index]) return -1;
+    if (leftParts[index] > rightParts[index]) return 1;
+  }
+  return 0;
+}
+
+function validReleaseGroup(group, flavor, device) {
+  if (!exactKeys(group, ['latest', 'history']) || !Array.isArray(group.history) || group.history.length > 12) {
+    return false;
+  }
+  if (group.history.length === 0) return group.latest === null;
+  if (!validRelease(group.latest, flavor, device) || JSON.stringify(group.latest) !== JSON.stringify(group.history[0])) {
+    return false;
+  }
+  const tags = new Set();
+  let previous = null;
+  for (const release of group.history) {
+    if (!validRelease(release, flavor, device) || tags.has(release.tag)) return false;
+    if (previous !== null && (release.published_at > previous.published_at ||
+        (release.published_at === previous.published_at && compareVersions(release.version, previous.version) > 0))) {
+      return false;
+    }
+    tags.add(release.tag);
+    previous = release;
+  }
+  return true;
 }
 
 function formatDate(timestamp) {
@@ -63,19 +152,54 @@ function formatDate(timestamp) {
   }).format(date);
 }
 
+function renderDevice(device) {
+  document.querySelector('[data-device-field="name"]').textContent = device.display_name;
+  document.querySelector('[data-device-field="target"]').textContent = `${device.target} / ${device.subtarget}`;
+  document.querySelector('[data-device-field="status"]').textContent = '尚未真机验证 · 非生产 · RAM candidate only';
+  const buildLink = document.querySelector('#browser-build-link');
+  buildLink.href = device.browser_build_workflow_url;
+  buildLink.hidden = false;
+  const docs = document.querySelector('#device-doc-links');
+  docs.replaceChildren(
+    makeLink('恢复指南 / Recovery ↗', device.recovery_url),
+    makeLink('测试门禁 / Testing ↗', device.testing_url)
+  );
+}
+
 function showUnavailable(card) {
   const downloads = card.querySelector('[data-field="downloads"]');
   const message = document.createElement('span');
   message.className = 'unavailable';
   message.textContent = '暂无完整已验证资产 / No complete verified release yet';
   downloads.replaceChildren(message);
+  card.querySelector('[data-field="version"]').textContent = '—';
+  const date = card.querySelector('[data-field="date"]');
+  date.textContent = '等待数据';
+  date.dateTime = '';
+  card.querySelector('[data-field="provenance"]').replaceChildren();
   card.querySelector('details').hidden = true;
+  card.querySelector('[data-field="support-links"]').replaceChildren();
+  const releaseUrl = card.querySelector('[data-field="release-url"]');
+  releaseUrl.removeAttribute('href');
+  releaseUrl.hidden = true;
 }
 
-function renderCard(flavor, release) {
+function resetReleaseUi() {
+  for (const flavor of FLAVORS) showUnavailable(document.querySelector(`[data-flavor="${flavor}"]`));
+  renderHistory({}, null);
+  const buildLink = document.querySelector('#browser-build-link');
+  buildLink.removeAttribute('href');
+  buildLink.hidden = true;
+  document.querySelector('#device-doc-links').replaceChildren();
+  document.querySelector('[data-device-field="name"]').textContent = '目录不可用 / Unavailable';
+  document.querySelector('[data-device-field="target"]').textContent = '—';
+  document.querySelector('[data-device-field="status"]').textContent = '下载与构建入口已禁用 / Disabled';
+}
+
+function renderCard(flavor, release, device) {
   const card = document.querySelector(`[data-flavor="${flavor}"]`);
   if (!card) return;
-  if (!validRelease(release, flavor)) {
+  if (!validRelease(release, flavor, device)) {
     showUnavailable(card);
     return;
   }
@@ -84,34 +208,37 @@ function renderCard(flavor, release) {
   const date = card.querySelector('[data-field="date"]');
   date.textContent = formatDate(release.published_at);
   date.dateTime = release.published_at;
-
-  const downloads = card.querySelector('[data-field="downloads"]');
-  downloads.replaceChildren(
+  card.querySelector('[data-field="downloads"]').replaceChildren(
     makeLink('下载已验证归档 ↓', release.assets.archive.url),
     makeLink('SHA-256', release.assets.checksum.url)
   );
-
-  const provenance = card.querySelector('[data-field="provenance"]');
-  provenance.replaceChildren(...Object.entries(PROVENANCE_LABELS).map(([key, label]) =>
-    makeLink(label, release.assets[key].url)
-  ));
-
+  card.querySelector('[data-field="provenance"]').replaceChildren(
+    ...Object.entries(PROVENANCE_LABELS).map(([key, label]) => makeLink(label, release.assets[key].url))
+  );
+  card.querySelector('[data-field="support-links"]').replaceChildren(
+    makeLink('浏览器云编译 ↗', release.browser_build_workflow_url),
+    makeLink('恢复指南 ↗', release.recovery_url),
+    makeLink('测试要求 ↗', release.testing_url)
+  );
   const releaseUrl = card.querySelector('[data-field="release-url"]');
-  releaseUrl.href = release.url;
+  releaseUrl.href = release.release_url;
   releaseUrl.hidden = false;
+  card.querySelector('details').hidden = false;
 }
 
-function renderHistory(flavorData) {
+function renderHistory(flavorData, device) {
   const history = document.querySelector('#release-history');
   const rows = [];
   for (const flavor of FLAVORS) {
     const releases = Array.isArray(flavorData[flavor]?.history) ? flavorData[flavor].history : [];
     for (const release of releases) {
-      if (validRelease(release, flavor)) rows.push({ flavor, release });
+      if (validRelease(release, flavor, device)) rows.push({ flavor, release });
     }
   }
-  rows.sort((left, right) => right.release.published_at.localeCompare(left.release.published_at));
-
+  rows.sort((left, right) => {
+    const byTime = right.release.published_at.localeCompare(left.release.published_at);
+    return byTime || compareVersions(right.release.version, left.release.version);
+  });
   if (!rows.length) {
     const empty = document.createElement('p');
     empty.className = 'empty-state';
@@ -119,24 +246,19 @@ function renderHistory(flavorData) {
     history.replaceChildren(empty);
     return;
   }
-
   const fragment = document.createDocumentFragment();
   for (const { flavor, release } of rows) {
     const row = document.createElement('article');
     row.className = 'history-item';
-
     const flavorLabel = document.createElement('span');
     flavorLabel.className = `history-flavor ${flavor}`;
-    flavorLabel.textContent = flavor === 'nss' ? 'NSS · EXP' : 'OFFICIAL';
-
+    flavorLabel.textContent = release.flavor_experimental ? 'NSS · EXP' : 'OFFICIAL';
     const tag = document.createElement('strong');
     tag.className = 'history-tag';
     tag.textContent = release.tag;
-
     const date = document.createElement('time');
     date.dateTime = release.published_at;
     date.textContent = formatDate(release.published_at);
-
     row.append(flavorLabel, tag, date, makeLink('Archive ↓', release.assets.archive.url));
     fragment.append(row);
   }
@@ -149,20 +271,30 @@ async function loadReleases() {
     const response = await fetch('releases.json', { cache: 'no-store', credentials: 'same-origin' });
     if (!response.ok) throw new Error(`HTTP ${response.status}`);
     const data = await response.json();
-    if (data.schema_version !== 1 || data.repository !== REPOSITORY || !data.flavors) {
+    if (!exactKeys(data, ['schema_version', 'repository', 'generated_at', 'devices', 'flavors']) ||
+        data.schema_version !== 2 || data.repository !== REPOSITORY || !validUtcTimestamp(data.generated_at) ||
+        !exactKeys(data.devices, [DEVICE_ID]) || !exactKeys(data.flavors, FLAVORS)) {
       throw new Error('unexpected release index schema');
     }
-    for (const flavor of FLAVORS) renderCard(flavor, data.flavors[flavor]?.latest);
-    renderHistory(data.flavors);
+    const device = data.devices[DEVICE_ID];
+    if (!validDevice(device)) throw new Error('invalid device metadata');
+    for (const flavor of FLAVORS) {
+      if (!validReleaseGroup(data.flavors[flavor], flavor, device)) {
+        throw new Error(`invalid ${flavor} release group`);
+      }
+    }
+    renderDevice(device);
+    for (const flavor of FLAVORS) renderCard(flavor, data.flavors[flavor].latest, device);
+    renderHistory(data.flavors, device);
+    status.classList.remove('error');
     status.textContent = data.generated_at === '1970-01-01T00:00:00Z'
-      ? '尚未发布版本 / No release index has been published yet'
+      ? '设备目录已验证；尚未发布版本 / Device catalog verified; no release published yet'
       : `索引更新 / Index generated: ${formatDate(data.generated_at)} UTC`;
   } catch (error) {
-    for (const flavor of FLAVORS) renderCard(flavor, null);
-    renderHistory({});
+    resetReleaseUi();
     status.classList.add('error');
-    status.textContent = '发布索引暂不可用；请勿猜测下载地址。 / Release index unavailable; never guess asset URLs.';
-    console.error('Unable to load the allowlisted release index:', error);
+    status.textContent = '设备或发布索引暂不可用；已禁用下载与构建入口。 / Catalog unavailable; downloads and builds disabled.';
+    console.error('Unable to load the allowlisted device/release index:', error);
   }
 }
 

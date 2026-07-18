@@ -1,4 +1,38 @@
 {
+  "devices": {
+    "xiaomi-ax9000": {
+      "browser_build_workflow_url": "https://github.com/tifycloud/NexaWrt/actions/workflows/build.yml",
+      "channels": [
+        "ram-test"
+      ],
+      "display_name": "Xiaomi AX9000",
+      "flavors": {
+        "nss": {
+          "experimental": true
+        },
+        "official": {
+          "experimental": false
+        }
+      },
+      "hardware_status": "unverified",
+      "id": "xiaomi-ax9000",
+      "image_capabilities": {
+        "factory": false,
+        "ram_boot": true,
+        "sysupgrade": false
+      },
+      "model": "AX9000",
+      "production_ready": false,
+      "profile": "xiaomi_ax9000",
+      "recovery_url": "https://github.com/tifycloud/NexaWrt/blob/main/docs/RECOVERY.md",
+      "schema": 1,
+      "subtarget": "ipq807x",
+      "target": "qualcommax",
+      "testing_url": "https://github.com/tifycloud/NexaWrt/blob/main/docs/TESTING.md",
+      "vendor": "Xiaomi",
+      "website_visible": true
+    }
+  },
   "flavors": {
     "nss": {
       "history": [],
@@ -11,5 +45,5 @@
   },
   "generated_at": "1970-01-01T00:00:00Z",
   "repository": "tifycloud/NexaWrt",
-  "schema_version": 1
+  "schema_version": 2
 }

@@ -15,6 +15,10 @@ reject_pattern() { if grep -Eiq -- "$2" "$1"; then fail "forbidden policy patter
 
 require_fixed "$WORKFLOW" 'workflow_dispatch:'
 require_fixed "$WORKFLOW" 'options: [official, nss]'
+require_fixed "$WORKFLOW" 'python3 scripts/device_metadata.py'
+require_fixed "$WORKFLOW" '--device xiaomi-ax9000'
+require_fixed "$WORKFLOW" '--flavor "$REQUESTED_FLAVOR"'
+require_fixed "$WORKFLOW" '--channel ram-test'
 require_fixed "$WORKFLOW" 'matrix:'
 require_fixed "$WORKFLOW" 'replica: [a, b]'
 require_fixed "$WORKFLOW" "CLEAN_BUILD: '1'"

@@ -86,6 +86,10 @@ jobs:
             return "$status"
           }
           release_tag_is_absent "$GITHUB_REF_NAME"
+          python3 scripts/device_metadata.py \
+            --device xiaomi-ax9000 \
+            --flavor "$flavor" \
+            --channel ram-test
           printf 'flavor=%s\nrelease_version=%s\nwork_basename=%s\nstaging_basename=%s\n' \
             "$flavor" "$release_version" "$work_basename" "$staging_basename" >> "$GITHUB_OUTPUT"
           NEXAWRT_FLAVOR="$flavor" ./tests/test_static.sh
@@ -366,7 +370,7 @@ jobs:
           source_epoch="$(awk -F= '$1 == "source_date_epoch" { count++; value=$2 } END { if (count != 1 || value !~ /^[1-9][0-9]*$/) exit 1; print value }' release-staging/verified-dist/BUILD-MANIFEST.txt)"
           archive_basename="NexaWrt-AX9000-${RELEASE_FLAVOR}-${RELEASE_VERSION}-verified-dist.tar.gz"
           mkdir release-staging/publish
-          tar --sort=name --owner=0 --group=0 --numeric-owner --mtime="@$source_epoch" \
+          tar --format=ustar --sort=name --owner=0 --group=0 --numeric-owner --mtime="@$source_epoch" \
             -C release-staging -cf - verified-dist | gzip -9n > "release-staging/publish/$archive_basename"
           (
             cd release-staging/publish
