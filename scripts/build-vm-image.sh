@@ -36,7 +36,7 @@ select_x86_64_release_manifest() {
   local target_dir="$1"
   local openwrt_version="$2"
   local built_image_basename="$3"
-  local expected_basename="openwrt-${openwrt_version}-x86-64.manifest"
+  local expected_basename="openwrt-${openwrt_version}-x86-64-generic.manifest"
   local image_derived_basename="${built_image_basename%.img.gz}.manifest"
   local candidate
   local candidate_basename
