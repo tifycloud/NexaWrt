@@ -90,16 +90,32 @@ PY
 }
 
 serial_has_release_labels() {
-  grep -Fq 'NexaWrt x86_64 VM release image' "$SERIAL_LOG" &&
-    grep -Fxq 'ARTIFACT_CLASS=VM_DISTRIBUTION_IMAGE' "$SERIAL_LOG" &&
-    grep -Fxq 'VM_ONLY=1' "$SERIAL_LOG" &&
-    grep -Fxq 'NOT_AX9000_FIRMWARE=1' "$SERIAL_LOG" &&
-    grep -Fxq 'HARDWARE_VALIDATION=0' "$SERIAL_LOG" &&
-    grep -Fxq 'NSS_VALIDATION=0' "$SERIAL_LOG" &&
-    grep -Fq 'Remote SSH is disabled by default' "$SERIAL_LOG"
+  [[ -s "$SERIAL_LOG" ]] || return 1
+  python3 - "$SERIAL_LOG" <<'PY'
+import pathlib
+import sys
+
+text = pathlib.Path(sys.argv[1]).read_bytes().decode("utf-8", errors="replace").replace("\r", "")
+expected = "\n".join(
+    (
+        "NEXAWRT_VM_RELEASE_METADATA_V1_BEGIN",
+        "ARTIFACT_CLASS=VM_DISTRIBUTION_IMAGE",
+        "VM_ONLY=1",
+        "NOT_AX9000_FIRMWARE=1",
+        "HARDWARE_VALIDATION=0",
+        "NSS_VALIDATION=0",
+        "VALIDATION_SCOPE=QEMU_BOOT_AND_USERSPACE_ONLY",
+        "SSH_DEFAULT=disabled",
+        "SSH_AUTHORIZED_KEYS=absent",
+        "NEXAWRT_VM_RELEASE_METADATA_V1_END",
+    )
+)
+raise SystemExit(0 if expected in text else 1)
+PY
 }
 
 serial_has_ssh_runtime_evidence() {
+  [[ -s "$SERIAL_LOG" ]] || return 1
   python3 - "$SERIAL_LOG" <<'PY'
 import pathlib
 import sys

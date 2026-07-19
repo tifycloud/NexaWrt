@@ -26,6 +26,7 @@ EVIDENCE_DIR='/tmp/nexawrt-vm-release'
 EVIDENCE_TMP="$EVIDENCE_DIR/ssh-runtime.evidence.tmp"
 EVIDENCE_FILE="$EVIDENCE_DIR/ssh-runtime.evidence"
 AUTHORIZED_KEYS='/etc/dropbear/authorized_keys'
+RELEASE_METADATA='/etc/nexawrt-vm-release'
 
 umask 077
 mkdir -p "$EVIDENCE_DIR"
@@ -45,6 +46,13 @@ if [ -s "$AUTHORIZED_KEYS" ]; then
   printf '%s\n' 'NEXAWRT_VM_SSH_RUNTIME_CHECK_FAILED=authorized_keys_nonempty' >/dev/console
   exit 1
 fi
+if [ ! -f "$RELEASE_METADATA" ] || [ -L "$RELEASE_METADATA" ]; then
+  printf '%s\n' 'NEXAWRT_VM_RELEASE_METADATA_CHECK_FAILED=missing_or_symlink' >/dev/console
+  exit 1
+fi
+
+# Emit machine-readable VM-only identity without requiring an interactive console login.
+cat "$RELEASE_METADATA" >/dev/console
 
 cat >"$EVIDENCE_TMP" <<'EVIDENCE'
 NEXAWRT_VM_SSH_RUNTIME_EVIDENCE_V1_BEGIN
