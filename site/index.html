@@ -3,10 +3,10 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <meta name="description" content="NexaWrt for Xiaomi AX9000 — reproducible initramfs RAM-test releases. Do not flash.">
+  <meta name="description" content="NexaWrt downloads — x86_64 VM images plus Xiaomi AX9000 reproducible initramfs RAM-test releases. Do not flash AX9000 candidates.">
   <meta name="color-scheme" content="dark">
   <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self'; object-src 'none'; base-uri 'none'; form-action 'none'">
-  <title>NexaWrt · AX9000 RAM Test</title>
+  <title>NexaWrt · x86_64 VM & AX9000 RAM Test</title>
   <link rel="icon" href="favicon.svg" type="image/svg+xml">
   <link rel="stylesheet" href="styles.css">
   <script src="app.js" defer></script>
@@ -31,7 +31,8 @@
           <span>NexaWrt</span>
         </a>
         <div class="nav-links">
-          <a href="#releases">下载 / Downloads</a>
+          <a href="#releases">AX9000</a>
+          <a href="#vm-releases">x86_64 VM</a>
           <a href="#configure">配置 / Configure</a>
           <a href="https://github.com/tifycloud/NexaWrt" target="_blank" rel="noopener noreferrer">GitHub ↗</a>
         </div>
@@ -130,6 +131,51 @@
       </div>
     </section>
 
+    <section id="vm-releases" class="section vm-section" aria-labelledby="vm-releases-title">
+      <div class="section-heading">
+        <div>
+          <p class="eyebrow">VIRTUAL MACHINE · 虚拟机镜像</p>
+          <h2 id="vm-releases-title">x86_64 QEMU / 虚拟机候选版</h2>
+        </div>
+        <span class="vm-safety-label">VM ONLY · 不是 AX9000 固件</span>
+      </div>
+
+      <div class="vm-boundary" role="note">
+        <strong>用途边界：</strong>此处镜像用于 x86_64 QEMU、UTM、PVE 等虚拟机验证。VM 测试通过只能证明通用 OpenWrt 用户空间、LuCI 和发布链路可用，不能替代 AX9000 真机、NSS、无线、闪存布局或恢复流程验证。
+      </div>
+
+      <article class="release-card vm-card" data-vm-platform="x86_64">
+        <div class="release-card-top">
+          <span class="flavor-dot" aria-hidden="true"></span>
+          <span class="flavor-label">x86_64 · QEMU</span>
+          <span class="release-badge vm-only">VM ONLY</span>
+        </div>
+        <h3>NexaWrt 虚拟机发行镜像</h3>
+        <p>浏览器云编译、自动 QEMU 启动检查、LuCI HTTP 检查和来源证明。默认禁用 SSH；首次使用请通过虚拟机串口设置密码后再显式启用。</p>
+        <div class="version-row">
+          <div><span>最新版本 / Latest</span><strong data-vm-field="version">—</strong></div>
+          <time data-vm-field="date" datetime="">等待数据</time>
+        </div>
+        <div class="download-actions" data-vm-field="downloads" aria-live="polite"></div>
+        <details>
+          <summary>Provenance · 来源证明</summary>
+          <div class="provenance-links" data-vm-field="provenance"></div>
+        </details>
+        <div class="support-links" data-vm-field="support-links"></div>
+        <a class="release-notes" data-vm-field="release-url" hidden target="_blank" rel="noopener noreferrer">VM 发布说明 / Release notes ↗</a>
+      </article>
+
+      <div class="history-panel vm-history-panel">
+        <div class="history-heading">
+          <div><p class="eyebrow">VM RELEASE HISTORY · 虚拟机历史版本</p><h3>通过自动 QEMU 检查的候选版</h3></div>
+          <div id="vm-history-actions" class="support-links" hidden></div>
+        </div>
+        <div id="vm-history" class="history-list">
+          <p class="empty-state">正在加载虚拟机版本… / Loading VM releases…</p>
+        </div>
+      </div>
+    </section>
+
     <section id="verify" class="section verify-section" aria-labelledby="verify-title">
       <div class="section-heading compact">
         <div><p class="eyebrow">THREE-STEP CHECK · 三步核验</p><h2 id="verify-title">下载不等于批准启动</h2></div>
@@ -196,7 +242,7 @@
 
   <footer>
     <div><span class="brand-glyph" aria-hidden="true">N</span><strong>NexaWrt</strong></div>
-    <p>Xiaomi AX9000 initramfs RAM-test project · Not affiliated with Xiaomi or OpenWrt.</p>
+    <p>x86_64 VM distribution + Xiaomi AX9000 initramfs RAM-test project · Not affiliated with Xiaomi or OpenWrt.</p>
     <a href="https://github.com/tifycloud/NexaWrt/actions" target="_blank" rel="noopener noreferrer">Build status ↗</a>
   </footer>
 </body>

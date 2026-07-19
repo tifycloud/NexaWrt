@@ -45,5 +45,11 @@
   },
   "generated_at": "1970-01-01T00:00:00Z",
   "repository": "tifycloud/NexaWrt",
-  "schema_version": 2
+  "schema_version": 3,
+  "virtual_images": {
+    "x86_64": {
+      "history": [],
+      "latest": null
+    }
+  }
 }

@@ -69,6 +69,22 @@ function makeCard() {
   return card;
 }
 
+function makeVmCard() {
+  const card = new FakeElement('article');
+  for (const [selector, tag] of [
+    ['[data-vm-field="version"]', 'strong'],
+    ['[data-vm-field="date"]', 'time'],
+    ['[data-vm-field="downloads"]', 'div'],
+    ['[data-vm-field="provenance"]', 'div'],
+    ['[data-vm-field="support-links"]', 'div'],
+    ['[data-vm-field="release-url"]', 'a'],
+    ['details', 'details'],
+  ]) card.fields.set(selector, new FakeElement(tag));
+  card.querySelector('[data-vm-field="release-url"]').hidden = true;
+  card.querySelector('details').hidden = true;
+  return card;
+}
+
 function makeDom() {
   const selectors = new Map();
   selectors.set('[data-device-field="name"]', new FakeElement('dd'));
@@ -78,6 +94,10 @@ function makeDom() {
   selectors.get('#browser-build-link').hidden = true;
   selectors.set('#device-doc-links', new FakeElement('div'));
   selectors.set('#release-history', new FakeElement('div'));
+  selectors.set('#vm-history', new FakeElement('div'));
+  selectors.set('#vm-history-actions', new FakeElement('div'));
+  selectors.get('#vm-history-actions').hidden = true;
+  selectors.set('[data-vm-platform="x86_64"]', makeVmCard());
   selectors.set('#data-status', new FakeElement('p'));
   const configForm = new FakeElement('form');
   configForm.elements = {
@@ -110,7 +130,7 @@ function makeDom() {
 const root = path.resolve(__dirname, '..');
 const source = fs.readFileSync(path.join(root, 'site/app.js'), 'utf8');
 const testedSource = source.replace(/\nloadReleases\(\);\s*$/, '\n') +
-  '\nglobalThis.hooks = { validDevice, validRelease, validReleaseGroup, validUtcTimestamp, compareVersions, loadReleases, generateSnippet };\n';
+  '\nglobalThis.hooks = { validDevice, validRelease, validReleaseGroup, validVmRelease, validVmReleaseGroup, validUtcTimestamp, compareVersions, loadReleases, generateSnippet };\n';
 const document = makeDom();
 const loggedErrors = [];
 const context = vm.createContext({
@@ -120,7 +140,7 @@ const context = vm.createContext({
   console: { error: (...args) => loggedErrors.push(args) },
 });
 vm.runInContext(testedSource, context, { filename: 'site/app.js' });
-const { validDevice, validRelease, validReleaseGroup, validUtcTimestamp, compareVersions, loadReleases, generateSnippet } = context.hooks;
+const { validDevice, validRelease, validReleaseGroup, validVmRelease, validVmReleaseGroup, validUtcTimestamp, compareVersions, loadReleases, generateSnippet } = context.hooks;
 const clone = (value) => JSON.parse(JSON.stringify(value));
 
 const index = JSON.parse(fs.readFileSync(path.join(root, 'site/releases.json'), 'utf8'));
@@ -164,9 +184,60 @@ function makeRelease(flavor, version, publishedAt) {
   };
 }
 
+function makeVmRelease(version, publishedAt) {
+  const tag = `vm-x86_64-${version}`;
+  const image = `NexaWrt-x86_64-${version}-generic-ext4-combined.img.gz`;
+  const asset = (name) => ({
+    name,
+    size: 1,
+    url: `https://github.com/tifycloud/NexaWrt/releases/download/${tag}/${name}`,
+  });
+  return {
+    platform: 'x86_64',
+    artifact_class: 'VM_DISTRIBUTION_IMAGE',
+    vm_only: true,
+    not_ax9000_firmware: true,
+    hardware_validation: false,
+    nss_validation: false,
+    qemu_validated: true,
+    ssh_default: 'disabled',
+    version,
+    tag,
+    published_at: publishedAt,
+    release_url: `https://github.com/tifycloud/NexaWrt/releases/tag/${tag}`,
+    browser_build_workflow_url: 'https://github.com/tifycloud/NexaWrt/actions/workflows/vm-release.yml',
+    docs_url: 'https://github.com/tifycloud/NexaWrt/blob/main/docs/VM-X86_64.md',
+    assets: {
+      image: asset(image),
+      image_checksum: asset(`${image}.sha256`),
+      manifest: asset(`${image.slice(0, -'.img.gz'.length)}.manifest`),
+      artifact_labels: asset('artifact-labels.env'),
+      readme: asset('README-VM.txt'),
+      smoke_report: asset('smoke-report.txt'),
+      checksums: asset('SHA256SUMS'),
+      provenance_image: asset('image.provenance.bundle.json'),
+      provenance_checksums: asset('checksums.provenance.bundle.json'),
+    },
+  };
+}
+
 const release = makeRelease('official', 'v1.2.3-rc.4', '2026-07-17T12:34:56Z');
 assert.equal(validRelease(release, 'official', device), true);
 assert.equal(validReleaseGroup({ latest: release, history: [release] }, 'official', device), true);
+const vmRelease = makeVmRelease('v0.1.0-rc.1', '2026-07-18T02:00:00Z');
+assert.equal(validVmRelease(vmRelease), true);
+assert.equal(validVmReleaseGroup({ latest: vmRelease, history: [vmRelease] }), true);
+for (const mutate of [
+  (value) => { value.vm_only = false; },
+  (value) => { value.not_ax9000_firmware = false; },
+  (value) => { value.hardware_validation = true; },
+  (value) => { value.ssh_default = 'enabled'; },
+  (value) => { value.assets.image.url = 'https://attacker.invalid/image'; },
+]) {
+  const invalid = clone(vmRelease);
+  mutate(invalid);
+  assert.equal(validVmRelease(invalid), false);
+}
 
 for (const mutate of [
   (value) => { value.production_ready = true; },
@@ -215,7 +286,7 @@ assert.equal(validReleaseGroup({ latest: hugeLow, history: [hugeLow, hugeHigh] }
 const official = makeRelease('official', 'v2.0.0-rc.1', '2026-07-18T02:00:00Z');
 const nss = makeRelease('nss', 'v2.0.0-rc.1', '2026-07-18T02:00:00Z');
 const validIndex = {
-  schema_version: 2,
+  schema_version: 3,
   repository: 'tifycloud/NexaWrt',
   generated_at: '2026-07-18T02:01:00Z',
   devices: { 'xiaomi-ax9000': clone(device) },
@@ -223,6 +294,7 @@ const validIndex = {
     official: { latest: official, history: [official] },
     nss: { latest: nss, history: [nss] },
   },
+  virtual_images: { x86_64: { latest: vmRelease, history: [vmRelease] } },
 };
 
 async function loadWith(responseFactory) {
@@ -257,6 +329,17 @@ function assertSafeEmptyState() {
   assert.equal(officialCard.querySelector('[data-field="release-url"]').href, undefined);
   assert.equal(officialCard.querySelector('details').hidden, true);
   assert.equal(document.querySelector('#release-history').children.some((child) => child.tagName === 'article'), false);
+  const vmCard = document.querySelector('[data-vm-platform="x86_64"]');
+  assert.equal(vmCard.querySelector('[data-vm-field="downloads"]').children.some((child) => child.tagName === 'a'), false);
+  assert.equal(vmCard.querySelector('[data-vm-field="provenance"]').children.length, 0);
+  assert.equal(vmCard.querySelector('[data-vm-field="support-links"]').children.length, 0);
+  assert.equal(vmCard.querySelector('[data-vm-field="release-url"]').hidden, true);
+  assert.equal(vmCard.querySelector('[data-vm-field="release-url"]').href, undefined);
+  assert.equal(vmCard.querySelector('details').hidden, true);
+  const vmHistoryActions = document.querySelector('#vm-history-actions');
+  assert.equal(vmHistoryActions.hidden, true);
+  assert.equal(vmHistoryActions.children.length, 0);
+  assert.equal(document.querySelector('#vm-history').children.some((child) => child.tagName === 'article'), false);
   assert.equal(document.querySelector('#data-status').classList.contains('error'), true);
 }
 
@@ -315,12 +398,56 @@ function assertSafeEmptyState() {
   assert.equal(card('official').querySelector('[data-field="provenance"]').children.length, 4);
   assert.equal(card('official').querySelector('[data-field="release-url"]').href, official.release_url);
   assert.equal(card('official').querySelector('details').hidden, false);
+  const vmCard = document.querySelector('[data-vm-platform="x86_64"]');
+  assert.equal(vmCard.querySelector('[data-vm-field="downloads"]').children[0].href, vmRelease.assets.image.url);
+  assert.equal(vmCard.querySelector('[data-vm-field="provenance"]').children.length, 2);
+  assert.equal(vmCard.querySelector('[data-vm-field="release-url"]').href, vmRelease.release_url);
+  assert.equal(vmCard.querySelector('[data-vm-field="support-links"]').children[0].href, vmRelease.browser_build_workflow_url);
+  assert.equal(vmCard.querySelector('[data-vm-field="support-links"]').children.length, 2);
+  assert.equal(vmCard.querySelector('details').hidden, false);
+  const vmHistoryActions = document.querySelector('#vm-history-actions');
+  assert.equal(vmHistoryActions.hidden, false);
+  assert.equal(vmHistoryActions.children.length, 1);
+  assert.equal(vmHistoryActions.children[0].href, vmRelease.browser_build_workflow_url);
 
-  const partialFailure = clone(validIndex);
-  partialFailure.flavors.nss.latest.production_ready = true;
-  partialFailure.flavors.nss.history[0].production_ready = true;
-  await loadWith(async () => ({ ok: true, json: async () => partialFailure }));
-  assertSafeEmptyState();
+  const invalidVmOnly = clone(validIndex);
+  invalidVmOnly.virtual_images.x86_64.latest.hardware_validation = true;
+  invalidVmOnly.virtual_images.x86_64.history[0].hardware_validation = true;
+  await loadWith(async () => ({ ok: true, json: async () => invalidVmOnly }));
+  assert.equal(document.querySelector('#browser-build-link').hidden, false);
+  assert.equal(card('official').querySelector('[data-field="downloads"]').children[0].href, official.assets.archive.url);
+  const invalidVmCard = document.querySelector('[data-vm-platform="x86_64"]');
+  assert.equal(invalidVmCard.querySelector('[data-vm-field="downloads"]').children.some((child) => child.tagName === 'a'), false);
+  assert.equal(invalidVmCard.querySelector('[data-vm-field="provenance"]').children.length, 0);
+  assert.equal(invalidVmCard.querySelector('[data-vm-field="support-links"]').children.length, 0);
+  assert.equal(invalidVmCard.querySelector('[data-vm-field="release-url"]').hidden, true);
+  assert.equal(invalidVmCard.querySelector('[data-vm-field="release-url"]').href, undefined);
+  assert.equal(invalidVmCard.querySelector('details').hidden, true);
+  assert.equal(document.querySelector('#vm-history-actions').hidden, true);
+  assert.equal(document.querySelector('#vm-history-actions').children.length, 0);
+  assert.equal(document.querySelector('#vm-history').children.some((child) => child.tagName === 'article'), false);
+
+  const invalidAxOnly = clone(validIndex);
+  invalidAxOnly.flavors.nss.latest.production_ready = true;
+  invalidAxOnly.flavors.nss.history[0].production_ready = true;
+  await loadWith(async () => ({ ok: true, json: async () => invalidAxOnly }));
+  assert.equal(document.querySelector('#browser-build-link').hidden, true);
+  assert.equal(card('official').querySelector('[data-field="release-url"]').hidden, true);
+  const validVmCardWithInvalidAx = document.querySelector('[data-vm-platform="x86_64"]');
+  assert.equal(validVmCardWithInvalidAx.querySelector('[data-vm-field="downloads"]').children[0].href, vmRelease.assets.image.url);
+  assert.equal(validVmCardWithInvalidAx.querySelector('[data-vm-field="support-links"]').children[0].href, vmRelease.browser_build_workflow_url);
+  assert.equal(validVmCardWithInvalidAx.querySelector('[data-vm-field="release-url"]').hidden, false);
+  assert.equal(document.querySelector('#vm-history-actions').hidden, false);
+  assert.equal(document.querySelector('#vm-history-actions').children[0].href, vmRelease.browser_build_workflow_url);
+  assert.equal(document.querySelector('#data-status').classList.contains('error'), false);
+
+  const invalidAxDeviceOnly = clone(validIndex);
+  invalidAxDeviceOnly.devices['xiaomi-ax9000'].production_ready = true;
+  await loadWith(async () => ({ ok: true, json: async () => invalidAxDeviceOnly }));
+  assert.equal(document.querySelector('#browser-build-link').hidden, true);
+  assert.equal(document.querySelector('[data-vm-platform="x86_64"]').querySelector('[data-vm-field="release-url"]').href, vmRelease.release_url);
+  assert.equal(document.querySelector('[data-vm-platform="x86_64"]').querySelector('[data-vm-field="support-links"]').children[0].href, vmRelease.browser_build_workflow_url);
+  assert.equal(document.querySelector('#vm-history-actions').children[0].href, vmRelease.browser_build_workflow_url);
 
   await loadWith(async () => ({ ok: true, json: async () => ({ schema_version: 999 }) }));
   assertSafeEmptyState();
@@ -335,7 +462,7 @@ function assertSafeEmptyState() {
   assertSafeEmptyState();
   assert.equal(loggedErrors.length >= 5, true);
 
-  console.log('Pages UI policy: edits invalidate stale config and release loading fails closed');
+  console.log('Pages UI policy: bidirectional AX9000/VM isolation, edits invalidate stale config, and top-level failures close both');
 })().catch((error) => {
   console.error(error);
   process.exitCode = 1;

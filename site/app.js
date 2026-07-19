@@ -3,14 +3,21 @@
 const REPOSITORY = 'tifycloud/NexaWrt';
 const DEVICE_ID = 'xiaomi-ax9000';
 const FLAVORS = ['official', 'nss'];
+const VM_PLATFORM = 'x86_64';
 const BUILD_WORKFLOW_URL = `https://github.com/${REPOSITORY}/actions/workflows/build.yml`;
 const RECOVERY_URL = `https://github.com/${REPOSITORY}/blob/main/docs/RECOVERY.md`;
 const TESTING_URL = `https://github.com/${REPOSITORY}/blob/main/docs/TESTING.md`;
+const VM_RELEASE_WORKFLOW_URL = `https://github.com/${REPOSITORY}/actions/workflows/vm-release.yml`;
+const VM_DOCS_URL = `https://github.com/${REPOSITORY}/blob/main/docs/VM-X86_64.md`;
 const PROVENANCE_LABELS = {
   provenance_archive: 'Archive bundle',
   provenance_checksums: 'Checksums bundle',
   provenance_firmware: 'Firmware bundle',
   provenance_sbom: 'SBOM bundle'
+};
+const VM_PROVENANCE_LABELS = {
+  provenance_image: 'Image bundle',
+  provenance_checksums: 'Checksums bundle'
 };
 
 function exactKeys(value, expected) {
@@ -144,6 +151,65 @@ function validReleaseGroup(group, flavor, device) {
   return true;
 }
 
+function validVmRelease(release) {
+  const keys = [
+    'platform', 'artifact_class', 'vm_only', 'not_ax9000_firmware', 'hardware_validation',
+    'nss_validation', 'qemu_validated', 'ssh_default', 'version', 'tag', 'published_at',
+    'release_url', 'browser_build_workflow_url', 'docs_url', 'assets'
+  ];
+  if (!exactKeys(release, keys)) return false;
+  const versionPattern = /^v(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)-rc\.(?:0|[1-9]\d*)$/;
+  const expectedTag = `vm-${VM_PLATFORM}-${release.version}`;
+  if (release.platform !== VM_PLATFORM || release.artifact_class !== 'VM_DISTRIBUTION_IMAGE' ||
+      release.vm_only !== true || release.not_ax9000_firmware !== true ||
+      release.hardware_validation !== false || release.nss_validation !== false ||
+      release.qemu_validated !== true || release.ssh_default !== 'disabled' ||
+      typeof release.version !== 'string' || !versionPattern.test(release.version) || release.tag !== expectedTag ||
+      !validUtcTimestamp(release.published_at) || release.browser_build_workflow_url !== VM_RELEASE_WORKFLOW_URL ||
+      release.docs_url !== VM_DOCS_URL ||
+      !validHttpsGitHubUrl(release.release_url, `/${REPOSITORY}/releases/tag/${expectedTag}`)) return false;
+
+  const image = `NexaWrt-${VM_PLATFORM}-${release.version}-generic-ext4-combined.img.gz`;
+  const expectedNames = {
+    image,
+    image_checksum: `${image}.sha256`,
+    manifest: `${image.slice(0, -'.img.gz'.length)}.manifest`,
+    artifact_labels: 'artifact-labels.env',
+    readme: 'README-VM.txt',
+    smoke_report: 'smoke-report.txt',
+    checksums: 'SHA256SUMS',
+    provenance_image: 'image.provenance.bundle.json',
+    provenance_checksums: 'checksums.provenance.bundle.json'
+  };
+  if (!exactKeys(release.assets, Object.keys(expectedNames))) return false;
+  return Object.entries(expectedNames).every(([key, expectedName]) => {
+    const asset = release.assets[key];
+    return exactKeys(asset, ['name', 'url', 'size']) && asset.name === expectedName &&
+      Number.isInteger(asset.size) && asset.size > 0 &&
+      validHttpsGitHubUrl(asset.url, `/${REPOSITORY}/releases/download/${expectedTag}/${expectedName}`);
+  });
+}
+
+function validVmReleaseGroup(group) {
+  if (!exactKeys(group, ['latest', 'history']) || !Array.isArray(group.history) || group.history.length > 12) {
+    return false;
+  }
+  if (group.history.length === 0) return group.latest === null;
+  if (!validVmRelease(group.latest) || JSON.stringify(group.latest) !== JSON.stringify(group.history[0])) return false;
+  const tags = new Set();
+  let previous = null;
+  for (const release of group.history) {
+    if (!validVmRelease(release) || tags.has(release.tag)) return false;
+    if (previous !== null && (release.published_at > previous.published_at ||
+        (release.published_at === previous.published_at && compareVersions(release.version, previous.version) > 0))) {
+      return false;
+    }
+    tags.add(release.tag);
+    previous = release;
+  }
+  return true;
+}
+
 function formatDate(timestamp) {
   const date = new Date(timestamp);
   if (Number.isNaN(date.getTime())) return '—';
@@ -184,16 +250,45 @@ function showUnavailable(card) {
   releaseUrl.hidden = true;
 }
 
-function resetReleaseUi() {
+function resetAxUi() {
   for (const flavor of FLAVORS) showUnavailable(document.querySelector(`[data-flavor="${flavor}"]`));
   renderHistory({}, null);
   const buildLink = document.querySelector('#browser-build-link');
   buildLink.removeAttribute('href');
   buildLink.hidden = true;
   document.querySelector('#device-doc-links').replaceChildren();
-  document.querySelector('[data-device-field="name"]').textContent = '目录不可用 / Unavailable';
+  document.querySelector('[data-device-field="name"]').textContent = 'AX9000 目录不可用 / Unavailable';
   document.querySelector('[data-device-field="target"]').textContent = '—';
-  document.querySelector('[data-device-field="status"]').textContent = '下载与构建入口已禁用 / Disabled';
+  document.querySelector('[data-device-field="status"]').textContent = 'AX9000 下载与构建入口已禁用 / Disabled';
+}
+
+function resetVmHistoryActions() {
+  const actions = document.querySelector('#vm-history-actions');
+  if (!actions) return;
+  actions.replaceChildren();
+  actions.hidden = true;
+}
+
+function renderVmHistoryActions(release) {
+  const actions = document.querySelector('#vm-history-actions');
+  if (!actions) return;
+  if (!validVmRelease(release)) {
+    resetVmHistoryActions();
+    return;
+  }
+  actions.replaceChildren(makeLink('浏览器云编译 VM ↗', release.browser_build_workflow_url));
+  actions.hidden = false;
+}
+
+function resetVmUi() {
+  showVmUnavailable();
+  renderVmHistory(null);
+  resetVmHistoryActions();
+}
+
+function resetReleaseUi() {
+  resetAxUi();
+  resetVmUi();
 }
 
 function renderCard(flavor, release, device) {
@@ -265,31 +360,137 @@ function renderHistory(flavorData, device) {
   history.replaceChildren(fragment);
 }
 
+function showVmUnavailable() {
+  const card = document.querySelector(`[data-vm-platform="${VM_PLATFORM}"]`);
+  if (!card) return;
+  const message = document.createElement('span');
+  message.className = 'unavailable';
+  message.textContent = '暂无完整已验证虚拟机镜像 / No complete verified VM image yet';
+  card.querySelector('[data-vm-field="downloads"]').replaceChildren(message);
+  card.querySelector('[data-vm-field="version"]').textContent = '—';
+  const date = card.querySelector('[data-vm-field="date"]');
+  date.textContent = '等待数据';
+  date.dateTime = '';
+  card.querySelector('[data-vm-field="provenance"]').replaceChildren();
+  card.querySelector('[data-vm-field="support-links"]').replaceChildren();
+  const releaseUrl = card.querySelector('[data-vm-field="release-url"]');
+  releaseUrl.removeAttribute('href');
+  releaseUrl.hidden = true;
+  card.querySelector('details').hidden = true;
+}
+
+function renderVmCard(release) {
+  const card = document.querySelector(`[data-vm-platform="${VM_PLATFORM}"]`);
+  if (!card) return;
+  if (!validVmRelease(release)) {
+    showVmUnavailable();
+    return;
+  }
+  card.querySelector('[data-vm-field="version"]').textContent = release.version;
+  const date = card.querySelector('[data-vm-field="date"]');
+  date.textContent = formatDate(release.published_at);
+  date.dateTime = release.published_at;
+  card.querySelector('[data-vm-field="downloads"]').replaceChildren(
+    makeLink('下载 x86_64 镜像 ↓', release.assets.image.url),
+    makeLink('SHA256SUMS', release.assets.checksums.url),
+    makeLink('Manifest', release.assets.manifest.url)
+  );
+  card.querySelector('[data-vm-field="provenance"]').replaceChildren(
+    ...Object.entries(VM_PROVENANCE_LABELS).map(([key, label]) => makeLink(label, release.assets[key].url))
+  );
+  card.querySelector('[data-vm-field="support-links"]').replaceChildren(
+    makeLink('浏览器云编译 VM ↗', release.browser_build_workflow_url),
+    makeLink('VM 文档 ↗', release.docs_url)
+  );
+  const releaseUrl = card.querySelector('[data-vm-field="release-url"]');
+  releaseUrl.href = release.release_url;
+  releaseUrl.hidden = false;
+  card.querySelector('details').hidden = false;
+}
+
+function renderVmHistory(group) {
+  const history = document.querySelector('#vm-history');
+  if (!history) return;
+  const releases = Array.isArray(group?.history) ? group.history.filter(validVmRelease) : [];
+  if (!releases.length) {
+    const empty = document.createElement('p');
+    empty.className = 'empty-state';
+    empty.textContent = '暂无完整已验证 VM 历史版本 / No verified VM history';
+    history.replaceChildren(empty);
+    return;
+  }
+  const fragment = document.createDocumentFragment();
+  for (const release of releases) {
+    const row = document.createElement('article');
+    row.className = 'history-item vm-history-item';
+    const flavorLabel = document.createElement('span');
+    flavorLabel.className = 'history-flavor vm';
+    flavorLabel.textContent = 'x86_64 VM';
+    const tag = document.createElement('strong');
+    tag.className = 'history-tag';
+    tag.textContent = release.tag;
+    const date = document.createElement('time');
+    date.dateTime = release.published_at;
+    date.textContent = formatDate(release.published_at);
+    row.append(flavorLabel, tag, date, makeLink('Image ↓', release.assets.image.url));
+    fragment.append(row);
+  }
+  history.replaceChildren(fragment);
+}
+
+
 async function loadReleases() {
   const status = document.querySelector('#data-status');
   try {
     const response = await fetch('releases.json', { cache: 'no-store', credentials: 'same-origin' });
     if (!response.ok) throw new Error(`HTTP ${response.status}`);
     const data = await response.json();
-    if (!exactKeys(data, ['schema_version', 'repository', 'generated_at', 'devices', 'flavors']) ||
-        data.schema_version !== 2 || data.repository !== REPOSITORY || !validUtcTimestamp(data.generated_at) ||
-        !exactKeys(data.devices, [DEVICE_ID]) || !exactKeys(data.flavors, FLAVORS)) {
+    if (!exactKeys(data, ['schema_version', 'repository', 'generated_at', 'devices', 'flavors', 'virtual_images']) ||
+        data.schema_version !== 3 || data.repository !== REPOSITORY || !validUtcTimestamp(data.generated_at) ||
+        !data.devices || typeof data.devices !== 'object' || Array.isArray(data.devices) ||
+        !data.flavors || typeof data.flavors !== 'object' || Array.isArray(data.flavors) ||
+        !data.virtual_images || typeof data.virtual_images !== 'object' || Array.isArray(data.virtual_images)) {
       throw new Error('unexpected release index schema');
     }
-    const device = data.devices[DEVICE_ID];
-    if (!validDevice(device)) throw new Error('invalid device metadata');
-    for (const flavor of FLAVORS) {
-      if (!validReleaseGroup(data.flavors[flavor], flavor, device)) {
-        throw new Error(`invalid ${flavor} release group`);
-      }
+
+    const device = exactKeys(data.devices, [DEVICE_ID]) ? data.devices[DEVICE_ID] : null;
+    const axValid = validDevice(device) && exactKeys(data.flavors, FLAVORS) &&
+      FLAVORS.every((flavor) => validReleaseGroup(data.flavors[flavor], flavor, device));
+    if (axValid) {
+      renderDevice(device);
+      for (const flavor of FLAVORS) renderCard(flavor, data.flavors[flavor].latest, device);
+      renderHistory(data.flavors, device);
+    } else {
+      resetAxUi();
+      console.error('Invalid AX9000 catalog; VM catalog remains independently eligible.');
     }
-    renderDevice(device);
-    for (const flavor of FLAVORS) renderCard(flavor, data.flavors[flavor].latest, device);
-    renderHistory(data.flavors, device);
-    status.classList.remove('error');
-    status.textContent = data.generated_at === '1970-01-01T00:00:00Z'
-      ? '设备目录已验证；尚未发布版本 / Device catalog verified; no release published yet'
-      : `索引更新 / Index generated: ${formatDate(data.generated_at)} UTC`;
+
+    const vmGroup = exactKeys(data.virtual_images, [VM_PLATFORM])
+      ? data.virtual_images[VM_PLATFORM]
+      : null;
+    const vmValid = validVmReleaseGroup(vmGroup);
+    if (vmValid) {
+      renderVmCard(vmGroup.latest);
+      renderVmHistory(vmGroup);
+      renderVmHistoryActions(vmGroup.latest);
+    } else {
+      resetVmUi();
+      console.error('Invalid VM release group; AX9000 catalog remains independently eligible.');
+    }
+
+    if (!axValid && !vmValid) status.classList.add('error');
+    else status.classList.remove('error');
+    if (!axValid && !vmValid) {
+      status.textContent = 'AX9000 与 VM 目录均无效；下载与构建入口已禁用。 / Both catalogs invalid; disabled.';
+    } else if (!axValid) {
+      status.textContent = 'VM 目录已验证；AX9000 目录无效并已独立禁用。 / VM verified; AX9000 disabled.';
+    } else if (!vmValid) {
+      status.textContent = 'AX9000 目录已验证；VM 目录无效并已独立禁用。 / AX9000 verified; VM disabled.';
+    } else {
+      status.textContent = data.generated_at === '1970-01-01T00:00:00Z'
+        ? '设备目录已验证；尚未发布版本 / Device catalog verified; no release published yet'
+        : `索引更新 / Index generated: ${formatDate(data.generated_at)} UTC`;
+    }
   } catch (error) {
     resetReleaseUi();
     status.classList.add('error');

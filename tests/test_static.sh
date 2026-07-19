@@ -60,5 +60,6 @@ echo 'flavor policy: official default, isolated nss work tree, and official-only
 "$ROOT_DIR/tests/test_reproducibility_policy.sh"
 "$ROOT_DIR/tests/test_browser_build_policy.sh"
 "$ROOT_DIR/tests/test_vm_policy.sh"
+"$ROOT_DIR/tests/test_vm_release_policy.sh"
 "$ROOT_DIR/tests/test_pages_policy.sh"
 "$ROOT_DIR/tests/test_workflow_policy.sh"

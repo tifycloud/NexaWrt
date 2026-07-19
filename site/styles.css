@@ -227,3 +227,46 @@ footer p { margin: 0; text-align: center; }
   color: var(--text);
   border-bottom-color: currentColor;
 }
+
+/* x86_64 VM downloads are deliberately isolated from AX9000 RAM-test assets. */
+.vm-section {
+  border-top: 1px solid var(--line);
+  padding-top: 82px;
+}
+.vm-safety-label {
+  display: inline-flex;
+  align-items: center;
+  min-height: 32px;
+  padding: 0 12px;
+  border: 1px solid rgba(95, 196, 255, .42);
+  color: #8dd8ff;
+  font: 700 .68rem/1 monospace;
+  letter-spacing: .08em;
+}
+.vm-boundary {
+  margin: -8px 0 24px;
+  padding: 18px 20px;
+  border-left: 3px solid #5fc4ff;
+  background: rgba(95, 196, 255, .07);
+  color: var(--muted);
+  line-height: 1.65;
+}
+.vm-boundary strong { color: #b8e8ff; }
+.vm-card {
+  width: min(100%, 760px);
+  min-height: 0;
+  border-color: rgba(95, 196, 255, .24);
+}
+.vm-card::after {
+  border-color: rgba(95, 196, 255, .18);
+  box-shadow: 0 0 0 28px rgba(95, 196, 255, .03), 0 0 0 58px rgba(95, 196, 255, .018);
+}
+.vm-card .flavor-dot { background: #5fc4ff; box-shadow: 0 0 12px rgba(95, 196, 255, .6); }
+.release-badge.vm-only { border-color: rgba(95, 196, 255, .35); color: #8dd8ff; }
+.vm-history-panel { margin-top: 34px; }
+.history-flavor.vm { color: #8dd8ff; border-color: rgba(95, 196, 255, .28); }
+
+@media (max-width: 600px) {
+  .vm-card { width: 100%; }
+  .vm-safety-label { white-space: nowrap; }
+}

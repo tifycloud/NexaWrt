@@ -128,3 +128,51 @@ If and only if the release is still a draft for the exact triggering tag:
 If the workflow implementation itself must change, the failed tag still identifies the old workflow commit and must remain immutable evidence. Do not move or recreate the failed tag. Merge the fix to `main`, delete only the draft release, and create the next release-candidate tag (for example, `rc.2`) from the corrected `main` commit.
 
 If the release is already published (`isDraft=false` or `publishedAt` is set), stop. Do not delete or overwrite it as routine draft recovery. Investigate the final-state verification failure and treat any correction as an explicit release-management incident; normally a new release-candidate tag is required.
+
+## x86_64 VM candidate releases
+
+The x86_64 virtual-machine release channel is independent from AX9000 RAM-test releases. A VM candidate tag must match exactly:
+
+```text
+vm-x86_64-vMAJOR.MINOR.PATCH-rc.N
+```
+
+It is a prerelease for QEMU/UTM/PVE-style virtual machines only. It is not AX9000 firmware and does not assert hardware, NSS, Wi-Fi, NAND/UBI, recovery, or flash validation.
+
+### Browser release procedure
+
+1. Merge all VM release changes to trusted `main` and ensure repository policy checks pass.
+2. Open **Actions → NexaWrt x86_64 VM release → Run workflow**.
+3. Select the `main` branch and enter the complete tag, for example `vm-x86_64-v0.1.0-rc.1`.
+4. The preflight reads the current remote `main` commit SHA from GitHub, requires the browser dispatch `GITHUB_SHA` to equal that exact SHA, rejects an existing tag or release, and creates the lightweight tag at that SHA. Build, attestation, draft creation, and final publication continue to check out and reverify the same pinned SHA and remote tag. A historical `main` ancestor is not sufficient for a new browser-triggered release.
+5. The workflow builds the exact no-key release image and boots that same compressed image in QEMU. It requires QEMU to remain alive, LuCI HTTP to return an accepted result, the serial VM-only labels to appear, runtime evidence that Dropbear is disabled and not running and `authorized_keys` is absent, and a separate probe showing that the host port forwarded to guest port 22 exposes no SSH service.
+6. Only after those checks pass does the workflow attest the image and `SHA256SUMS`, create and recheck the exact draft assets, recheck the pinned source/tag and repository Immutable Releases setting immediately before publication, and publish the result as an immutable prerelease.
+
+A successful VM release contains exactly these nine assets:
+
+```text
+NexaWrt-x86_64-vX.Y.Z-rc.N-generic-ext4-combined.img.gz
+NexaWrt-x86_64-vX.Y.Z-rc.N-generic-ext4-combined.img.gz.sha256
+NexaWrt-x86_64-vX.Y.Z-rc.N-generic-ext4-combined.manifest
+artifact-labels.env
+README-VM.txt
+smoke-report.txt
+SHA256SUMS
+image.provenance.bundle.json
+checksums.provenance.bundle.json
+```
+
+The Pages verifier accepts a VM release only when all of the following hold:
+
+- it is an immutable, non-draft prerelease whose lightweight tag resolves to a commit in the trusted `main` history;
+- its uploaded asset set is exactly the nine names above, with no additions, omissions, duplicates, invalid sizes, or AX9000-labelled names;
+- the external image checksum and `SHA256SUMS` match the downloaded assets exactly;
+- `artifact-labels.env` has the exact 15-key release safety contract;
+- `smoke-report.txt` has exactly these 23 keys: `status`, `target`, `image`, `vm_only`, `not_ax9000_firmware`, `hardware_validation`, `nss_validation`, `exact_release_image`, `qemu_boot`, `serial_labels`, `http`, `ssh_runtime_evidence`, `ssh_port_probe`, `ssh`, `authorized_keys`, `dropbear_enabled`, `dropbear_running`, `http_status`, `auth_challenge`, `http_host_port`, `ssh_host_port`, `serial_log`, and `ssh_probe_log`;
+- those 23 fields bind the exact published image and report PASS/expected values for QEMU boot, LuCI HTTP, VM-only serial labels, Dropbear disabled and not running, absent `authorized_keys`, and no SSH service on the host port forwarded to guest port 22;
+- the image and `SHA256SUMS` provenance bundles verify against `tifycloud/NexaWrt/.github/workflows/vm-release.yml`, the release source digest, and a GitHub-hosted runner;
+- the generated proof binds every one of the nine assets by asset ID, name, size, and downloaded SHA-256; the Pages generator then requires those identities to match the same GitHub Release API response (and its trusted `digest` when provided).
+
+If any VM condition fails, the site hides that VM candidate. This VM fail-closed path is isolated from a separately valid AX9000 catalog, and the reverse is also true. A VM PASS is evidence only for the exact x86_64 virtual-machine image and release pipeline; it is not permission to flash AX9000 and is not an AX9000 production-readiness claim.
+
+Do not move a VM release tag, replace assets, or manually repair a published immutable release. Merge the correction and use the next RC tag. See [`docs/VM-X86_64.md`](VM-X86_64.md) for download and QEMU instructions.

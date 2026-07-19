@@ -1,0 +1,25 @@
+ _   _                 __        __    _     __     ____  __
+| \ | | _____  ____ _  \ \      / / __| |_   \ \   / /  \/  |
+|  \| |/ _ \ \/ / _` |  \ \ /\ / / '__| __|   \ \ / /| |\/| |
+| |\  |  __/>  < (_| |   \ V  V /| |  | |_     \ V / | |  | |
+|_| \_|\___/_/\_\__,_|    \_/\_/ |_|   \__|     \_/  |_|  |_|
+
+NexaWrt x86_64 VM release image — VM ONLY — NOT-AX9000 FIRMWARE
+ARTIFACT_CLASS=VM_DISTRIBUTION_IMAGE
+VM_ONLY=1
+NOT_AX9000_FIRMWARE=1
+HARDWARE_VALIDATION=0
+NSS_VALIDATION=0
+VALIDATION_SCOPE=QEMU_BOOT_AND_USERSPACE_ONLY
+SSH_DEFAULT=disabled
+SSH_AUTHORIZED_KEYS=absent
+
+仅供 x86_64 虚拟机运行；不是 Xiaomi AX9000 固件。
+不得上传到 AX9000 LuCI，不得用于 sysupgrade、mtd、UBI、NAND 或刷写。
+QEMU 通过只证明虚拟机用户空间/LuCI/基础网络正常，不证明 AX9000 硬件、Wi-Fi、NSS 或闪存布局。
+
+Remote SSH is disabled by default. Set a root password on the serial console,
+then explicitly enable Dropbear only if needed:
+  passwd
+  /etc/init.d/dropbear enable
+  /etc/init.d/dropbear start
