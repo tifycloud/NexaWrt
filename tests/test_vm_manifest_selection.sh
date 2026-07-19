@@ -17,7 +17,7 @@ trap 'rm -rf "$tmp_dir"' EXIT
 
 version="25.12.5"
 image_basename="openwrt-${version}-x86-64-generic-ext4-combined.img.gz"
-manifest_basename="openwrt-${version}-x86-64.manifest"
+manifest_basename="openwrt-${version}-x86-64-generic.manifest"
 image_derived_manifest="${image_basename%.img.gz}.manifest"
 release_manifest_basename="NexaWrt-x86_64-v0.1.0-rc.1-generic-ext4-combined.manifest"
 
@@ -65,6 +65,14 @@ printf 'symlink target\n' > "$tmp_dir/manifest-target"
 ln -s "$tmp_dir/manifest-target" "$unique_symlink_dir/$manifest_basename"
 if (select_x86_64_release_manifest "$unique_symlink_dir" "$version" "$image_basename" >/dev/null 2>&1); then
   fail_test "selector accepted a unique symlink manifest"
+fi
+
+wrong_target_name_dir="$tmp_dir/wrong-target-name/bin/targets/x86/64"
+mkdir -p "$wrong_target_name_dir"
+printf 'fake image bytes\n' > "$wrong_target_name_dir/$image_basename"
+printf 'wrong target name\n' > "$wrong_target_name_dir/openwrt-${version}-x86-64.manifest"
+if (select_x86_64_release_manifest "$wrong_target_name_dir" "$version" "$image_basename" >/dev/null 2>&1); then
+  fail_test "selector accepted the obsolete target manifest name without the generic profile"
 fi
 
 abnormal_dir="$tmp_dir/abnormal/bin/targets/x86/64"
