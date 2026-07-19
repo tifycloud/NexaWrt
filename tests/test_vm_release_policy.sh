@@ -44,6 +44,11 @@ for script in "$BUILD_SCRIPT" "$RELEASE_SCRIPT" "$RELEASE_OVERLAY/etc/uci-defaul
   bash -n "$script" || fail "shell syntax check failed: $script"
 done
 
+grep -qx 'NEXAWRT_VM_RELEASE_METADATA_V1_BEGIN' "$RELEASE_OVERLAY/etc/nexawrt-vm-release" || \
+  fail "release VM metadata begin marker is missing"
+grep -qx 'NEXAWRT_VM_RELEASE_METADATA_V1_END' "$RELEASE_OVERLAY/etc/nexawrt-vm-release" || \
+  fail "release VM metadata end marker is missing"
+
 for label in \
   'ARTIFACT_CLASS=VM_DISTRIBUTION_IMAGE' \
   'VM_ONLY=1' \
@@ -74,6 +79,7 @@ assert_contains 'ssh=DISABLED_BY_DEFAULT' "$RELEASE_OVERLAY/etc/uci-defaults/10-
 assert_contains 'authorized_keys=ABSENT' "$RELEASE_OVERLAY/etc/uci-defaults/10-vm-release"
 assert_contains 'dropbear_enabled=NO' "$RELEASE_OVERLAY/etc/uci-defaults/10-vm-release"
 assert_contains 'dropbear_running=NO' "$RELEASE_OVERLAY/etc/uci-defaults/10-vm-release"
+assert_contains 'cat "$RELEASE_METADATA" >/dev/console' "$RELEASE_OVERLAY/etc/uci-defaults/10-vm-release"
 assert_contains 'cat "$EVIDENCE_FILE" >/dev/console' "$RELEASE_OVERLAY/etc/uci-defaults/10-vm-release"
 
 if find "$RELEASE_OVERLAY" -type f -path '*/authorized_keys' -print -quit | grep -q .; then
@@ -121,7 +127,9 @@ for required_text in \
   'NOT_AX9000_FIRMWARE=1' \
   'HARDWARE_VALIDATION=0' \
   'NSS_VALIDATION=0' \
-  'Remote SSH is disabled by default' \
+  'NEXAWRT_VM_RELEASE_METADATA_V1_BEGIN' \
+  'SSH_DEFAULT=disabled' \
+  'NEXAWRT_VM_RELEASE_METADATA_V1_END' \
   'exact_release_image=true' \
   'qemu_boot_result="UNVERIFIED"' \
   'qemu_boot_result="FAIL"' \
@@ -173,6 +181,7 @@ def init_contract(text: str) -> bool:
         "dropbear_enabled=NO",
         "dropbear_running=NO",
         "NEXAWRT_VM_SSH_RUNTIME_EVIDENCE_V1_END",
+        'cat "$RELEASE_METADATA" >/dev/console',
         'cat "$EVIDENCE_FILE" >/dev/console',
     )
     return (
@@ -180,7 +189,11 @@ def init_contract(text: str) -> bool:
         and "|| true" not in text
         and text.index(stop) < text.index(disable)
         and text.index(disable) < text.index("if /etc/init.d/dropbear enabled")
-        and text.index("if /etc/init.d/dropbear enabled") < text.index('cat >"$EVIDENCE_TMP"')
+        and text.index('if [ -s "$AUTHORIZED_KEYS" ]; then')
+        < text.index('if [ ! -f "$RELEASE_METADATA" ] || [ -L "$RELEASE_METADATA" ]; then')
+        < text.index('cat "$RELEASE_METADATA" >/dev/console')
+        < text.index('cat >"$EVIDENCE_TMP"')
+        < text.index('cat "$EVIDENCE_FILE" >/dev/console')
     )
 
 
