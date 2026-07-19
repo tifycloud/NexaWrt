@@ -162,6 +162,110 @@ def expect_verification_error(callable_value, message: str) -> None:
     raise AssertionError(message)
 
 
+def vm_evidence_payloads(version: str = "v0.1.0-rc.1", *,
+                         missing_label: str | None = None,
+                         missing_smoke: str | None = None,
+                         label_updates: dict[str, str] | None = None,
+                         smoke_updates: dict[str, str] | None = None) -> dict[str, bytes]:
+    names = module.vm_expected_names(version)
+    image = b"exact x86_64 VM image\n"
+    labels = {
+        "ARTIFACT_CLASS": "VM_DISTRIBUTION_IMAGE",
+        "OPENWRT_VERSION": "24.10.2",
+        "TARGET": "x86-64",
+        "MODE": "release",
+        "VM_ONLY": "true",
+        "NOT_AX9000_FIRMWARE": "true",
+        "HARDWARE_VALIDATION": "false",
+        "NSS_VALIDATION": "false",
+        "VALIDATION_SCOPE": "QEMU_BOOT_AND_USERSPACE_ONLY",
+        "IMAGEBUILDER_URL": "https://downloads.openwrt.org/releases/24.10.2/targets/x86/64/imagebuilder.tar.zst",
+        "IMAGEBUILDER_SHA256": "1" * 64,
+        "RELEASE_TAG": f"vm-x86_64-{version}",
+        "RELEASE_VERSION": version,
+        "SSH_DEFAULT": "disabled",
+        "SSH_AUTHORIZED_KEYS": "absent",
+    }
+    smoke = {
+        "status": "PASS",
+        "target": "x86-64",
+        "image": names["image"],
+        "vm_only": "true",
+        "not_ax9000_firmware": "true",
+        "hardware_validation": "false",
+        "nss_validation": "false",
+        "exact_release_image": "true",
+        "qemu_boot": "PASS",
+        "serial_labels": "PASS",
+        "http": "PASS",
+        "ssh_runtime_evidence": "PASS",
+        "ssh_port_probe": "PASS",
+        "ssh": "DISABLED_BY_DEFAULT",
+        "authorized_keys": "ABSENT",
+        "dropbear_enabled": "NO",
+        "dropbear_running": "NO",
+        "http_status": "200",
+        "auth_challenge": "false",
+        "http_host_port": "18080",
+        "ssh_host_port": "18022",
+        "serial_log": "/home/runner/work/NexaWrt/NexaWrt/vm-release-results/x86-64/serial.log",
+        "ssh_probe_log": "/home/runner/work/NexaWrt/NexaWrt/vm-release-results/x86-64/ssh-port-probe.txt",
+    }
+    labels.update(label_updates or {})
+    smoke.update(smoke_updates or {})
+    if missing_label is not None:
+        labels.pop(missing_label)
+    if missing_smoke is not None:
+        smoke.pop(missing_smoke)
+    payloads = {
+        names["image"]: image,
+        names["image_checksum"]: f"{hashlib.sha256(image).hexdigest()}  {names['image']}\n".encode("ascii"),
+        names["manifest"]: b"base-files - 1\n",
+        names["artifact_labels"]: "".join(f'{key}="{value}"\n' for key, value in labels.items()).encode(),
+        names["readme"]: b"NexaWrt x86_64 VM only\n",
+        names["smoke_report"]: "".join(f"{key}={value}\n" for key, value in smoke.items()).encode(),
+        names["provenance_image"]: b"image bundle",
+        names["provenance_checksums"]: b"checksums bundle",
+    }
+    checksum_names = ["image", "image_checksum", "manifest", "artifact_labels", "readme", "smoke_report"]
+    payloads[names["checksums"]] = "".join(
+        f"{hashlib.sha256(payloads[names[key]]).hexdigest()}  {names[key]}\n" for key in checksum_names
+    ).encode("ascii")
+    return payloads
+
+
+def verify_vm_fixture(payloads: dict[str, bytes], version: str = "v0.1.0-rc.1") -> tuple[str, dict]:
+    names = module.vm_expected_names(version)
+    release_id = 88
+    raw = {
+        "id": release_id,
+        "tag_name": f"vm-x86_64-{version}",
+        "draft": False,
+        "prerelease": True,
+        "immutable": True,
+        "published_at": "2026-07-18T02:00:00Z",
+        "assets": [
+            {"id": release_id * 100 + index, "name": name, "state": "uploaded", "size": len(payloads[name])}
+            for index, name in enumerate(names.values(), 1)
+        ],
+    }
+    candidate = module.vm_candidate_assets(raw)
+    assert candidate is not None
+    source_digest = "c" * 40
+    originals = (module.resolve_tag_commit, module.require_main_ancestor, module.download_asset, module.verify_vm_attestation)
+    try:
+        module.resolve_tag_commit = lambda gh, tag: source_digest
+        module.require_main_ancestor = lambda commit, trusted: None
+        def fake_download(gh: Path, asset: dict, destination: Path, budget: module.DownloadBudget) -> None:
+            budget.reserve(asset["size"])
+            destination.write_bytes(payloads[asset["name"]])
+        module.download_asset = fake_download
+        module.verify_vm_attestation = lambda gh, subject, bundle, tag, digest: None
+        return module.verify_vm_candidate(Path("/trusted/gh"), candidate, "d" * 40, module.DownloadBudget())
+    finally:
+        module.resolve_tag_commit, module.require_main_ancestor, module.download_asset, module.verify_vm_attestation = originals
+
+
 def main() -> None:
     archive = archive_bytes()
     archive_name = "NexaWrt-AX9000-official-v1.10.0-rc.1-verified-dist.tar.gz"
@@ -376,9 +480,71 @@ def main() -> None:
     finally:
         module.MAX_ARCHIVE_MEMBERS = original_header_limit
 
+    vm_tag, vm_proof = verify_vm_fixture(vm_evidence_payloads())
+    assert vm_tag == "vm-x86_64-v0.1.0-rc.1"
+    assert set(vm_proof) == {"release_id", "source_digest", "assets", "verified_subjects"}
+    assert set(vm_proof["assets"]) == set(module.vm_expected_names("v0.1.0-rc.1"))
+    assert all(set(asset) == {"id", "name", "size", "sha256"} for asset in vm_proof["assets"].values())
+    assert len({asset["id"] for asset in vm_proof["assets"].values()}) == 9
+
+    critical_labels = {
+        "SSH_AUTHORIZED_KEYS", "TARGET", "MODE", "RELEASE_TAG", "RELEASE_VERSION", "VALIDATION_SCOPE",
+    }
+    critical_smoke = {
+        "qemu_boot", "ssh_runtime_evidence", "ssh_port_probe", "ssh", "authorized_keys",
+        "dropbear_enabled", "dropbear_running", "http_host_port", "ssh_host_port",
+        "serial_log", "ssh_probe_log",
+    }
+    for key in critical_labels:
+        expect_verification_error(
+            lambda key=key: verify_vm_fixture(vm_evidence_payloads(missing_label=key)),
+            f"VM artifact labels accepted missing critical key: {key}",
+        )
+    for key in critical_smoke:
+        expect_verification_error(
+            lambda key=key: verify_vm_fixture(vm_evidence_payloads(missing_smoke=key)),
+            f"VM smoke report accepted missing critical key: {key}",
+        )
+    expect_verification_error(
+        lambda: verify_vm_fixture(vm_evidence_payloads(smoke_updates={"dropbear_running": "YES"})),
+        "VM smoke report accepted a running Dropbear service",
+    )
+    expect_verification_error(
+        lambda: verify_vm_fixture(vm_evidence_payloads(label_updates={"RELEASE_VERSION": "v9.9.9-rc.9"})),
+        "VM artifact labels accepted a mismatched release version",
+    )
+    for field in ("qemu_boot", "ssh_runtime_evidence", "ssh_port_probe"):
+        expect_verification_error(
+            lambda field=field: verify_vm_fixture(vm_evidence_payloads(smoke_updates={field: "FAIL"})),
+            f"VM smoke report accepted failed runtime evidence: {field}",
+        )
+    for field, value in (
+        ("http_host_port", "80"),
+        ("ssh_host_port", "22"),
+        ("http_host_port", "65536"),
+        ("ssh_host_port", "018022"),
+    ):
+        expect_verification_error(
+            lambda field=field, value=value: verify_vm_fixture(vm_evidence_payloads(smoke_updates={field: value})),
+            f"VM smoke report accepted invalid non-privileged port: {field}={value}",
+        )
+    expect_verification_error(
+        lambda: verify_vm_fixture(vm_evidence_payloads(smoke_updates={"ssh_host_port": "18080"})),
+        "VM smoke report accepted identical HTTP and SSH host ports",
+    )
+    for field, value in (
+        ("serial_log", "/tmp/replay/vm-release-results/x86-64/serial.log"),
+        ("serial_log", "/home/runner/work/NexaWrt/NexaWrt/vm-release-results/x86-64/../serial.log"),
+        ("ssh_probe_log", "/home/runner/work/NexaWrt/NexaWrt/vm-release-results/x86-64/serial.log"),
+        ("ssh_probe_log", "ssh-port-probe.txt"),
+    ):
+        expect_verification_error(
+            lambda field=field, value=value: verify_vm_fixture(vm_evidence_payloads(smoke_updates={field: value})),
+            f"VM smoke report accepted unsafe or replayable log path: {field}",
+        )
+
     print(
-        "Pages provenance policy: staged trust, bounded full tar stream, strict physical headers, "
-        "and four expected subjects OK"
+        "Pages provenance policy: strict AX archive trust plus exact VM evidence and per-asset proof identity OK"
     )
 
 

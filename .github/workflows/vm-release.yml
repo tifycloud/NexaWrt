@@ -1,0 +1,483 @@
+name: NexaWrt x86_64 VM release
+
+on:
+  push:
+    tags:
+      - 'vm-x86_64-v*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Release tag to create/use, for example vm-x86_64-v0.1.0-rc.1'
+        required: true
+        type: string
+
+permissions: {}
+
+concurrency:
+  group: nexawrt-vm-release-${{ github.event_name == 'workflow_dispatch' && inputs.version || github.ref_name }}
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  preflight:
+    name: Validate VM release tag
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    outputs:
+      release_tag: ${{ steps.identity.outputs.release_tag }}
+      release_version: ${{ steps.identity.outputs.release_version }}
+      expected_source_sha: ${{ steps.identity.outputs.expected_source_sha }}
+      image_basename: ${{ steps.identity.outputs.image_basename }}
+      manifest_basename: ${{ steps.identity.outputs.manifest_basename }}
+    steps:
+      - name: Checkout trusted source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Require repository immutable releases
+        env:
+          IMMUTABLE_RELEASES_READ_TOKEN: ${{ secrets.IMMUTABLE_RELEASES_READ_TOKEN }}
+        run: |
+          set -euo pipefail
+          test -n "$IMMUTABLE_RELEASES_READ_TOKEN"
+          GH_TOKEN="$IMMUTABLE_RELEASES_READ_TOKEN" gh api \
+            -H 'Accept: application/vnd.github+json' \
+            -H 'X-GitHub-Api-Version: 2026-03-10' \
+            "repos/$GITHUB_REPOSITORY/immutable-releases" \
+            --jq 'select(.enabled == true) | .enabled' | grep -Fxq true
+      - name: Verify tag identity and pin current main commit
+        id: identity
+        env:
+          GH_TOKEN: ${{ github.token }}
+          DISPATCH_VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          tag_pattern='^vm-x86_64-(v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)-rc\.(0|[1-9][0-9]*))$'
+          git fetch --force origin main:refs/remotes/origin/main
+          main_type="$(gh api "repos/$GITHUB_REPOSITORY/git/ref/heads/main" --jq '.object.type')"
+          expected_source_sha="$(gh api "repos/$GITHUB_REPOSITORY/git/ref/heads/main" --jq '.object.sha')"
+          test "$main_type" = commit
+          test "$expected_source_sha" = "$(git rev-parse refs/remotes/origin/main)"
+          if [[ "$GITHUB_EVENT_NAME" == workflow_dispatch ]]; then
+            release_tag="$DISPATCH_VERSION"
+            test "$GITHUB_REF" = refs/heads/main
+            test "$GITHUB_SHA" = "$(git rev-parse refs/remotes/origin/main)"
+            test "$GITHUB_SHA" = "$expected_source_sha"
+          else
+            test "$GITHUB_REF_TYPE" = tag
+            test "$GITHUB_REF" = "refs/tags/$GITHUB_REF_NAME"
+            release_tag="$GITHUB_REF_NAME"
+            test "$GITHUB_SHA" = "$expected_source_sha"
+          fi
+          [[ "$release_tag" =~ $tag_pattern ]] || { echo "Untrusted VM release tag: $release_tag" >&2; exit 1; }
+          release_version="${BASH_REMATCH[1]}"
+          if [[ "$GITHUB_EVENT_NAME" == workflow_dispatch ]]; then
+            set +e
+            existing_ref="$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$release_tag" 2>&1)"
+            ref_status=$?
+            set -e
+            if [[ $ref_status -eq 0 ]]; then
+              echo "VM release tag already exists: $release_tag" >&2
+              exit 1
+            fi
+            grep -Eqi '404|not found' <<<"$existing_ref" || { echo "$existing_ref" >&2; exit 1; }
+            set +e
+            existing_release="$(gh api "repos/$GITHUB_REPOSITORY/releases/tags/$release_tag" 2>&1)"
+            release_status=$?
+            set -e
+            if [[ $release_status -eq 0 ]]; then
+              echo "VM release already exists: $release_tag" >&2
+              exit 1
+            fi
+            grep -Eqi '404|not found' <<<"$existing_release" || { echo "$existing_release" >&2; exit 1; }
+            gh api --method POST "repos/$GITHUB_REPOSITORY/git/refs" \
+              -f ref="refs/tags/$release_tag" \
+              -f sha="$expected_source_sha" >/dev/null
+          fi
+          git fetch --force origin main:refs/remotes/origin/main "+refs/tags/$release_tag:refs/tags/$release_tag"
+          test "$expected_source_sha" = "$(git rev-parse refs/remotes/origin/main)"
+          test "$(git cat-file -t "refs/tags/$release_tag")" = commit
+          tag_sha="$(git rev-parse "refs/tags/$release_tag")"
+          remote_type="$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$release_tag" --jq '.object.type')"
+          remote_sha="$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$release_tag" --jq '.object.sha')"
+          test "$remote_type" = commit
+          test "$remote_sha" = "$tag_sha"
+          test "$tag_sha" = "$expected_source_sha"
+          git merge-base --is-ancestor "$tag_sha" refs/remotes/origin/main
+          git checkout --detach "$expected_source_sha"
+          test "$(git rev-parse HEAD)" = "$expected_source_sha"
+          test "$GITHUB_WORKFLOW" = 'NexaWrt x86_64 VM release'
+          case "$GITHUB_WORKFLOW_REF" in
+            tifycloud/NexaWrt/.github/workflows/vm-release.yml@*) ;;
+            *) echo "Unexpected workflow identity: $GITHUB_WORKFLOW_REF" >&2; exit 1 ;;
+          esac
+          image_basename="NexaWrt-x86_64-${release_version}-generic-ext4-combined.img.gz"
+          manifest_basename="${image_basename%.img.gz}.manifest"
+          {
+            printf 'release_tag=%s\n' "$release_tag"
+            printf 'release_version=%s\n' "$release_version"
+            printf 'expected_source_sha=%s\n' "$expected_source_sha"
+            printf 'image_basename=%s\n' "$image_basename"
+            printf 'manifest_basename=%s\n' "$manifest_basename"
+          } >> "$GITHUB_OUTPUT"
+
+  build_test_publish:
+    name: Build, QEMU-test, attest, and publish VM prerelease
+    needs: preflight
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    env:
+      RELEASE_TAG: ${{ needs.preflight.outputs.release_tag }}
+      RELEASE_VERSION: ${{ needs.preflight.outputs.release_version }}
+      EXPECTED_SOURCE_SHA: ${{ needs.preflight.outputs.expected_source_sha }}
+      IMAGE_BASENAME: ${{ needs.preflight.outputs.image_basename }}
+      MANIFEST_BASENAME: ${{ needs.preflight.outputs.manifest_basename }}
+      ARTIFACT_DIR: ${{ github.workspace }}/dist/vm/x86-64
+      RELEASE_RESULTS_DIR: ${{ github.workspace }}/vm-release-results/x86-64
+      PUBLISH_DIR: ${{ github.workspace }}/vm-release-publish
+    steps:
+      - name: Checkout exact VM release tag
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ needs.preflight.outputs.expected_source_sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Re-verify checkout and pinned remote tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          git fetch --force origin "+refs/tags/$RELEASE_TAG:refs/tags/$RELEASE_TAG"
+          test "$(git cat-file -t "refs/tags/$RELEASE_TAG")" = commit
+          tag_sha="$(git rev-parse "refs/tags/$RELEASE_TAG")"
+          test "$(git rev-parse HEAD)" = "$EXPECTED_SOURCE_SHA"
+          test "$tag_sha" = "$EXPECTED_SOURCE_SHA"
+          remote_type="$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$RELEASE_TAG" --jq '.object.type')"
+          remote_sha="$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$RELEASE_TAG" --jq '.object.sha')"
+          test "$remote_type" = commit
+          test "$remote_sha" = "$EXPECTED_SOURCE_SHA"
+      - name: Install ImageBuilder, QEMU, and policy dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends \
+            build-essential \
+            ca-certificates \
+            curl \
+            file \
+            gawk \
+            gzip \
+            libncurses-dev \
+            python3 \
+            qemu-system-x86 \
+            rsync \
+            shellcheck \
+            unzip \
+            wget \
+            xz-utils \
+            zstd
+      - name: Run VM release policy checks
+        run: |
+          shellcheck -S warning \
+            scripts/build-vm-image.sh \
+            scripts/test-vm-smoke.sh \
+            scripts/test-vm-release.sh \
+            tests/test_vm_policy.sh \
+            tests/test_vm_release_policy.sh \
+            vm-files/etc/uci-defaults/10-vm-smoke \
+            vm-files/usr/libexec/nexawrt-vm-dangerous-command-guard \
+            vm-files/sbin/* \
+            vm-files-release/etc/uci-defaults/10-vm-release \
+            vm-files-release/usr/libexec/nexawrt-vm-dangerous-command-guard \
+            vm-files-release/sbin/*
+          ./tests/test_vm_policy.sh
+          ./tests/test_vm_release_policy.sh
+      - name: Build exact x86_64 VM release image
+        id: build
+        env:
+          VM_WORK_DIR: ${{ github.workspace }}/.work/vm-release
+          VM_OUTPUT_DIR: ${{ github.workspace }}/dist/vm
+        run: ./scripts/build-vm-image.sh x86-64 release "$RELEASE_TAG"
+      - name: Verify release build outputs before QEMU
+        run: |
+          set -euo pipefail
+          test -f "$ARTIFACT_DIR/$IMAGE_BASENAME"
+          test -f "$ARTIFACT_DIR/${IMAGE_BASENAME}.sha256"
+          test -f "$ARTIFACT_DIR/$MANIFEST_BASENAME"
+          test -f "$ARTIFACT_DIR/artifact-labels.env"
+          test -f "$ARTIFACT_DIR/README-VM.txt"
+          grep -Fxq 'ARTIFACT_CLASS="VM_DISTRIBUTION_IMAGE"' "$ARTIFACT_DIR/artifact-labels.env"
+          grep -Fxq 'VM_ONLY="true"' "$ARTIFACT_DIR/artifact-labels.env"
+          grep -Fxq 'NOT_AX9000_FIRMWARE="true"' "$ARTIFACT_DIR/artifact-labels.env"
+          grep -Fxq 'HARDWARE_VALIDATION="false"' "$ARTIFACT_DIR/artifact-labels.env"
+          grep -Fxq 'NSS_VALIDATION="false"' "$ARTIFACT_DIR/artifact-labels.env"
+          grep -Fxq 'SSH_DEFAULT="disabled"' "$ARTIFACT_DIR/artifact-labels.env"
+          if find "$ARTIFACT_DIR" -maxdepth 1 -type f -iname '*AX9000*' -print -quit | grep -q .; then
+            echo "VM release output must not contain AX9000-named files" >&2
+            exit 1
+          fi
+          (cd "$ARTIFACT_DIR" && sha256sum -c "${IMAGE_BASENAME}.sha256")
+      - name: Run QEMU release smoke test against exact image
+        env:
+          VM_RELEASE_OUTPUT_DIR: ${{ github.workspace }}/vm-release-results/x86-64
+        run: ./scripts/test-vm-release.sh x86-64 '${{ steps.build.outputs.image }}'
+      - name: Stage exact white-listed release assets
+        run: |
+          set -euo pipefail
+          grep -Fxq 'status=PASS' "$RELEASE_RESULTS_DIR/smoke-report.txt"
+          grep -Fxq 'exact_release_image=true' "$RELEASE_RESULTS_DIR/smoke-report.txt"
+          grep -Fxq 'serial_labels=PASS' "$RELEASE_RESULTS_DIR/smoke-report.txt"
+          grep -Fxq 'http=PASS' "$RELEASE_RESULTS_DIR/smoke-report.txt"
+          grep -Fxq 'qemu_boot=PASS' "$RELEASE_RESULTS_DIR/smoke-report.txt"
+          grep -Fxq 'ssh_runtime_evidence=PASS' "$RELEASE_RESULTS_DIR/smoke-report.txt"
+          grep -Fxq 'ssh_port_probe=PASS' "$RELEASE_RESULTS_DIR/smoke-report.txt"
+          grep -Fxq 'ssh=DISABLED_BY_DEFAULT' "$RELEASE_RESULTS_DIR/smoke-report.txt"
+          grep -Fxq 'authorized_keys=ABSENT' "$RELEASE_RESULTS_DIR/smoke-report.txt"
+          grep -Fxq 'dropbear_enabled=NO' "$RELEASE_RESULTS_DIR/smoke-report.txt"
+          grep -Fxq 'dropbear_running=NO' "$RELEASE_RESULTS_DIR/smoke-report.txt"
+          cp "$RELEASE_RESULTS_DIR/smoke-report.txt" "$ARTIFACT_DIR/smoke-report.txt"
+          (
+            cd "$ARTIFACT_DIR"
+            sha256sum \
+              "$IMAGE_BASENAME" \
+              "${IMAGE_BASENAME}.sha256" \
+              "$MANIFEST_BASENAME" \
+              artifact-labels.env \
+              README-VM.txt \
+              smoke-report.txt > SHA256SUMS
+            sha256sum -c SHA256SUMS
+          )
+          python3 - "$ARTIFACT_DIR/SHA256SUMS" <<'PY'
+          import pathlib
+          import sys
+
+          path = pathlib.Path(sys.argv[1])
+          for raw in path.read_text(encoding="utf-8").splitlines():
+              digest, name = raw.split(maxsplit=1)
+              if len(digest) != 64 or not all(c in "0123456789abcdef" for c in digest):
+                  raise SystemExit(f"invalid SHA256 line: {raw}")
+              if "AX9000" in name or "ax9000" in name:
+                  raise SystemExit(f"VM release checksum mentions AX9000: {name}")
+          PY
+          mkdir -p "$PUBLISH_DIR"
+          cp "$ARTIFACT_DIR/$IMAGE_BASENAME" "$PUBLISH_DIR/"
+          cp "$ARTIFACT_DIR/${IMAGE_BASENAME}.sha256" "$PUBLISH_DIR/"
+          cp "$ARTIFACT_DIR/$MANIFEST_BASENAME" "$PUBLISH_DIR/"
+          cp "$ARTIFACT_DIR/artifact-labels.env" "$PUBLISH_DIR/"
+          cp "$ARTIFACT_DIR/README-VM.txt" "$PUBLISH_DIR/"
+          cp "$ARTIFACT_DIR/smoke-report.txt" "$PUBLISH_DIR/"
+          cp "$ARTIFACT_DIR/SHA256SUMS" "$PUBLISH_DIR/"
+      - name: Re-verify pinned source before attestations
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          git fetch --force origin "+refs/tags/$RELEASE_TAG:refs/tags/$RELEASE_TAG"
+          test "$(git rev-parse HEAD)" = "$EXPECTED_SOURCE_SHA"
+          test "$(git cat-file -t "refs/tags/$RELEASE_TAG")" = commit
+          test "$(git rev-parse "refs/tags/$RELEASE_TAG")" = "$EXPECTED_SOURCE_SHA"
+          remote_type="$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$RELEASE_TAG" --jq '.object.type')"
+          remote_sha="$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$RELEASE_TAG" --jq '.object.sha')"
+          test "$remote_type" = commit
+          test "$remote_sha" = "$EXPECTED_SOURCE_SHA"
+      - name: Attest exact VM image
+        id: image_attestation
+        uses: actions/attest-build-provenance@96278af6caaf10aea03fd8d33a09a777ca52d62f # v3.2.0
+        with:
+          subject-path: ${{ env.PUBLISH_DIR }}/${{ env.IMAGE_BASENAME }}
+      - name: Attest VM checksums
+        id: checksums_attestation
+        uses: actions/attest-build-provenance@96278af6caaf10aea03fd8d33a09a777ca52d62f # v3.2.0
+        with:
+          subject-path: ${{ env.PUBLISH_DIR }}/SHA256SUMS
+      - name: Attach offline attestation bundles
+        run: |
+          set -euo pipefail
+          cp '${{ steps.image_attestation.outputs.bundle-path }}' "$PUBLISH_DIR/image.provenance.bundle.json"
+          cp '${{ steps.checksums_attestation.outputs.bundle-path }}' "$PUBLISH_DIR/checksums.provenance.bundle.json"
+      - name: Verify exact asset whitelist
+        run: |
+          set -euo pipefail
+          expected_assets="$IMAGE_BASENAME
+          ${IMAGE_BASENAME}.sha256
+          $MANIFEST_BASENAME
+          artifact-labels.env
+          README-VM.txt
+          smoke-report.txt
+          SHA256SUMS
+          image.provenance.bundle.json
+          checksums.provenance.bundle.json"
+          EXPECTED_ASSETS="$expected_assets" python3 - "$PUBLISH_DIR" <<'PY'
+          import os
+          import pathlib
+          import sys
+
+          publish_dir = pathlib.Path(sys.argv[1])
+          expected = {line.strip() for line in os.environ["EXPECTED_ASSETS"].splitlines() if line.strip()}
+          actual = {path.name for path in publish_dir.iterdir() if path.is_file()}
+          if actual != expected:
+              raise SystemExit(f"asset whitelist mismatch: actual={sorted(actual)!r}, expected={sorted(expected)!r}")
+          for name in actual:
+              path = publish_dir / name
+              if "AX9000" in name or "ax9000" in name:
+                  raise SystemExit(f"VM release asset must not mention AX9000: {name}")
+              if path.stat().st_size <= 0:
+                  raise SystemExit(f"release asset is empty: {name}")
+          PY
+      - name: Create, verify, and publish immutable prerelease
+        env:
+          GH_TOKEN: ${{ github.token }}
+          IMMUTABLE_RELEASES_READ_TOKEN: ${{ secrets.IMMUTABLE_RELEASES_READ_TOKEN }}
+        run: |
+          set -euo pipefail
+          git fetch --force origin "+refs/tags/$RELEASE_TAG:refs/tags/$RELEASE_TAG"
+          test "$(git rev-parse HEAD)" = "$EXPECTED_SOURCE_SHA"
+          test "$(git cat-file -t "refs/tags/$RELEASE_TAG")" = commit
+          test "$(git rev-parse "refs/tags/$RELEASE_TAG")" = "$EXPECTED_SOURCE_SHA"
+          remote_type="$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$RELEASE_TAG" --jq '.object.type')"
+          remote_sha="$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$RELEASE_TAG" --jq '.object.sha')"
+          test "$remote_type" = commit
+          test "$remote_sha" = "$EXPECTED_SOURCE_SHA"
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            echo "Release already exists and will not be overwritten: $RELEASE_TAG" >&2
+            exit 1
+          fi
+          release_title="NexaWrt x86_64 VM $RELEASE_VERSION prerelease"
+          gh release create "$RELEASE_TAG" --verify-tag --draft --prerelease --latest=false \
+            --title "$release_title" \
+            --notes "NexaWrt x86_64 VM-only prerelease. NOT Xiaomi AX9000 firmware. QEMU validation covers VM userspace/LuCI/basic networking only and does not validate AX9000 hardware, Wi-Fi, switch, NSS, NAND, sysupgrade, or recovery."
+          draft_release="$(mktemp)"
+          draft_assets="$(mktemp)"
+          final_release_by_id="$(mktemp)"
+          final_release_by_tag="$(mktemp)"
+          trap 'rm -f "$draft_release" "$draft_assets" "$final_release_by_id" "$final_release_by_tag"' EXIT
+          gh release view "$RELEASE_TAG" --json databaseId,isDraft,isPrerelease,tagName > "$draft_release"
+          release_id="$(python3 - "$draft_release" "$RELEASE_TAG" <<'PY'
+          import json
+          import pathlib
+          import sys
+
+          release_path, expected_tag = sys.argv[1:]
+          release = json.loads(pathlib.Path(release_path).read_text(encoding="utf-8"))
+          release_id = release.get("databaseId")
+          if isinstance(release_id, bool) or not isinstance(release_id, int) or release_id <= 0:
+              raise SystemExit("draft release database ID is invalid")
+          if release.get("isDraft") is not True:
+              raise SystemExit("draft release is not a draft")
+          if release.get("isPrerelease") is not True:
+              raise SystemExit("draft release is not marked prerelease")
+          if release.get("tagName") != expected_tag:
+              raise SystemExit("draft release tag mismatch")
+          print(release_id)
+          PY
+          )"
+          while IFS= read -r -d '' asset; do
+            gh release upload "$RELEASE_TAG" "$asset"
+          done < <(find "$PUBLISH_DIR" -maxdepth 1 -type f -print0 | sort -z)
+          expected="$(find "$PUBLISH_DIR" -maxdepth 1 -type f -exec basename {} \; | sort)"
+          gh api \
+            -H 'Accept: application/vnd.github+json' \
+            -H 'X-GitHub-Api-Version: 2026-03-10' \
+            "repos/$GITHUB_REPOSITORY/releases/$release_id/assets?per_page=100" > "$draft_assets"
+          DRAFT_EXPECTED_ASSETS="$expected" python3 - "$draft_assets" <<'PY'
+          import json
+          import os
+          import pathlib
+          import sys
+
+          assets = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
+          expected_assets = set(os.environ.get("DRAFT_EXPECTED_ASSETS", "").splitlines())
+          if not expected_assets:
+              raise SystemExit("draft release expected asset set is empty")
+          if not isinstance(assets, list) or len(assets) != len(expected_assets):
+              raise SystemExit("draft release asset count is not exact")
+          names = []
+          for asset in assets:
+              name = asset.get("name") if isinstance(asset, dict) else None
+              if not isinstance(name, str) or not name:
+                  raise SystemExit("draft release asset name is invalid")
+              if "AX9000" in name or "ax9000" in name:
+                  raise SystemExit(f"VM release asset mentions AX9000: {name}")
+              if asset.get("state") != "uploaded":
+                  raise SystemExit(f"draft release asset is not uploaded: {name}")
+              size = asset.get("size")
+              if isinstance(size, bool) or not isinstance(size, int) or size <= 0:
+                  raise SystemExit(f"draft release asset size is invalid: {name}")
+              names.append(name)
+          if set(names) != expected_assets or len(names) != len(set(names)):
+              raise SystemExit("draft release asset names are not the exact expected set")
+          PY
+          git fetch --force origin "+refs/tags/$RELEASE_TAG:refs/tags/$RELEASE_TAG"
+          test "$(git rev-parse HEAD)" = "$EXPECTED_SOURCE_SHA"
+          test "$(git cat-file -t "refs/tags/$RELEASE_TAG")" = commit
+          test "$(git rev-parse "refs/tags/$RELEASE_TAG")" = "$EXPECTED_SOURCE_SHA"
+          remote_type="$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$RELEASE_TAG" --jq '.object.type')"
+          remote_sha="$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$RELEASE_TAG" --jq '.object.sha')"
+          test "$remote_type" = commit
+          test "$remote_sha" = "$EXPECTED_SOURCE_SHA"
+          test -n "$IMMUTABLE_RELEASES_READ_TOKEN"
+          GH_TOKEN="$IMMUTABLE_RELEASES_READ_TOKEN" gh api \
+            -H 'Accept: application/vnd.github+json' \
+            -H 'X-GitHub-Api-Version: 2026-03-10' \
+            "repos/$GITHUB_REPOSITORY/immutable-releases" \
+            --jq 'select(.enabled == true) | .enabled' | grep -Fxq true
+          gh api \
+            --method PATCH \
+            -H 'Accept: application/vnd.github+json' \
+            -H 'X-GitHub-Api-Version: 2026-03-10' \
+            "repos/$GITHUB_REPOSITORY/releases/$release_id" \
+            -F draft=false \
+            -F prerelease=true \
+            -f make_latest=false > /dev/null
+          gh api \
+            -H 'Accept: application/vnd.github+json' \
+            -H 'X-GitHub-Api-Version: 2026-03-10' \
+            "repos/$GITHUB_REPOSITORY/releases/$release_id" > "$final_release_by_id"
+          gh api \
+            -H 'Accept: application/vnd.github+json' \
+            -H 'X-GitHub-Api-Version: 2026-03-10' \
+            "repos/$GITHUB_REPOSITORY/releases/tags/$RELEASE_TAG" > "$final_release_by_tag"
+          EXPECTED_ASSETS="$(find "$PUBLISH_DIR" -maxdepth 1 -type f -exec basename {} \; | sort)" \
+          python3 - "$final_release_by_id" "$final_release_by_tag" "$release_id" "$RELEASE_TAG" <<'PY'
+          import json
+          import os
+          import pathlib
+          import re
+          import sys
+
+          by_id_path, by_tag_path, expected_id_text, expected_tag = sys.argv[1:]
+          expected_id = int(expected_id_text)
+          expected_assets = set(os.environ["EXPECTED_ASSETS"].splitlines())
+          for label, path_text in (("by ID", by_id_path), ("by tag", by_tag_path)):
+              release = json.loads(pathlib.Path(path_text).read_text(encoding="utf-8"))
+              if release.get("id") != expected_id:
+                  raise SystemExit(f"published release {label} does not match draft release ID")
+              if release.get("draft") is not False:
+                  raise SystemExit(f"published release {label} is still draft")
+              if release.get("prerelease") is not True:
+                  raise SystemExit(f"published release {label} is not prerelease")
+              if release.get("immutable") is not True:
+                  raise SystemExit(f"published release {label} is not immutable")
+              if release.get("tag_name") != expected_tag:
+                  raise SystemExit(f"published release {label} tag mismatch")
+              if not re.fullmatch(r"vm-x86_64-v[0-9]+\.[0-9]+\.[0-9]+-rc\.[0-9]+", release.get("tag_name", "")):
+                  raise SystemExit(f"published release {label} tag format changed")
+              assets = release.get("assets")
+              if not isinstance(assets, list):
+                  raise SystemExit(f"published release {label} assets are malformed")
+              names = [asset.get("name") for asset in assets if isinstance(asset, dict)]
+              if set(names) != expected_assets or len(names) != len(set(names)):
+                  raise SystemExit(f"published release {label} asset set mismatch")
+              for name in names:
+                  if "AX9000" in name or "ax9000" in name:
+                      raise SystemExit(f"published VM release asset mentions AX9000: {name}")
+          PY

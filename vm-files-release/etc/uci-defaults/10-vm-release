@@ -1,0 +1,60 @@
+#!/bin/sh
+set -eu
+
+uci -q batch <<'UCI'
+set system.@system[0].hostname='nexawrt-vm'
+delete network.lan
+set network.lan='interface'
+set network.lan.device='eth0'
+set network.lan.proto='dhcp'
+set uhttpd.main.redirect_https='0'
+set dropbear.@dropbear[0].PasswordAuth='off'
+set dropbear.@dropbear[0].RootPasswordAuth='off'
+commit system
+commit network
+commit uhttpd
+commit dropbear
+UCI
+
+# Stop first so a later disable failure cannot leave a remotely reachable daemon.
+# Both commands are intentionally fail-closed: a failure prevents this uci-default
+# from being removed and prevents creation of successful runtime evidence.
+/etc/init.d/dropbear stop >/dev/null 2>&1
+/etc/init.d/dropbear disable >/dev/null 2>&1
+
+EVIDENCE_DIR='/tmp/nexawrt-vm-release'
+EVIDENCE_TMP="$EVIDENCE_DIR/ssh-runtime.evidence.tmp"
+EVIDENCE_FILE="$EVIDENCE_DIR/ssh-runtime.evidence"
+AUTHORIZED_KEYS='/etc/dropbear/authorized_keys'
+
+umask 077
+mkdir -p "$EVIDENCE_DIR"
+rm -f "$EVIDENCE_TMP" "$EVIDENCE_FILE"
+
+# These are runtime checks, not labels. Do not emit a PASS evidence block unless
+# every assertion is true in the exact booted release image.
+if /etc/init.d/dropbear enabled >/dev/null 2>&1; then
+  printf '%s\n' 'NEXAWRT_VM_SSH_RUNTIME_CHECK_FAILED=dropbear_enabled' >/dev/console
+  exit 1
+fi
+if pidof dropbear >/dev/null 2>&1; then
+  printf '%s\n' 'NEXAWRT_VM_SSH_RUNTIME_CHECK_FAILED=dropbear_running' >/dev/console
+  exit 1
+fi
+if [ -s "$AUTHORIZED_KEYS" ]; then
+  printf '%s\n' 'NEXAWRT_VM_SSH_RUNTIME_CHECK_FAILED=authorized_keys_nonempty' >/dev/console
+  exit 1
+fi
+
+cat >"$EVIDENCE_TMP" <<'EVIDENCE'
+NEXAWRT_VM_SSH_RUNTIME_EVIDENCE_V1_BEGIN
+ssh=DISABLED_BY_DEFAULT
+authorized_keys=ABSENT
+dropbear_enabled=NO
+dropbear_running=NO
+NEXAWRT_VM_SSH_RUNTIME_EVIDENCE_V1_END
+EVIDENCE
+mv "$EVIDENCE_TMP" "$EVIDENCE_FILE"
+cat "$EVIDENCE_FILE" >/dev/console
+
+exit 0

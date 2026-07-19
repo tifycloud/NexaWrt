@@ -76,11 +76,19 @@ assert_contains 'sha256sum --check --status' "$BUILD_SCRIPT"
 assert_contains 'PROFILE="$PROFILE"' "$BUILD_SCRIPT"
 assert_contains 'FILES="$OVERLAY_WORK"' "$BUILD_SCRIPT"
 assert_contains 'ARTIFACT_BASENAME="nexawrt-vm-smoke-openwrt-${VM_OPENWRT_VERSION}-${TARGET}.img.gz"' "$BUILD_SCRIPT"
-artifact_expression="$(sed -nE 's/^ARTIFACT_BASENAME="(.*)"/\1/p' "$BUILD_SCRIPT")"
-[[ -n "$artifact_expression" ]] || fail "VM artifact basename is not explicit"
-artifact_expression_lower="$(printf '%s' "$artifact_expression" | tr '[:upper:]' '[:lower:]')"
-[[ "$artifact_expression_lower" != *ax9000* ]] || fail "VM image artifact name mentions AX9000"
+assert_contains 'ARTIFACT_BASENAME="NexaWrt-x86_64-${RELEASE_VERSION}-generic-ext4-combined.img.gz"' "$BUILD_SCRIPT"
+artifact_expressions="$(sed -nE 's/^[[:space:]]*ARTIFACT_BASENAME="(.*)"/\1/p' "$BUILD_SCRIPT")"
+[[ -n "$artifact_expressions" ]] || fail "VM artifact basenames are not explicit"
+while IFS= read -r artifact_expression; do
+  artifact_expression_lower="$(printf '%s' "$artifact_expression" | tr '[:upper:]' '[:lower:]')"
+  [[ "$artifact_expression_lower" != *ax9000* ]] || fail "VM image artifact name mentions AX9000"
+done <<<"$artifact_expressions"
 ! grep -Fq 'files/etc' "$BUILD_SCRIPT" || fail "VM build script references the hardware overlay"
+assert_contains 'MODE="smoke"' "$BUILD_SCRIPT"
+assert_contains 'release mode supports x86-64 only' "$BUILD_SCRIPT"
+assert_contains 'VM_SMOKE_AUTHORIZED_KEY_FILE is required in smoke mode' "$BUILD_SCRIPT"
+assert_contains 'VM_SMOKE_AUTHORIZED_KEY_FILE must not be set in release mode' "$BUILD_SCRIPT"
+assert_contains 'RELEASE_TAG_PATTERN=' "$BUILD_SCRIPT"
 
 for label in \
   'ARTIFACT_CLASS=VM_SMOKE_IMAGE' \

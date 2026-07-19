@@ -11,7 +11,7 @@ on:
       - 'scripts/verify-pages-releases.py'
       - '.github/workflows/pages.yml'
   workflow_run:
-    workflows: ['NexaWrt AX9000 reproducible RAM-test release']
+    workflows: ['NexaWrt AX9000 reproducible RAM-test release', 'NexaWrt x86_64 VM release']
     types: [completed]
   schedule:
     - cron: '17 */6 * * *'

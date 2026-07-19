@@ -252,8 +252,23 @@ SHA-256 锁定的 OpenWrt ImageBuilder，检查启动、SSH、LuCI HTTP、`ubus`
 OpenWrt 用户空间和自动化流程可运行，不能证明 AX9000、Qualcomm NSS、交换芯片、Wi-Fi、温度、
 断电恢复或持久存储安全。**
 
-在浏览器中打开 **Actions → VM smoke (QEMU only) → Run workflow** 即可重新运行；Pull Request 修改
-VM 相关文件时也会自动执行。测试阶段的 AX9000 候选则通过轻量 tag 发布为 GitHub prerelease：
+VM 有两条彼此隔离的路径：
+
+- **VM smoke (QEMU only)**：覆盖 `x86-64` 与 `armsr-armv8`，注入一次性 CI SSH 公钥，只用于仓库自动化冒烟检查，不发布给用户。
+- **NexaWrt x86_64 VM release**：只构建 `x86-64` 用户发行镜像，不注入任何 SSH 公钥、默认禁用 Dropbear。工作流对即将发布的精确 `.img.gz` 启动 QEMU，验证启动存活、LuCI、串口 VM-only 标签、Dropbear 已禁用且未运行、`authorized_keys` 缺失，以及转发到 guest 22 的随机主机端口没有 SSH 服务；通过后发布独立的 `vm-x86_64-vX.Y.Z-rc.N` prerelease。
+
+在浏览器中打开 **Actions → NexaWrt x86_64 VM release → Run workflow**，必须选择 `main` 并填写例如
+`vm-x86_64-v0.1.0-rc.1`。预检从 GitHub 远程读取当时的 `main` 精确 commit SHA，要求 dispatch 的
+`GITHUB_SHA` 与之完全一致，再在该 SHA 创建轻量 tag；构建、证明和发布阶段都继续固定并复验同一个 SHA，
+不是“任意 `main` 祖先”即可发布。VM Release 精确包含 9 个资产：镜像、镜像摘要、manifest、安全标签、
+使用说明、QEMU 报告、`SHA256SUMS` 和两份 provenance。
+
+Pages 只有在 immutable prerelease、精确 9 资产、`artifact-labels.env` 安全合同、精确 23 字段的
+`smoke-report.txt` 合同、镜像与 `SHA256SUMS` attestation，以及每个资产的 Release ID/name/size/SHA-256
+proof 全部匹配后，才会在独立的 x86_64 VM 区域提供下载。任一项失败只隐藏 VM 条目，不会把 VM PASS
+升级成 AX9000 可刷写或生产结论。完整规则和使用说明见 [VM x86_64 文档](docs/VM-X86_64.md)。
+
+测试阶段的 AX9000 候选仍通过轻量 tag 发布为 GitHub prerelease：
 
 ```sh
 tag=ram-test-nss-v0.1.0-rc.1
@@ -294,8 +309,16 @@ AX9000 initramfs firmware 与 CycloneDX SBOM。随后四个 provenance bundle �
 匹配 Release ID 的 proof 才会把下载项写入页面索引。因此，即使有人手工创建名称和六资产外观都相同的
 immutable/prerelease lookalike，只要缺少上述可信来源与摘要证明，也会从网站中排除。
 
+x86_64 VM 下载区使用独立门禁：候选必须是 immutable prerelease，并具有精确 9 个资产；验证器复验
+精确 15 字段的 `artifact-labels.env` 和精确 23 字段的 `smoke-report.txt`，其中 QEMU 报告必须绑定
+实际发布的镜像文件名，并证明 `qemu_boot=PASS`、LuCI HTTP、VM-only 串口标签、Dropbear disabled/未运行、
+`authorized_keys` 缺失以及 guest 22 转发端口无 SSH 服务。镜像和 `SHA256SUMS` 必须具有受信任工作流
+attestation；proof 还要为全部 9 个资产绑定同一 Release 的 asset ID、name、size 与实际 SHA-256，
+Pages 生成器再与 GitHub Release API 数据逐项匹配。任一 VM 证据不符，VM 下载即 fail-closed；AX9000
+和 VM 两个区域相互隔离，某一区域无效不会自动禁用另一区域。
+
 站点会在 `main` 更新、发布工作流成功后以及每 6 小时周期复验并重新部署。Official 与 NSS 分频道，
-Release 尚不存在或证明失败时页面会明确显示不可下载。站点从 schema-v2 目录生成浏览器云编译、恢复与
+Release 尚不存在或证明失败时页面会明确显示不可下载。站点从 schema-v3 目录分别生成 AX9000 RAM-test 与 x86_64 VM 下载区；AX9000 区继续提供浏览器云编译、恢复与
 测试文档的固定链接，并提供只生成易失性 RAM 会话 UCI 配置片段的生成器。前端对异常设备元数据、异常
 URL、历史顺序、重复 tag、`latest` 不一致或非 RAM-only 状态全部 fail-closed。**当前目录仍仅支持
 Xiaomi AX9000 的 RAM-only 候选，硬件状态为未验证，绝非生产可用或可刷写固件。**网站不是刷机工具，
@@ -323,12 +346,13 @@ scripts/backup-router.sh               只读备份
 scripts/nss-diagnostics.sh             NSS/ECM 只读运行时诊断
 scripts/prepare.sh                     获取、锁定并校验上游
 scripts/build.sh                       Linux 干净构建
-scripts/build-vm-image.sh              构建 x86_64/ARM64 VM-only 测试镜像
-scripts/test-vm-smoke.sh               QEMU 启动、网络、SSH 与 LuCI 冒烟测试
+scripts/build-vm-image.sh              构建 VM smoke 或 x86_64 用户发行镜像
+scripts/test-vm-smoke.sh               CI 专用 QEMU 启动、网络、SSH 与 LuCI 冒烟测试
+scripts/test-vm-release.sh             对无注入密钥的精确 x86_64 Release 镜像做 QEMU/LuCI 检查
 devices/xiaomi-ax9000/device.json      AX9000 RAM-only 设备目录单一事实来源
 scripts/device_metadata.py              严格设备目录与构建请求校验器
 scripts/verify-pages-releases.py         验证 Release 来源、资产、摘要与 provenance 并生成 proof manifest
-scripts/generate-pages-data.py           生成 schema-v2 严格白名单 Pages Release 索引
+scripts/generate-pages-data.py           生成 schema-v3 AX9000/VM 严格白名单 Pages Release 索引
 site/                                    GitHub Pages 下载与安全配置站点
 scripts/check-kernel-build-identity.sh Kconfig 构建身份与带产品前缀的 source-lock revision 门禁
 tests/test_openwrt_defconfig_version.sh 锁定 OpenWrt Kconfig defconfig 保留测试

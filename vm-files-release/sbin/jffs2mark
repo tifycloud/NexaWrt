@@ -1,0 +1,3 @@
+#!/bin/sh
+guard="${NEXAWRT_VM_GUARD_PATH:-/usr/libexec/nexawrt-vm-dangerous-command-guard}"
+exec "$guard" "$0" "$@"

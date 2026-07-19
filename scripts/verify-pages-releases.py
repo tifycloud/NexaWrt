@@ -25,7 +25,7 @@ MAX_INPUT_BYTES = 5 * 1024 * 1024
 MAX_ARCHIVE_BYTES = 128 * 1024 * 1024
 MAX_CHECKSUM_BYTES = 4096
 MAX_PROVENANCE_BYTES = 16 * 1024 * 1024
-MAX_TOTAL_DOWNLOAD_BYTES = 768 * 1024 * 1024
+MAX_TOTAL_DOWNLOAD_BYTES = 1536 * 1024 * 1024
 MAX_CANDIDATES_PER_FLAVOR = 12
 MAX_ARCHIVE_MEMBERS = 4096
 MAX_TOTAL_MEMBER_BYTES = 256 * 1024 * 1024
@@ -37,6 +37,30 @@ MAX_FIRMWARE_BYTES = 128 * 1024 * 1024
 MAX_SBOM_BYTES = 32 * 1024 * 1024
 CHANNEL = "ram-test"
 SIGNER_WORKFLOW = f"{REPOSITORY}/.github/workflows/release.yml"
+VM_SIGNER_WORKFLOW = f"{REPOSITORY}/.github/workflows/vm-release.yml"
+VM_TAG_PREFIX = "vm-x86_64-"
+VM_PLATFORM = "x86_64"
+MAX_VM_IMAGE_BYTES = 1024 * 1024 * 1024
+MAX_VM_TEXT_BYTES = 2 * 1024 * 1024
+VM_PROVENANCE_ASSETS = {
+    "provenance_image": "image.provenance.bundle.json",
+    "provenance_checksums": "checksums.provenance.bundle.json",
+}
+VM_VERIFIED_SUBJECTS = ["image", "checksums"]
+VM_ARTIFACT_LABEL_KEYS = {
+    "ARTIFACT_CLASS", "OPENWRT_VERSION", "TARGET", "MODE", "VM_ONLY",
+    "NOT_AX9000_FIRMWARE", "HARDWARE_VALIDATION", "NSS_VALIDATION",
+    "VALIDATION_SCOPE", "IMAGEBUILDER_URL", "IMAGEBUILDER_SHA256",
+    "RELEASE_TAG", "RELEASE_VERSION", "SSH_DEFAULT", "SSH_AUTHORIZED_KEYS",
+}
+VM_SMOKE_REPORT_KEYS = {
+    "status", "target", "image", "vm_only", "not_ax9000_firmware",
+    "hardware_validation", "nss_validation", "exact_release_image", "qemu_boot",
+    "serial_labels", "http", "ssh_runtime_evidence", "ssh_port_probe", "ssh",
+    "authorized_keys", "dropbear_enabled", "dropbear_running", "http_status",
+    "auth_challenge", "http_host_port", "ssh_host_port", "serial_log", "ssh_probe_log",
+}
+VM_RESULT_ROOT = PurePosixPath("/home/runner/work/NexaWrt/NexaWrt/vm-release-results/x86-64")
 TRUSTED_REF = "refs/heads/main"
 VERSION_RE = re.compile(r"^v(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)-rc\.(?:0|[1-9][0-9]*)$")
 HEX_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
@@ -160,6 +184,57 @@ def expected_names(metadata: dict[str, Any], flavor: str, version: str) -> dict[
         "checksum": f"{archive}.sha256",
         **{f"provenance_{key}": value for key, value in PROVENANCE.items()},
     }
+
+
+def vm_identity(tag: Any) -> str | None:
+    if not isinstance(tag, str) or not tag.startswith(VM_TAG_PREFIX):
+        return None
+    version = tag[len(VM_TAG_PREFIX):]
+    return version if VERSION_RE.fullmatch(version) else None
+
+
+def vm_expected_names(version: str) -> dict[str, str]:
+    image = f"NexaWrt-x86_64-{version}-generic-ext4-combined.img.gz"
+    manifest = f"{image[:-len('.img.gz')]}.manifest"
+    return {
+        "image": image,
+        "image_checksum": f"{image}.sha256",
+        "manifest": manifest,
+        "artifact_labels": "artifact-labels.env",
+        "readme": "README-VM.txt",
+        "smoke_report": "smoke-report.txt",
+        "checksums": "SHA256SUMS",
+        **VM_PROVENANCE_ASSETS,
+    }
+
+
+def vm_candidate_assets(raw: Any) -> tuple[int, str, str, str, dict[str, dict[str, Any]]] | None:
+    if not isinstance(raw, dict) or raw.get("draft") is not False or raw.get("prerelease") is not True or raw.get("immutable") is not True:
+        return None
+    release_id, tag = raw.get("id"), raw.get("tag_name")
+    version = vm_identity(tag)
+    published_at = normalized_timestamp(raw.get("published_at"))
+    if isinstance(release_id, bool) or not isinstance(release_id, int) or release_id <= 0 or version is None or published_at is None:
+        return None
+    expected = vm_expected_names(version)
+    assets = raw.get("assets")
+    if not isinstance(assets, list) or len(assets) != len(expected):
+        return None
+    limits = {
+        expected["image"]: MAX_VM_IMAGE_BYTES,
+        **{name: MAX_VM_TEXT_BYTES for key, name in expected.items() if key != "image"},
+    }
+    by_name: dict[str, dict[str, Any]] = {}
+    for asset in assets:
+        if not isinstance(asset, dict):
+            return None
+        name, asset_id, size = asset.get("name"), asset.get("id"), asset.get("size")
+        if name not in expected.values() or name in by_name or asset.get("state") != "uploaded":
+            return None
+        if isinstance(asset_id, bool) or not isinstance(asset_id, int) or asset_id <= 0 or isinstance(size, bool) or not isinstance(size, int) or size <= 0 or size > limits[name]:
+            return None
+        by_name[name] = asset
+    return (release_id, tag, version, published_at, by_name) if set(by_name) == set(expected.values()) else None
 
 
 def normalized_timestamp(value: Any) -> str | None:
@@ -485,6 +560,179 @@ def verify_candidate(
     return tag, proof
 
 
+def parse_vm_key_values(path: Path) -> dict[str, str]:
+    values: dict[str, str] = {}
+    for raw in path.read_text(encoding="utf-8").splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        if "=" not in line:
+            raise VerificationError(f"invalid VM evidence line in {path.name}")
+        key, value = line.split("=", 1)
+        key = key.strip()
+        if key in values or not re.fullmatch(r"[A-Za-z][A-Za-z0-9_]*", key):
+            raise VerificationError(f"invalid or duplicate VM evidence key in {path.name}")
+        values[key] = value.strip().strip('"').strip("'")
+    return values
+
+
+def parse_vm_host_port(value: str, field: str) -> int:
+    if not re.fullmatch(r"[1-9][0-9]{3,4}", value):
+        raise VerificationError(f"VM smoke report contains an invalid {field}")
+    port = int(value)
+    if port < 1024 or port > 65535 or str(port) != value:
+        raise VerificationError(f"VM smoke report contains an invalid {field}")
+    return port
+
+
+def require_vm_result_path(value: str, filename: str, field: str) -> None:
+    path = PurePosixPath(value)
+    expected = VM_RESULT_ROOT / filename
+    if not path.is_absolute() or path != expected:
+        raise VerificationError(f"VM smoke report contains an unsafe or unexpected {field}")
+
+
+def verify_sha256sums(checksums: Path, expected_subjects: dict[str, Path]) -> None:
+    if checksums.stat().st_size > MAX_VM_TEXT_BYTES:
+        raise VerificationError("VM SHA256SUMS asset is too large")
+    lines = checksums.read_text(encoding="ascii").splitlines()
+    expected_lines = [f"{sha256(path)}  {path.name}" for path in expected_subjects.values()]
+    if lines != expected_lines:
+        raise VerificationError("VM SHA256SUMS does not exactly match published non-provenance assets")
+
+
+def vm_attestation_command(gh: Path, subject: Path, bundle: Path, source_ref: str, source_digest: str) -> list[str]:
+    return [
+        str(gh), "attestation", "verify", str(subject), "--bundle", str(bundle),
+        "--repo", REPOSITORY, "--signer-workflow", VM_SIGNER_WORKFLOW,
+        "--source-ref", source_ref, "--source-digest", source_digest,
+        "--predicate-type", "https://slsa.dev/provenance/v1",
+        "--cert-oidc-issuer", "https://token.actions.githubusercontent.com",
+        "--deny-self-hosted-runners",
+    ]
+
+
+def verify_vm_attestation(gh: Path, subject: Path, bundle: Path, tag: str, source_digest: str) -> None:
+    errors: list[str] = []
+    for source_ref in (f"refs/tags/{tag}", TRUSTED_REF):
+        try:
+            run(vm_attestation_command(gh, subject, bundle, source_ref, source_digest), timeout=180)
+            return
+        except VerificationError as exc:
+            errors.append(f"{source_ref}: {exc}")
+    raise VerificationError("VM attestation source-ref did not match tag or main: " + "; ".join(errors))
+
+
+def verify_vm_candidate(gh: Path, candidate: tuple[int, str, str, str, dict[str, dict[str, Any]]],
+                        trusted_main: str, budget: DownloadBudget) -> tuple[str, dict[str, Any]]:
+    release_id, tag, version, _published_at, assets = candidate
+    names = vm_expected_names(version)
+    source_digest = resolve_tag_commit(gh, tag)
+    require_main_ancestor(source_digest, trusted_main)
+    with tempfile.TemporaryDirectory(prefix="nexawrt-pages-vm-proof-") as temporary:
+        work = Path(temporary)
+        downloaded: dict[str, Path] = {}
+        for key, name in names.items():
+            destination = work / name
+            download_asset(gh, assets[name], destination, budget)
+            downloaded[key] = destination
+        verify_external_checksum(downloaded["image_checksum"], downloaded["image"])
+        checksum_subjects = {
+            "image": downloaded["image"],
+            "image_checksum": downloaded["image_checksum"],
+            "manifest": downloaded["manifest"],
+            "artifact_labels": downloaded["artifact_labels"],
+            "readme": downloaded["readme"],
+            "smoke_report": downloaded["smoke_report"],
+        }
+        verify_sha256sums(downloaded["checksums"], checksum_subjects)
+        labels = parse_vm_key_values(downloaded["artifact_labels"])
+        if set(labels) != VM_ARTIFACT_LABEL_KEYS:
+            raise VerificationError("VM artifact labels do not have the exact required key set")
+        expected_labels = {
+            "ARTIFACT_CLASS": "VM_DISTRIBUTION_IMAGE",
+            "TARGET": "x86-64",
+            "MODE": "release",
+            "VM_ONLY": "true",
+            "NOT_AX9000_FIRMWARE": "true",
+            "HARDWARE_VALIDATION": "false",
+            "NSS_VALIDATION": "false",
+            "VALIDATION_SCOPE": "QEMU_BOOT_AND_USERSPACE_ONLY",
+            "RELEASE_TAG": tag,
+            "RELEASE_VERSION": version,
+            "SSH_DEFAULT": "disabled",
+            "SSH_AUTHORIZED_KEYS": "absent",
+        }
+        if any(labels[key] != value for key, value in expected_labels.items()):
+            raise VerificationError("VM artifact labels do not exactly match the release safety contract")
+        if not re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+(?:[-.][A-Za-z0-9]+)*", labels["OPENWRT_VERSION"]):
+            raise VerificationError("VM artifact labels contain an invalid OpenWrt version")
+        if not labels["IMAGEBUILDER_URL"].startswith("https://downloads.openwrt.org/"):
+            raise VerificationError("VM artifact labels contain an untrusted ImageBuilder URL")
+        if not HEX_SHA256_RE.fullmatch(labels["IMAGEBUILDER_SHA256"]):
+            raise VerificationError("VM artifact labels contain an invalid ImageBuilder digest")
+
+        smoke = parse_vm_key_values(downloaded["smoke_report"])
+        if set(smoke) != VM_SMOKE_REPORT_KEYS:
+            raise VerificationError("VM smoke report does not have the exact required key set")
+        expected_smoke = {
+            "status": "PASS",
+            "target": "x86-64",
+            "vm_only": "true",
+            "not_ax9000_firmware": "true",
+            "hardware_validation": "false",
+            "nss_validation": "false",
+            "exact_release_image": "true",
+            "qemu_boot": "PASS",
+            "serial_labels": "PASS",
+            "http": "PASS",
+            "ssh_runtime_evidence": "PASS",
+            "ssh_port_probe": "PASS",
+            "ssh": "DISABLED_BY_DEFAULT",
+            "authorized_keys": "ABSENT",
+            "dropbear_enabled": "NO",
+            "dropbear_running": "NO",
+        }
+        if any(smoke[key] != value for key, value in expected_smoke.items()):
+            raise VerificationError("VM smoke report does not exactly prove the release safety contract")
+        if Path(smoke["image"]).name != names["image"]:
+            raise VerificationError("VM smoke report did not test the exact published image")
+        if (smoke["http_status"], smoke["auth_challenge"]) not in {("200", "false"), ("403", "true")}:
+            raise VerificationError("VM smoke report contains an invalid LuCI HTTP result")
+        http_port = parse_vm_host_port(smoke["http_host_port"], "HTTP host port")
+        ssh_port = parse_vm_host_port(smoke["ssh_host_port"], "SSH host port")
+        if http_port == ssh_port:
+            raise VerificationError("VM smoke report reuses the same HTTP and SSH host port")
+        require_vm_result_path(smoke["serial_log"], "serial.log", "serial log path")
+        require_vm_result_path(smoke["ssh_probe_log"], "ssh-port-probe.txt", "SSH probe log path")
+        verify_vm_attestation(gh, downloaded["image"], downloaded["provenance_image"], tag, source_digest)
+        verify_vm_attestation(gh, downloaded["checksums"], downloaded["provenance_checksums"], tag, source_digest)
+        proof = {
+            "release_id": release_id,
+            "source_digest": source_digest,
+            "assets": {
+                key: {
+                    "id": assets[name]["id"],
+                    "name": name,
+                    "size": assets[name]["size"],
+                    "sha256": sha256(downloaded[key]),
+                }
+                for key, name in names.items()
+            },
+            "verified_subjects": VM_VERIFIED_SUBJECTS,
+        }
+    return tag, proof
+
+
+def select_vm_candidates(raw: list[Any]) -> list[tuple[int, str, str, str, dict[str, dict[str, Any]]]]:
+    candidates = [candidate for item in raw if (candidate := vm_candidate_assets(item)) is not None]
+    tags = [candidate[1] for candidate in candidates]
+    if len(tags) != len(set(tags)):
+        raise ValueError("duplicate VM candidate release tag")
+    candidates.sort(key=lambda item: (item[3], version_order(item[2])), reverse=True)
+    return candidates[:MAX_CANDIDATES_PER_FLAVOR]
+
+
 def select_candidates(raw: list[Any], metadata: dict[str, Any]) -> list[tuple[int, str, str, str, str, dict[str, dict[str, Any]]]]:
     grouped: dict[str, list[tuple[int, str, str, str, str, dict[str, dict[str, Any]]]]] = {
         flavor: [] for flavor in metadata["flavors"]
@@ -534,6 +782,7 @@ def main() -> int:
         gh = executable_path(args.gh_bin)
         main_digest = trusted_main_digest(args.trusted_main)
         proofs: dict[str, dict[str, Any]] = {}
+        vm_proofs: dict[str, dict[str, Any]] = {}
         budget = DownloadBudget()
         for candidate in select_candidates(raw, metadata):
             tag = candidate[1]
@@ -543,13 +792,22 @@ def main() -> int:
                 print(f"verify-pages-releases: excluded {tag}: {exc}", file=sys.stderr)
                 continue
             proofs[verified_tag] = proof
+        for candidate in select_vm_candidates(raw):
+            tag = candidate[1]
+            try:
+                verified_tag, proof = verify_vm_candidate(gh, candidate, main_digest, budget)
+            except VerificationError as exc:
+                print(f"verify-pages-releases: excluded {tag}: {exc}", file=sys.stderr)
+                continue
+            vm_proofs[verified_tag] = proof
         write_json(args.output, {
-            "schema_version": 1,
+            "schema_version": 3,
             "repository": REPOSITORY,
             "trusted_ref": TRUSTED_REF,
             "trusted_main_digest": main_digest,
-            "signer_workflow": SIGNER_WORKFLOW,
+            "signer_workflows": {"ax9000": SIGNER_WORKFLOW, "vm_x86_64": VM_SIGNER_WORKFLOW},
             "releases": proofs,
+            "virtual_images": {"x86_64": vm_proofs},
         })
     except (OSError, ValueError, json.JSONDecodeError, UnicodeError) as exc:
         print(f"verify-pages-releases: {exc}", file=sys.stderr)
