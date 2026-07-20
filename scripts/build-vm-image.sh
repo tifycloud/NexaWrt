@@ -9,6 +9,8 @@ WORK_DIR="${VM_WORK_DIR:-$ROOT_DIR/.work/vm}"
 OUTPUT_ROOT="${VM_OUTPUT_DIR:-$ROOT_DIR/dist/vm}"
 ROOTFS_PARTSIZE="${VM_ROOTFS_PARTSIZE:-256}"
 RELEASE_TAG_PATTERN='^vm-x86_64-v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)-rc\.(0|[1-9][0-9]*)$'
+RELEASE_CONTRACT='vm-x86_64/v2'
+PUBLISHED_VARIANTS='raw_bios,iso_bios,iso_efi,vmdk_bios,vmdk_efi'
 
 usage() {
   cat >&2 <<'USAGE'
@@ -17,13 +19,14 @@ Usage:
   build-vm-image.sh x86-64 release <vm-x86_64-vX.Y.Z-rc.N>
   build-vm-image.sh x86-64 <vm-x86_64-vX.Y.Z-rc.N>
 
-Build a VM-only OpenWrt image from a SHA256-pinned ImageBuilder.
+Build VM-only OpenWrt artifacts from a SHA256-pinned ImageBuilder.
 
 The one-argument form is the existing smoke mode. It remains compatible with
 .github/workflows/vm-smoke.yml and requires VM_SMOKE_AUTHORIZED_KEY_FILE.
 
-Release mode is only for x86-64 user-distribution images. It never injects CI
-SSH authorized_keys and uses the independent vm-files-release overlay.
+Release mode is x86-64 only. The v2 contract builds exactly five publishable
+ext4 variants: raw BIOS, BIOS/EFI Live ISO, and BIOS/EFI VMDK. It never injects
+CI SSH authorized_keys and never claims ESXi validation.
 USAGE
 }
 
@@ -67,7 +70,47 @@ select_x86_64_release_manifest() {
   printf '%s\n' "$candidate"
 }
 
-# Keep the selector sourceable for offline policy tests without executing a build.
+select_x86_64_release_inputs() {
+  local target_dir="$1"
+  local openwrt_version="$2"
+  local generic_prefix="openwrt-${openwrt_version}-x86-64-generic"
+  local expected_names=(
+    "${generic_prefix}-ext4-combined.img.gz"
+    "${generic_prefix}-ext4-combined-efi.img.gz"
+    "${generic_prefix}-image.iso"
+    "${generic_prefix}-image-efi.iso"
+    "${generic_prefix}-ext4-combined.vmdk.gz"
+    "${generic_prefix}-ext4-combined-efi.vmdk.gz"
+  )
+  local selected=()
+  local candidate
+  local expected
+
+  [[ -d "$target_dir" ]] || fail "release image target directory is missing: $target_dir"
+
+  # OpenWrt 25.12.5 still emits squashfs files even when
+  # CONFIG_TARGET_ROOTFS_SQUASHFS=n is passed to ImageBuilder. Do not use that
+  # make argument as evidence that squashfs was suppressed; bind only these six
+  # exact inputs. The native monolithicSparse VMDKs are source/capability checks,
+  # while the published VMDKs are converted from the matching ext4 raw disks.
+  for expected in "${expected_names[@]}"; do
+    candidate="$target_dir/$expected"
+    [[ -f "$candidate" && ! -L "$candidate" ]] ||
+      fail "required upstream release input is missing or not a regular non-symlink file: $candidate"
+    [[ -s "$candidate" ]] || fail "required upstream release input is empty: $candidate"
+    selected+=("$candidate")
+  done
+
+  [[ "${#selected[@]}" -eq 6 ]] || fail "internal error: release selector did not bind six upstream inputs"
+  printf '%s\n' "${selected[@]}"
+}
+
+# Backward-compatible function name for focused policy tests. The v2 release
+# selector now returns six build inputs used to produce five published images.
+select_x86_64_release_images() {
+  select_x86_64_release_inputs "$@"
+}
+# Keep selectors sourceable for offline policy tests without executing a build.
 if [[ "${BASH_SOURCE[0]}" != "$0" ]]; then
   return 0
 fi
@@ -134,6 +177,7 @@ case "$MODE" in
   smoke)
     OVERLAY_DIR="$SMOKE_OVERLAY_DIR"
     ARTIFACT_CLASS="VM_SMOKE_IMAGE"
+    VALIDATION_SCOPE_VALUE="QEMU_BOOT_AND_USERSPACE_ONLY"
     ARTIFACT_BASENAME="nexawrt-vm-smoke-openwrt-${VM_OPENWRT_VERSION}-${TARGET}.img.gz"
     RELEASE_VERSION=""
     ;;
@@ -142,9 +186,16 @@ case "$MODE" in
     [[ -n "$RELEASE_TAG" ]] || fail "release mode requires a tag: vm-x86_64-vX.Y.Z-rc.N"
     [[ "$RELEASE_TAG" =~ $RELEASE_TAG_PATTERN ]] || fail "release tag must match vm-x86_64-vX.Y.Z-rc.N: $RELEASE_TAG"
     OVERLAY_DIR="$RELEASE_OVERLAY_DIR"
-    ARTIFACT_CLASS="VM_DISTRIBUTION_IMAGE"
+    ARTIFACT_CLASS="VM_DISTRIBUTION_SET"
+    VALIDATION_SCOPE_VALUE="QEMU_RUNTIME_ALL_VARIANTS"
     RELEASE_VERSION="${RELEASE_TAG#vm-x86_64-}"
     ARTIFACT_BASENAME="NexaWrt-x86_64-${RELEASE_VERSION}-generic-ext4-combined.img.gz"
+    RAW_BIOS_BASENAME="$ARTIFACT_BASENAME"
+    ISO_BIOS_BASENAME="NexaWrt-x86_64-${RELEASE_VERSION}-generic-image.iso"
+    ISO_EFI_BASENAME="NexaWrt-x86_64-${RELEASE_VERSION}-generic-image-efi.iso"
+    VMDK_BIOS_BASENAME="NexaWrt-x86_64-${RELEASE_VERSION}-generic-ext4-combined.vmdk"
+    VMDK_EFI_BASENAME="NexaWrt-x86_64-${RELEASE_VERSION}-generic-ext4-combined-efi.vmdk"
+    RELEASE_MANIFEST_BASENAME="NexaWrt-x86_64-${RELEASE_VERSION}-generic.manifest"
     ;;
   *)
     fail "internal error: unsupported mode $MODE"
@@ -152,9 +203,14 @@ case "$MODE" in
 esac
 
 [[ -d "$OVERLAY_DIR" ]] || fail "missing VM overlay: $OVERLAY_DIR"
-for command_name in curl sha256sum tar make find install cp tee wc grep sort; do
+for command_name in curl sha256sum tar make find install cp tee wc grep sort sed gzip python3; do
   command -v "$command_name" >/dev/null 2>&1 || fail "required command is missing: $command_name"
 done
+if [[ "$MODE" == release ]]; then
+  for command_name in mkisofs qemu-img; do
+    command -v "$command_name" >/dev/null 2>&1 || fail "release image format tool is missing: $command_name"
+  done
+fi
 [[ "$ROOTFS_PARTSIZE" =~ ^[1-9][0-9]*$ ]] || fail "VM_ROOTFS_PARTSIZE must be a positive integer"
 
 AUTHORIZED_KEY_FILE="${VM_SMOKE_AUTHORIZED_KEY_FILE:-}"
@@ -211,6 +267,39 @@ else
   if find "$OVERLAY_WORK" -type f -path '*/authorized_keys' -print -quit | grep -q .; then
     fail "release overlay must not contain SSH authorized_keys"
   fi
+  cat > "$OVERLAY_WORK/etc/nexawrt-vm-release" <<EOF_METADATA
+NEXAWRT_VM_RELEASE_METADATA_V2_BEGIN
+RELEASE_CONTRACT=$RELEASE_CONTRACT
+ARTIFACT_CLASS=$ARTIFACT_CLASS
+PUBLISHED_VARIANTS=$PUBLISHED_VARIANTS
+ESXI_VALIDATION=not-tested
+VM_ONLY=1
+NOT_AX9000_FIRMWARE=1
+HARDWARE_VALIDATION=0
+NSS_VALIDATION=0
+VALIDATION_SCOPE=$VALIDATION_SCOPE_VALUE
+SSH_DEFAULT=disabled
+SSH_AUTHORIZED_KEYS=absent
+NEXAWRT_VM_RELEASE_METADATA_V2_END
+EOF_METADATA
+  cat > "$OVERLAY_WORK/etc/banner" <<EOF_BANNER
+NexaWrt x86_64 VM distribution set ${RELEASE_VERSION}
+RELEASE_CONTRACT=$RELEASE_CONTRACT
+ARTIFACT_CLASS=$ARTIFACT_CLASS
+PUBLISHED_VARIANTS=$PUBLISHED_VARIANTS
+ESXI_VALIDATION=not-tested
+VM_ONLY=1
+NOT_AX9000_FIRMWARE=1
+HARDWARE_VALIDATION=0
+NSS_VALIDATION=0
+VALIDATION_SCOPE=$VALIDATION_SCOPE_VALUE
+SSH_DEFAULT=disabled
+SSH_AUTHORIZED_KEYS=absent
+
+VM-only images. NOT Xiaomi AX9000 firmware. Do not use router flash tools.
+QEMU runtime validation is not VMware ESXi validation.
+Remote SSH is disabled by default; use the serial console to set a password first.
+EOF_BANNER
 fi
 
 # Keep this package set identical for both VM architectures. It intentionally
@@ -231,39 +320,102 @@ printf -v PACKAGE_LIST ' %q' "${VM_PACKAGES[@]}"
 PACKAGE_LIST="${PACKAGE_LIST# }"
 
 rm -rf "$BUILDER_DIR/bin/targets/$TARGET_PATH"
+MAKE_ARGS=(
+  "PROFILE=$PROFILE"
+  "PACKAGES=$PACKAGE_LIST"
+  "FILES=$OVERLAY_WORK"
+  "ROOTFS_PARTSIZE=$ROOTFS_PARTSIZE"
+)
+if [[ "$MODE" == release ]]; then
+  MAKE_ARGS+=(
+    'CONFIG_TARGET_ROOTFS_EXT4FS=y'
+    'CONFIG_TARGET_ROOTFS_SQUASHFS=n'
+    'CONFIG_ISO_IMAGES=y'
+    'CONFIG_VMDK_IMAGES=y'
+  )
+fi
 {
   printf 'VM-only OpenWrt %s %s build for %s\n' "$VM_OPENWRT_VERSION" "$MODE" "$TARGET"
   printf 'ImageBuilder: %s\n' "$IMAGEBUILDER_URL"
   printf 'ImageBuilder SHA256: %s\n' "$IMAGEBUILDER_SHA256"
   if [[ "$MODE" == release ]]; then
+    printf 'Release contract: %s\n' "$RELEASE_CONTRACT"
     printf 'Release tag: %s\n' "$RELEASE_TAG"
     printf 'Release version: %s\n' "$RELEASE_VERSION"
+    printf 'Published variants: %s\n' "$PUBLISHED_VARIANTS"
+    printf 'ESXi validation: not-tested\n'
   fi
-  printf 'Validation scope: QEMU boot/userspace only; not hardware or NSS validation.\n'
-  make -C "$BUILDER_DIR" image \
-    PROFILE="$PROFILE" \
-    PACKAGES="$PACKAGE_LIST" \
-    FILES="$OVERLAY_WORK" \
-    ROOTFS_PARTSIZE="$ROOTFS_PARTSIZE"
+  printf 'Validation scope: %s; not hardware, NSS, or ESXi validation.\n' "$VALIDATION_SCOPE_VALUE"
+  make -C "$BUILDER_DIR" image "${MAKE_ARGS[@]}"
 } 2>&1 | tee "$BUILD_LOG"
 
-BUILT_IMAGE="$BUILDER_DIR/bin/targets/$TARGET_PATH/$UPSTREAM_IMAGE"
-[[ -f "$BUILT_IMAGE" ]] || fail "expected image was not produced: $BUILT_IMAGE"
-ARTIFACT_PATH="$OUTPUT_DIR/$ARTIFACT_BASENAME"
-cp "$BUILT_IMAGE" "$ARTIFACT_PATH"
-
-MANIFEST_PATH="$OUTPUT_DIR/${ARTIFACT_BASENAME%.img.gz}.manifest"
 if [[ "$MODE" == release ]]; then
-  MANIFEST_SOURCE="$(
-    select_x86_64_release_manifest \
-      "$BUILDER_DIR/bin/targets/$TARGET_PATH" \
-      "$VM_OPENWRT_VERSION" \
-      "${BUILT_IMAGE##*/}"
-  )"
+  TARGET_DIR="$BUILDER_DIR/bin/targets/$TARGET_PATH"
+  BUILT_INPUTS_OUTPUT="$(select_x86_64_release_inputs "$TARGET_DIR" "$VM_OPENWRT_VERSION")" ||
+    fail "failed to select the exact six upstream release inputs"
+  BUILT_INPUTS=()
+  while IFS= read -r selected_input; do
+    [[ -n "$selected_input" ]] && BUILT_INPUTS+=("$selected_input")
+  done <<< "$BUILT_INPUTS_OUTPUT"
+  [[ "${#BUILT_INPUTS[@]}" -eq 6 ]] || fail "internal error: release selector did not return six inputs"
+
+  RELEASE_BASENAMES=(
+    "$RAW_BIOS_BASENAME"
+    "$ISO_BIOS_BASENAME"
+    "$ISO_EFI_BASENAME"
+    "$VMDK_BIOS_BASENAME"
+    "$VMDK_EFI_BASENAME"
+  )
+  cp "${BUILT_INPUTS[0]}" "$OUTPUT_DIR/$RAW_BIOS_BASENAME"
+  cp "${BUILT_INPUTS[2]}" "$OUTPUT_DIR/$ISO_BIOS_BASENAME"
+  cp "${BUILT_INPUTS[3]}" "$OUTPUT_DIR/$ISO_EFI_BASENAME"
+
+  VMDK_WORK="$WORK_DIR/vmdk-conversion-$RELEASE_VERSION"
+  rm -rf "$VMDK_WORK"
+  mkdir -p "$VMDK_WORK"
+  gzip -t "${BUILT_INPUTS[0]}"
+  gzip -dc "${BUILT_INPUTS[0]}" > "$VMDK_WORK/bios.raw"
+  gzip -t "${BUILT_INPUTS[1]}"
+  gzip -dc "${BUILT_INPUTS[1]}" > "$VMDK_WORK/efi.raw"
+
+  # The ImageBuilder-native VMDKs prove that the pinned upstream exposes VMDK
+  # generation, but OpenWrt 25.12.5 emits monolithicSparse. Validate and retain
+  # them only as build inputs; ESXi-facing release VMDKs are streamOptimized
+  # conversions from the matching BIOS/EFI ext4 raw disks.
+  for index in 4 5; do
+    native_vmdk="$VMDK_WORK/native-$index.vmdk"
+    gzip -t "${BUILT_INPUTS[$index]}"
+    gzip -dc "${BUILT_INPUTS[$index]}" > "$native_vmdk"
+    qemu-img info --output=json "$native_vmdk" | python3 -c \
+      'import json,sys; d=json.load(sys.stdin); data=d.get("format-specific", {}).get("data", {}); raise SystemExit(0 if d.get("format") == "vmdk" and data.get("create-type") == "monolithicSparse" else 1)' ||
+      fail "native ImageBuilder VMDK is not the expected monolithicSparse source: ${BUILT_INPUTS[$index]}"
+    qemu-img check -f vmdk "$native_vmdk" >/dev/null ||
+      fail "native ImageBuilder VMDK failed qemu-img check: ${BUILT_INPUTS[$index]}"
+  done
+
+  qemu-img convert -f raw -O vmdk -o subformat=streamOptimized \
+    "$VMDK_WORK/bios.raw" "$OUTPUT_DIR/$VMDK_BIOS_BASENAME"
+  qemu-img convert -f raw -O vmdk -o subformat=streamOptimized \
+    "$VMDK_WORK/efi.raw" "$OUTPUT_DIR/$VMDK_EFI_BASENAME"
+  for vmdk_path in "$OUTPUT_DIR/$VMDK_BIOS_BASENAME" "$OUTPUT_DIR/$VMDK_EFI_BASENAME"; do
+    [[ -s "$vmdk_path" ]] || fail "converted release VMDK is empty: $vmdk_path"
+    qemu-img info --output=json "$vmdk_path" | python3 -c \
+      'import json,sys; d=json.load(sys.stdin); data=d.get("format-specific", {}).get("data", {}); raise SystemExit(0 if d.get("format") == "vmdk" and data.get("create-type") == "streamOptimized" else 1)' ||
+      fail "converted release image is not a streamOptimized VMDK: $vmdk_path"
+    qemu-img check -f vmdk "$vmdk_path" >/dev/null ||
+      fail "converted release VMDK failed qemu-img check: $vmdk_path"
+  done
+
+  MANIFEST_SOURCE="$(select_x86_64_release_manifest "$TARGET_DIR" "$VM_OPENWRT_VERSION" "${BUILT_INPUTS[0]##*/}")"
+  MANIFEST_PATH="$OUTPUT_DIR/$RELEASE_MANIFEST_BASENAME"
   cp "$MANIFEST_SOURCE" "$MANIFEST_PATH"
+  ARTIFACT_PATH="$OUTPUT_DIR/$RAW_BIOS_BASENAME"
 else
-  # Preserve the historical smoke-mode behavior: copy an image-specific
-  # manifest only when that optional file exists.
+  BUILT_IMAGE="$BUILDER_DIR/bin/targets/$TARGET_PATH/$UPSTREAM_IMAGE"
+  [[ -f "$BUILT_IMAGE" ]] || fail "expected image was not produced: $BUILT_IMAGE"
+  ARTIFACT_PATH="$OUTPUT_DIR/$ARTIFACT_BASENAME"
+  cp "$BUILT_IMAGE" "$ARTIFACT_PATH"
+  MANIFEST_PATH="$OUTPUT_DIR/${ARTIFACT_BASENAME%.img.gz}.manifest"
   MANIFEST_SOURCE="${BUILT_IMAGE%.img.gz}.manifest"
   if [[ -f "$MANIFEST_SOURCE" ]]; then
     cp "$MANIFEST_SOURCE" "$MANIFEST_PATH"
@@ -280,14 +432,17 @@ VM_ONLY="true"
 NOT_AX9000_FIRMWARE="true"
 HARDWARE_VALIDATION="false"
 NSS_VALIDATION="false"
-VALIDATION_SCOPE="QEMU_BOOT_AND_USERSPACE_ONLY"
+VALIDATION_SCOPE="$VALIDATION_SCOPE_VALUE"
 IMAGEBUILDER_URL="$IMAGEBUILDER_URL"
 IMAGEBUILDER_SHA256="$IMAGEBUILDER_SHA256"
 EOF_LABELS
 if [[ "$MODE" == release ]]; then
   {
+    printf 'RELEASE_CONTRACT="%s"\n' "$RELEASE_CONTRACT"
     printf 'RELEASE_TAG="%s"\n' "$RELEASE_TAG"
     printf 'RELEASE_VERSION="%s"\n' "$RELEASE_VERSION"
+    printf 'PUBLISHED_VARIANTS="%s"\n' "$PUBLISHED_VARIANTS"
+    printf 'ESXI_VALIDATION="not-tested"\n'
     printf 'SSH_DEFAULT="disabled"\n'
     printf 'SSH_AUTHORIZED_KEYS="absent"\n'
   } >> "$LABELS_PATH"
@@ -297,58 +452,51 @@ README_PATH="$OUTPUT_DIR/README-VM.txt"
 if [[ "$MODE" == release ]]; then
   cat > "$README_PATH" <<EOF_README
 NexaWrt x86_64 VM ${RELEASE_VERSION}
+Release contract: ${RELEASE_CONTRACT}
 
 WARNING / 警告
-- This is an x86_64 virtual-machine image only.
-- It is NOT Xiaomi AX9000 firmware.
-- Do not upload it to AX9000 LuCI.
-- Do not use it with sysupgrade, mtd, UBI, NAND, or router flash tools.
-- QEMU PASS means OpenWrt userspace/LuCI/basic networking works in a VM only.
-- It does not validate AX9000 bootloader, DTS, Wi-Fi, switch, NSS, NAND layout, or recovery.
+- These are x86_64 virtual-machine images only, not Xiaomi AX9000 firmware.
+- QEMU SeaBIOS/OVMF runtime PASS is not VMware ESXi validation.
+- ESXI_VALIDATION=not-tested. Do not describe these VMDKs as ESXi-tested.
+- SSH is disabled by default and no authorized_keys are embedded.
 
-First boot
-1. Decompress the image:
-   gzip -dk ${ARTIFACT_BASENAME}
-2. Verify checksum:
-   sha256sum -c ${ARTIFACT_BASENAME}.sha256
-3. Boot with QEMU:
-   qemu-system-x86_64 \\
-     -m 512 \\
-     -smp 2 \\
-     -display none \\
-     -monitor none \\
-     -serial stdio \\
-     -machine q35,accel=tcg \\
-     -drive file=${ARTIFACT_BASENAME%.gz},format=raw,if=ide \\
-     -netdev user,id=net0,hostfwd=tcp:127.0.0.1:8080-:80 \\
-     -device e1000,netdev=net0
-4. Open LuCI: http://127.0.0.1:8080/cgi-bin/luci/
-5. Remote SSH is disabled by default. Use the VM serial console, run passwd,
-   then enable SSH only if you need it:
-   /etc/init.d/dropbear enable
-   /etc/init.d/dropbear start
+Published variants
+- ${RAW_BIOS_BASENAME}: raw BIOS disk for QEMU/PVE and conversion workflows.
+- ${ISO_BIOS_BASENAME}: BIOS Live ISO; configuration is not guaranteed persistent.
+- ${ISO_EFI_BASENAME}: EFI Live ISO; configuration is not guaranteed persistent.
+- ${VMDK_BIOS_BASENAME}: BIOS streamOptimized VMDK for VMware import; QEMU runtime-tested only.
+- ${VMDK_EFI_BASENAME}: EFI streamOptimized VMDK for VMware import; QEMU+OVMF runtime-tested only.
 
-Dangerous router-write commands are intentionally guarded inside this VM image.
+After upload, import/convert each streamOptimized VMDK into an ESXi datastore-backed writable disk; do not run it as a directly writable base.
+Verify every downloaded image with its adjacent .sha256 file or SHA256SUMS.
+Use the serial console to set a root password before explicitly enabling Dropbear.
+Dangerous router-write commands are intentionally guarded inside these VM images.
 EOF_README
 fi
 
 (
   cd "$OUTPUT_DIR"
-  sha256sum "$ARTIFACT_BASENAME" > "${ARTIFACT_BASENAME}.sha256"
   if [[ "$MODE" == release ]]; then
+    for image_basename in "${RELEASE_BASENAMES[@]}"; do
+      sha256sum "$image_basename" > "${image_basename}.sha256"
+    done
     sha256sum \
-      "$ARTIFACT_BASENAME" \
-      "${ARTIFACT_BASENAME}.sha256" \
-      "$(basename "$MANIFEST_PATH")" \
+      "$RAW_BIOS_BASENAME" "${RAW_BIOS_BASENAME}.sha256" \
+      "$ISO_BIOS_BASENAME" "${ISO_BIOS_BASENAME}.sha256" \
+      "$ISO_EFI_BASENAME" "${ISO_EFI_BASENAME}.sha256" \
+      "$VMDK_BIOS_BASENAME" "${VMDK_BIOS_BASENAME}.sha256" \
+      "$VMDK_EFI_BASENAME" "${VMDK_EFI_BASENAME}.sha256" \
+      "$RELEASE_MANIFEST_BASENAME" \
       "$(basename "$LABELS_PATH")" \
       "$(basename "$README_PATH")" > SHA256SUMS
   else
+    sha256sum "$ARTIFACT_BASENAME" > "${ARTIFACT_BASENAME}.sha256"
     sha256sum "$ARTIFACT_BASENAME" > SHA256SUMS
   fi
 )
 
-printf 'Built VM-only %s image: %s\n' "$MODE" "$ARTIFACT_PATH"
-printf 'This artifact is not AX9000 firmware, not hardware validation, and not NSS validation.\n'
+printf 'Built VM-only %s artifact set in: %s\n' "$MODE" "$OUTPUT_DIR"
+printf 'These artifacts are not AX9000 firmware and do not claim hardware, NSS, or ESXi validation.\n'
 if [[ -n "${GITHUB_OUTPUT:-}" ]]; then
   {
     printf 'image=%s\n' "$ARTIFACT_PATH"
@@ -358,5 +506,12 @@ if [[ -n "${GITHUB_OUTPUT:-}" ]]; then
     printf 'labels=%s\n' "$LABELS_PATH"
     printf 'readme=%s\n' "$README_PATH"
     printf 'sha256=%s\n' "$OUTPUT_DIR/${ARTIFACT_BASENAME}.sha256"
+    if [[ "$MODE" == release ]]; then
+      printf 'raw_bios=%s\n' "$OUTPUT_DIR/$RAW_BIOS_BASENAME"
+      printf 'iso_bios=%s\n' "$OUTPUT_DIR/$ISO_BIOS_BASENAME"
+      printf 'iso_efi=%s\n' "$OUTPUT_DIR/$ISO_EFI_BASENAME"
+      printf 'vmdk_bios=%s\n' "$OUTPUT_DIR/$VMDK_BIOS_BASENAME"
+      printf 'vmdk_efi=%s\n' "$OUTPUT_DIR/$VMDK_EFI_BASENAME"
+    fi
   } >> "$GITHUB_OUTPUT"
 fi

@@ -135,23 +135,23 @@
       <div class="section-heading">
         <div>
           <p class="eyebrow">VIRTUAL MACHINE · 虚拟机镜像</p>
-          <h2 id="vm-releases-title">x86_64 QEMU / 虚拟机候选版</h2>
+          <h2 id="vm-releases-title">x86_64 多格式虚拟机候选版</h2>
         </div>
         <span class="vm-safety-label">VM ONLY · 不是 AX9000 固件</span>
       </div>
 
       <div class="vm-boundary" role="note">
-        <strong>用途边界：</strong>此处镜像用于 x86_64 QEMU、UTM、PVE 等虚拟机验证。VM 测试通过只能证明通用 OpenWrt 用户空间、LuCI 和发布链路可用，不能替代 AX9000 真机、NSS、无线、闪存布局或恢复流程验证。
+        <strong>用途边界：</strong>此处镜像用于 x86_64 虚拟机验证。ISO 是 Live 启动盘，不是安装盘；VMDK 仅提供 VMware/ESXi 可导入格式，<strong>ESXi compatibility not yet validated</strong>。自动 QEMU runtime pass 不能替代 AX9000 真机、NSS、无线、闪存布局或恢复流程验证。
       </div>
 
       <article class="release-card vm-card" data-vm-platform="x86_64">
         <div class="release-card-top">
           <span class="flavor-dot" aria-hidden="true"></span>
-          <span class="flavor-label">x86_64 · QEMU</span>
+          <span class="flavor-label">x86_64 · RAW / ISO / VMDK</span>
           <span class="release-badge vm-only">VM ONLY</span>
         </div>
         <h3>NexaWrt 虚拟机发行镜像</h3>
-        <p>浏览器云编译、自动 QEMU 启动检查、LuCI HTTP 检查和来源证明。默认禁用 SSH；首次使用请通过虚拟机串口设置密码后再显式启用。</p>
+        <p>v2 提供 BIOS/EFI 的 RAW、Live ISO 与 VMDK，历史 v1 仍仅提供 RAW。页面只展示具备独立 checksum、provenance 和 QEMU runtime pass 的镜像；默认禁用 SSH。ISO 不执行安装，VMDK 的 ESXi 兼容性尚未验证。</p>
         <div class="version-row">
           <div><span>最新版本 / Latest</span><strong data-vm-field="version">—</strong></div>
           <time data-vm-field="date" datetime="">等待数据</time>
@@ -167,7 +167,7 @@
 
       <div class="history-panel vm-history-panel">
         <div class="history-heading">
-          <div><p class="eyebrow">VM RELEASE HISTORY · 虚拟机历史版本</p><h3>通过自动 QEMU 检查的候选版</h3></div>
+          <div><p class="eyebrow">VM RELEASE HISTORY · 虚拟机历史版本</p><h3>通过合同级校验与 QEMU runtime 检查的候选版</h3></div>
           <div id="vm-history-actions" class="support-links" hidden></div>
         </div>
         <div id="vm-history" class="history-list">

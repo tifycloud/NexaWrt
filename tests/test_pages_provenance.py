@@ -163,14 +163,14 @@ def expect_verification_error(callable_value, message: str) -> None:
 
 
 def vm_evidence_payloads(version: str = "v0.1.0-rc.1", *,
+                         contract_version: int = module.VM_CONTRACT_V1,
                          missing_label: str | None = None,
                          missing_smoke: str | None = None,
                          label_updates: dict[str, str] | None = None,
                          smoke_updates: dict[str, str] | None = None) -> dict[str, bytes]:
-    names = module.vm_expected_names(version)
-    image = b"exact x86_64 VM image\n"
+    names = module.vm_expected_names(version, contract_version)
     labels = {
-        "ARTIFACT_CLASS": "VM_DISTRIBUTION_IMAGE",
+        "ARTIFACT_CLASS": "VM_DISTRIBUTION_IMAGE" if contract_version == 1 else "VM_DISTRIBUTION_SET",
         "OPENWRT_VERSION": "24.10.2",
         "TARGET": "x86-64",
         "MODE": "release",
@@ -178,7 +178,7 @@ def vm_evidence_payloads(version: str = "v0.1.0-rc.1", *,
         "NOT_AX9000_FIRMWARE": "true",
         "HARDWARE_VALIDATION": "false",
         "NSS_VALIDATION": "false",
-        "VALIDATION_SCOPE": "QEMU_BOOT_AND_USERSPACE_ONLY",
+        "VALIDATION_SCOPE": "QEMU_BOOT_AND_USERSPACE_ONLY" if contract_version == 1 else "QEMU_RUNTIME_ALL_VARIANTS",
         "IMAGEBUILDER_URL": "https://downloads.openwrt.org/releases/24.10.2/targets/x86/64/imagebuilder.tar.zst",
         "IMAGEBUILDER_SHA256": "1" * 64,
         "RELEASE_TAG": f"vm-x86_64-{version}",
@@ -186,16 +186,15 @@ def vm_evidence_payloads(version: str = "v0.1.0-rc.1", *,
         "SSH_DEFAULT": "disabled",
         "SSH_AUTHORIZED_KEYS": "absent",
     }
+    result_dir = module.VM_RESULT_ROOT if contract_version == module.VM_CONTRACT_V1 else module.VM_RESULT_ROOT / "raw_bios"
     smoke = {
         "status": "PASS",
         "target": "x86-64",
-        "image": names["image"],
         "vm_only": "true",
         "not_ax9000_firmware": "true",
         "hardware_validation": "false",
         "nss_validation": "false",
         "exact_release_image": "true",
-        "qemu_boot": "PASS",
         "serial_labels": "PASS",
         "http": "PASS",
         "ssh_runtime_evidence": "PASS",
@@ -208,35 +207,61 @@ def vm_evidence_payloads(version: str = "v0.1.0-rc.1", *,
         "auth_challenge": "false",
         "http_host_port": "18080",
         "ssh_host_port": "18022",
-        "serial_log": "/home/runner/work/NexaWrt/NexaWrt/vm-release-results/x86-64/serial.log",
-        "ssh_probe_log": "/home/runner/work/NexaWrt/NexaWrt/vm-release-results/x86-64/ssh-port-probe.txt",
+        "serial_log": str(result_dir / "serial.log"),
+        "ssh_probe_log": str(result_dir / "ssh-port-probe.txt"),
     }
+    if contract_version == module.VM_CONTRACT_V1:
+        smoke.update({"image": names["image"], "qemu_boot": "PASS"})
+        image_keys = ["image"]
+    else:
+        labels.update({
+            "RELEASE_CONTRACT": "vm-x86_64/v2",
+            "PUBLISHED_VARIANTS": module.VM_PUBLISHED_VARIANTS,
+            "ESXI_VALIDATION": "not-tested",
+        })
+        smoke.update({
+            "release_contract": "vm-x86_64/v2",
+            "esxi_validation": "not-tested",
+            **{f"{variant}_file": names[variant] for variant in module.VM_VARIANTS},
+            **{f"{variant}_qemu": "runtime-pass" for variant in module.VM_VARIANTS},
+        })
+        image_keys = list(module.VM_VARIANTS)
     labels.update(label_updates or {})
     smoke.update(smoke_updates or {})
     if missing_label is not None:
         labels.pop(missing_label)
     if missing_smoke is not None:
         smoke.pop(missing_smoke)
-    payloads = {
-        names["image"]: image,
-        names["image_checksum"]: f"{hashlib.sha256(image).hexdigest()}  {names['image']}\n".encode("ascii"),
+
+    payloads: dict[str, bytes] = {}
+    for key in image_keys:
+        image = f"exact x86_64 VM image: {key}\n".encode()
+        payloads[names[key]] = image
+        payloads[names[f"{key}_checksum"]] = (
+            f"{hashlib.sha256(image).hexdigest()}  {names[key]}\n".encode("ascii")
+        )
+    payloads.update({
         names["manifest"]: b"base-files - 1\n",
         names["artifact_labels"]: "".join(f'{key}="{value}"\n' for key, value in labels.items()).encode(),
         names["readme"]: b"NexaWrt x86_64 VM only\n",
         names["smoke_report"]: "".join(f"{key}={value}\n" for key, value in smoke.items()).encode(),
-        names["provenance_image"]: b"image bundle",
-        names["provenance_checksums"]: b"checksums bundle",
-    }
-    checksum_names = ["image", "image_checksum", "manifest", "artifact_labels", "readme", "smoke_report"]
+    })
+    provenance_keys = module.VM_V1_PROVENANCE_ASSETS if contract_version == 1 else module.VM_V2_PROVENANCE_ASSETS
+    for key, name in provenance_keys.items():
+        payloads[name] = f"{key} bundle".encode()
+    checksum_keys = [key for image_key in image_keys for key in (image_key, f"{image_key}_checksum")]
+    checksum_keys += ["manifest", "artifact_labels", "readme", "smoke_report"]
     payloads[names["checksums"]] = "".join(
-        f"{hashlib.sha256(payloads[names[key]]).hexdigest()}  {names[key]}\n" for key in checksum_names
+        f"{hashlib.sha256(payloads[names[key]]).hexdigest()}  {names[key]}\n" for key in checksum_keys
     ).encode("ascii")
     return payloads
 
 
-def verify_vm_fixture(payloads: dict[str, bytes], version: str = "v0.1.0-rc.1") -> tuple[str, dict]:
-    names = module.vm_expected_names(version)
-    release_id = 88
+def verify_vm_fixture(payloads: dict[str, bytes], version: str = "v0.1.0-rc.1", *,
+                      contract_version: int = module.VM_CONTRACT_V1,
+                      attested_subjects: list[tuple[str, str]] | None = None) -> tuple[str, dict]:
+    names = module.vm_expected_names(version, contract_version)
+    release_id = 88 if contract_version == 1 else 89
     raw = {
         "id": release_id,
         "tag_name": f"vm-x86_64-{version}",
@@ -250,7 +275,7 @@ def verify_vm_fixture(payloads: dict[str, bytes], version: str = "v0.1.0-rc.1") 
         ],
     }
     candidate = module.vm_candidate_assets(raw)
-    assert candidate is not None
+    assert candidate is not None and candidate[4] == contract_version
     source_digest = "c" * 40
     originals = (module.resolve_tag_commit, module.require_main_ancestor, module.download_asset, module.verify_vm_attestation)
     try:
@@ -260,11 +285,13 @@ def verify_vm_fixture(payloads: dict[str, bytes], version: str = "v0.1.0-rc.1") 
             budget.reserve(asset["size"])
             destination.write_bytes(payloads[asset["name"]])
         module.download_asset = fake_download
-        module.verify_vm_attestation = lambda gh, subject, bundle, tag, digest: None
+        def fake_attest(gh: Path, subject: Path, bundle: Path, tag: str, digest: str) -> None:
+            if attested_subjects is not None:
+                attested_subjects.append((subject.name, bundle.name))
+        module.verify_vm_attestation = fake_attest
         return module.verify_vm_candidate(Path("/trusted/gh"), candidate, "d" * 40, module.DownloadBudget())
     finally:
         module.resolve_tag_commit, module.require_main_ancestor, module.download_asset, module.verify_vm_attestation = originals
-
 
 def main() -> None:
     archive = archive_bytes()
@@ -482,7 +509,11 @@ def main() -> None:
 
     vm_tag, vm_proof = verify_vm_fixture(vm_evidence_payloads())
     assert vm_tag == "vm-x86_64-v0.1.0-rc.1"
-    assert set(vm_proof) == {"release_id", "source_digest", "assets", "verified_subjects"}
+    assert set(vm_proof) == {
+        "release_id", "source_digest", "contract_version", "assets", "verified_subjects", "validation",
+    }
+    assert vm_proof["contract_version"] == module.VM_CONTRACT_V1
+    assert vm_proof["validation"] == {"qemu": {"raw_bios": "runtime-pass"}, "esxi": "not-tested"}
     assert set(vm_proof["assets"]) == set(module.vm_expected_names("v0.1.0-rc.1"))
     assert all(set(asset) == {"id", "name", "size", "sha256"} for asset in vm_proof["assets"].values())
     assert len({asset["id"] for asset in vm_proof["assets"].values()}) == 9
@@ -531,6 +562,99 @@ def main() -> None:
     expect_verification_error(
         lambda: verify_vm_fixture(vm_evidence_payloads(smoke_updates={"ssh_host_port": "18080"})),
         "VM smoke report accepted identical HTTP and SSH host ports",
+    )
+    for status, challenge in (("200", "true"), ("403", "false")):
+        expect_verification_error(
+            lambda status=status, challenge=challenge: verify_vm_fixture(
+                vm_evidence_payloads(smoke_updates={"http_status": status, "auth_challenge": challenge})
+            ),
+            f"VM smoke report accepted inconsistent HTTP/auth pair: {status}/{challenge}",
+        )
+
+    v2_attested: list[tuple[str, str]] = []
+    v2_payloads = vm_evidence_payloads(contract_version=module.VM_CONTRACT_V2)
+    v2_tag, v2_proof = verify_vm_fixture(
+        v2_payloads, contract_version=module.VM_CONTRACT_V2, attested_subjects=v2_attested,
+    )
+    assert v2_tag == "vm-x86_64-v0.1.0-rc.1"
+    assert v2_proof["contract_version"] == module.VM_CONTRACT_V2
+    assert len(v2_proof["assets"]) == 21
+    assert v2_proof["verified_subjects"] == [*module.VM_VARIANTS, "checksums"]
+    assert v2_proof["validation"] == {
+        "qemu": {variant: "runtime-pass" for variant in module.VM_VARIANTS},
+        "esxi": "not-tested",
+    }
+    v2_names = module.vm_expected_names("v0.1.0-rc.1", module.VM_CONTRACT_V2)
+    assert v2_attested == [
+        (v2_names[variant], v2_names[f"provenance_{variant}"]) for variant in module.VM_VARIANTS
+    ] + [(v2_names["checksums"], v2_names["provenance_checksums"])]
+    for key in ("RELEASE_CONTRACT", "PUBLISHED_VARIANTS", "ESXI_VALIDATION"):
+        expect_verification_error(
+            lambda key=key: verify_vm_fixture(
+                vm_evidence_payloads(contract_version=2, missing_label=key), contract_version=2,
+            ),
+            f"v2 artifact labels accepted missing contract key: {key}",
+        )
+    for key in ("release_contract", "raw_bios_file", "iso_bios_qemu", "vmdk_efi_file", "esxi_validation"):
+        expect_verification_error(
+            lambda key=key: verify_vm_fixture(
+                vm_evidence_payloads(contract_version=2, missing_smoke=key), contract_version=2,
+            ),
+            f"v2 smoke report accepted missing exact key: {key}",
+        )
+    expect_verification_error(
+        lambda: verify_vm_fixture(
+            vm_evidence_payloads(contract_version=2, smoke_updates={"iso_efi_qemu": "boot-pass"}),
+            contract_version=2,
+        ),
+        "v2 smoke report accepted less than a runtime pass",
+    )
+    expect_verification_error(
+        lambda: verify_vm_fixture(
+            vm_evidence_payloads(contract_version=2, smoke_updates={"vmdk_bios_file": "other.vmdk"}),
+            contract_version=2,
+        ),
+        "v2 smoke report accepted a filename not bound to the release asset",
+    )
+    expect_verification_error(
+        lambda: verify_vm_fixture(
+            vm_evidence_payloads(contract_version=2, label_updates={"ESXI_VALIDATION": "passed"}),
+            contract_version=2,
+        ),
+        "v2 labels claimed ESXi validation",
+    )
+    expect_verification_error(
+        lambda: verify_vm_fixture(
+            vm_evidence_payloads(
+                contract_version=2,
+                smoke_updates={"serial_log": str(module.VM_RESULT_ROOT / "serial.log")},
+            ),
+            contract_version=2,
+        ),
+        "v2 smoke report accepted the legacy v1 root-level serial path",
+    )
+    expect_verification_error(
+        lambda: verify_vm_fixture(
+            vm_evidence_payloads(
+                contract_version=2,
+                smoke_updates={"ssh_probe_log": str(module.VM_RESULT_ROOT / "iso_bios" / "ssh-port-probe.txt")},
+            ),
+            contract_version=2,
+        ),
+        "v2 smoke report accepted a non-raw_bios variant log path",
+    )
+
+    bad_sidecar = vm_evidence_payloads(contract_version=2)
+    bad_sidecar[v2_names["iso_bios"]] += b"tampered"
+    expect_verification_error(
+        lambda: verify_vm_fixture(bad_sidecar, contract_version=2),
+        "v2 image was not bound to its independent checksum sidecar",
+    )
+    bad_sums = vm_evidence_payloads(contract_version=2)
+    bad_sums[v2_names["checksums"]] = bad_sums[v2_names["checksums"]].replace(b"a", b"b", 1)
+    expect_verification_error(
+        lambda: verify_vm_fixture(bad_sums, contract_version=2),
+        "v2 SHA256SUMS tampering was accepted",
     )
     for field, value in (
         ("serial_log", "/tmp/replay/vm-release-results/x86-64/serial.log"),

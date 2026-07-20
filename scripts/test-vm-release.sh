@@ -3,13 +3,21 @@ set -euo pipefail
 
 usage() {
   cat >&2 <<'USAGE'
-Usage: test-vm-release.sh x86-64 <NexaWrt-x86_64-vX.Y.Z-rc.N-generic-ext4-combined.img.gz>
+Usage: test-vm-release.sh x86-64 <release-artifact-directory>
 
-Boot the exact public x86_64 VM release image in QEMU without relying on an
-in-image SSH key. Validate serial VM-only labels, LuCI HTTP reachability, the
-runtime Dropbear/authorized_keys evidence, and that forwarded guest port 22
-never completes an SSH protocol handshake.
-This is not AX9000 hardware, flash, Wi-Fi, switch, or NSS validation.
+Validate the exact NexaWrt x86_64 v2 release set in QEMU:
+- raw BIOS disk with SeaBIOS
+- BIOS Live ISO with SeaBIOS
+- EFI Live ISO with OVMF
+- BIOS VMDK with SeaBIOS
+- EFI VMDK with OVMF
+
+Every variant must expose LuCI, emit the v2 release labels and runtime SSH safety
+evidence, and expose no SSH protocol on the forwarded guest port 22. A single
+smoke-report.txt binds all five exact filenames. This is QEMU validation only;
+The streamOptimized VMDKs are VMware import transport images and QEMU always
+runs them with -snapshot; after upload they must be imported/converted into a
+writable datastore disk. VMware ESXi remains explicitly not tested.
 USAGE
 }
 
@@ -18,31 +26,20 @@ fail() {
   return 1
 }
 
-dump_http_diagnostics() {
-  printf '%s\n' '--- LuCI HTTP diagnostics ---' >&2
-  for diagnostic_file in "$HTTP_STATUS" "$HTTP_ERROR" "$HTTP_HEADERS"; do
-    if [[ -s "$diagnostic_file" ]]; then
-      printf '%s\n' "--- $(basename "$diagnostic_file") ---" >&2
-      cat "$diagnostic_file" >&2 || true
-    fi
-  done
-  if [[ -s "$HTTP_BODY" ]]; then
-    printf '%s\n' '--- http-body.html (last 4096 bytes) ---' >&2
-    tail -c 4096 "$HTTP_BODY" >&2 || true
-    printf '\n' >&2
-  fi
-}
-
-fail_http() {
-  dump_http_diagnostics
-  fail "$@"
+allocate_port() {
+  python3 - <<'PY'
+import socket
+with socket.socket() as sock:
+    sock.bind(("127.0.0.1", 0))
+    print(sock.getsockname()[1])
+PY
 }
 
 http_status_is_healthy() {
   local status="$1"
   local auth_challenge="$2"
-
-  [[ "$status" == 200 || ( "$status" == 403 && "$auth_challenge" == true ) ]]
+  [[ ( "$status" == 200 && "$auth_challenge" == false ) ||
+     ( "$status" == 403 && "$auth_challenge" == true ) ]]
 }
 
 luci_auth_challenge_from_headers() {
@@ -68,11 +65,7 @@ auth_challenge = False
 if final_headers is not None:
     for line in final_headers:
         name, separator, value = line.partition(b":")
-        if (
-            separator
-            and name.strip().lower() == b"x-luci-login-required"
-            and value.strip().lower() == b"yes"
-        ):
+        if separator and name.strip().lower() == b"x-luci-login-required" and value.strip().lower() == b"yes":
             auth_challenge = True
             break
 
@@ -80,34 +73,29 @@ print("true" if auth_challenge else "false")
 PY
 }
 
-allocate_port() {
-  python3 - <<'PY'
-import socket
-with socket.socket() as sock:
-    sock.bind(("127.0.0.1", 0))
-    print(sock.getsockname()[1])
-PY
-}
-
 serial_has_release_labels() {
-  [[ -s "$SERIAL_LOG" ]] || return 1
-  python3 - "$SERIAL_LOG" <<'PY'
+  local serial_log="$1"
+  [[ -s "$serial_log" ]] || return 1
+  python3 - "$serial_log" <<'PY'
 import pathlib
 import sys
 
 text = pathlib.Path(sys.argv[1]).read_bytes().decode("utf-8", errors="replace").replace("\r", "")
 expected = "\n".join(
     (
-        "NEXAWRT_VM_RELEASE_METADATA_V1_BEGIN",
-        "ARTIFACT_CLASS=VM_DISTRIBUTION_IMAGE",
+        "NEXAWRT_VM_RELEASE_METADATA_V2_BEGIN",
+        "RELEASE_CONTRACT=vm-x86_64/v2",
+        "ARTIFACT_CLASS=VM_DISTRIBUTION_SET",
+        "PUBLISHED_VARIANTS=raw_bios,iso_bios,iso_efi,vmdk_bios,vmdk_efi",
+        "ESXI_VALIDATION=not-tested",
         "VM_ONLY=1",
         "NOT_AX9000_FIRMWARE=1",
         "HARDWARE_VALIDATION=0",
         "NSS_VALIDATION=0",
-        "VALIDATION_SCOPE=QEMU_BOOT_AND_USERSPACE_ONLY",
+        "VALIDATION_SCOPE=QEMU_RUNTIME_ALL_VARIANTS",
         "SSH_DEFAULT=disabled",
         "SSH_AUTHORIZED_KEYS=absent",
-        "NEXAWRT_VM_RELEASE_METADATA_V1_END",
+        "NEXAWRT_VM_RELEASE_METADATA_V2_END",
     )
 )
 raise SystemExit(0 if expected in text else 1)
@@ -115,8 +103,9 @@ PY
 }
 
 serial_has_ssh_runtime_evidence() {
-  [[ -s "$SERIAL_LOG" ]] || return 1
-  python3 - "$SERIAL_LOG" <<'PY'
+  local serial_log="$1"
+  [[ -s "$serial_log" ]] || return 1
+  python3 - "$serial_log" <<'PY'
 import pathlib
 import sys
 
@@ -137,23 +126,23 @@ PY
 
 probe_luci_http() {
   set +e
-  http_status="$(curl --silent --show-error \
+  current_http_status="$(curl --silent --show-error \
     --connect-timeout 5 --max-time 30 \
     --retry 1 --retry-delay 1 --retry-all-errors \
     --location --max-redirs 5 \
-    --dump-header "$HTTP_HEADERS" --output "$HTTP_BODY" --write-out '%{http_code}' \
-    "http://127.0.0.1:${HTTP_PORT}/cgi-bin/luci/" 2> "$HTTP_ERROR")"
-  curl_status=$?
+    --dump-header "$CURRENT_HTTP_HEADERS" --output "$CURRENT_HTTP_BODY" --write-out '%{http_code}' \
+    "http://127.0.0.1:${CURRENT_HTTP_PORT}/cgi-bin/luci/" 2> "$CURRENT_HTTP_ERROR")"
+  local curl_status=$?
   set -e
-  printf '%s\n' "$http_status" > "$HTTP_STATUS"
-  auth_challenge="$(luci_auth_challenge_from_headers "$HTTP_HEADERS")"
+  printf '%s\n' "$current_http_status" > "$CURRENT_HTTP_STATUS_FILE"
+  current_auth_challenge="$(luci_auth_challenge_from_headers "$CURRENT_HTTP_HEADERS")"
   (( curl_status == 0 )) || return 1
-  http_status_is_healthy "$http_status" "$auth_challenge" || return 1
-  grep -Eqi 'luci|<html' "$HTTP_BODY" || return 1
+  http_status_is_healthy "$current_http_status" "$current_auth_challenge" || return 1
+  grep -Eqi 'luci|<html' "$CURRENT_HTTP_BODY" || return 1
 }
 
 probe_no_ssh_service() {
-  python3 - "$SSH_PORT" >"$SSH_PROBE" 2>&1 <<'PY'
+  python3 - "$CURRENT_SSH_PORT" >"$CURRENT_SSH_PROBE" 2>&1 <<'PY'
 import socket
 import sys
 import time
@@ -186,48 +175,235 @@ print("ssh_host_port=NO_SSH_PROTOCOL")
 PY
 }
 
-[[ $# -eq 2 ]] || { usage; exit 2; }
-TARGET="$1"
-IMAGE_GZ="$(cd "$(dirname "$2")" 2>/dev/null && pwd)/$(basename "$2")"
-OUTPUT_DIR="${VM_RELEASE_OUTPUT_DIR:-$(pwd)/vm-release-results/$TARGET}"
-BOOT_TIMEOUT="${VM_RELEASE_BOOT_TIMEOUT:-300}"
-mkdir -p "$OUTPUT_DIR"
-SERIAL_LOG="$OUTPUT_DIR/serial.log"
-HTTP_HEADERS="$OUTPUT_DIR/http-headers.txt"
-HTTP_BODY="$OUTPUT_DIR/http-body.html"
-HTTP_STATUS="$OUTPUT_DIR/http-status.txt"
-HTTP_ERROR="$OUTPUT_DIR/http-error.txt"
-SSH_PROBE="$OUTPUT_DIR/ssh-port-probe.txt"
-REPORT="$OUTPUT_DIR/smoke-report.txt"
-DISK_IMAGE="$OUTPUT_DIR/disk.img"
-QEMU_PID=""
-HTTP_PORT="unallocated"
-SSH_PORT="unallocated"
-SMOKE_STATUS="FAIL"
-qemu_boot_result="UNVERIFIED"
-http_status="unknown"
-auth_challenge="false"
-serial_labels="FAIL"
-http_result="FAIL"
-ssh_runtime_evidence="FAIL"
-ssh_port_probe="FAIL"
-ssh_result="UNVERIFIED"
-authorized_keys_result="UNVERIFIED"
-dropbear_enabled_result="UNVERIFIED"
-dropbear_running_result="UNVERIFIED"
+find_ovmf_pair() {
+  local code vars
+  while IFS='|' read -r code vars; do
+    if [[ -f "$code" && -f "$vars" ]]; then
+      code="$(readlink -f "$code")"
+      vars="$(readlink -f "$vars")"
+      [[ -f "$code" && -f "$vars" ]] || continue
+      printf '%s|%s\n' "$code" "$vars"
+      return 0
+    fi
+  done <<'PAIRS'
+/usr/share/OVMF/OVMF_CODE_4M.fd|/usr/share/OVMF/OVMF_VARS_4M.fd
+/usr/share/OVMF/OVMF_CODE.fd|/usr/share/OVMF/OVMF_VARS.fd
+/usr/share/edk2/ovmf/OVMF_CODE.fd|/usr/share/edk2/ovmf/OVMF_VARS.fd
+/usr/share/edk2/x64/OVMF_CODE.fd|/usr/share/edk2/x64/OVMF_VARS.fd
+PAIRS
+  return 1
+}
+
+stop_current_qemu() {
+  if [[ -n "${CURRENT_QEMU_PID:-}" ]] && kill -0 "$CURRENT_QEMU_PID" 2>/dev/null; then
+    kill "$CURRENT_QEMU_PID" 2>/dev/null || true
+    for _ in {1..20}; do
+      kill -0 "$CURRENT_QEMU_PID" 2>/dev/null || break
+      sleep 0.25
+    done
+    kill -9 "$CURRENT_QEMU_PID" 2>/dev/null || true
+    wait "$CURRENT_QEMU_PID" 2>/dev/null || true
+  fi
+  CURRENT_QEMU_PID=""
+}
+
+dump_variant_diagnostics() {
+  local variant="$1"
+  printf '%s\n' "--- ${variant} diagnostics ---" >&2
+  for path in "$CURRENT_HTTP_STATUS_FILE" "$CURRENT_HTTP_ERROR" "$CURRENT_HTTP_HEADERS" "$CURRENT_SSH_PROBE"; do
+    if [[ -s "$path" ]]; then
+      printf '%s\n' "--- $(basename "$path") ---" >&2
+      cat "$path" >&2 || true
+    fi
+  done
+  if [[ -s "$CURRENT_HTTP_BODY" ]]; then
+    printf '%s\n' '--- http-body.html (last 4096 bytes) ---' >&2
+    tail -c 4096 "$CURRENT_HTTP_BODY" >&2 || true
+    printf '\n' >&2
+  fi
+  if [[ -s "$CURRENT_SERIAL_LOG" ]]; then
+    printf '%s\n' '--- QEMU serial tail ---' >&2
+    tail -n 160 "$CURRENT_SERIAL_LOG" >&2 || true
+  fi
+}
+
+set_variant_result() {
+  local variant="$1" result="$2"
+  case "$variant" in
+    raw_bios) raw_bios_qemu="$result" ;;
+    iso_bios) iso_bios_qemu="$result" ;;
+    iso_efi) iso_efi_qemu="$result" ;;
+    vmdk_bios) vmdk_bios_qemu="$result" ;;
+    vmdk_efi) vmdk_efi_qemu="$result" ;;
+    *) fail "internal error: unknown variant result key $variant" ;;
+  esac
+}
+
+run_variant() {
+  local variant="$1"
+  local image_path="$2"
+  local firmware="$3"
+  local media="$4"
+  local variant_dir="$OUTPUT_DIR/$variant"
+  local serial_labels_result="FAIL"
+  local http_result_local="FAIL"
+  local ssh_runtime_result="FAIL"
+  local ssh_port_result="FAIL"
+  local ovmf_pair ovmf_code ovmf_vars_source ovmf_vars_work
+  local disk_image
+  local deadline
+  local qemu_args=(
+    -m 512
+    -smp 2
+    -display none
+    -monitor none
+    -no-reboot
+    -snapshot
+    -machine "q35,accel=tcg"
+  )
+
+  mkdir -p "$variant_dir"
+  CURRENT_SERIAL_LOG="$variant_dir/serial.log"
+  CURRENT_HTTP_HEADERS="$variant_dir/http-headers.txt"
+  CURRENT_HTTP_BODY="$variant_dir/http-body.html"
+  CURRENT_HTTP_STATUS_FILE="$variant_dir/http-status.txt"
+  CURRENT_HTTP_ERROR="$variant_dir/http-error.txt"
+  CURRENT_SSH_PROBE="$variant_dir/ssh-port-probe.txt"
+  CURRENT_HTTP_PORT="$(allocate_port)"
+  CURRENT_SSH_PORT="$(allocate_port)"
+  while [[ "$CURRENT_HTTP_PORT" == "$CURRENT_SSH_PORT" ]]; do
+    CURRENT_SSH_PORT="$(allocate_port)"
+  done
+  current_http_status="unknown"
+  current_auth_challenge="false"
+
+  qemu_args+=(
+    -serial "file:$CURRENT_SERIAL_LOG"
+    -netdev "user,id=net0,hostfwd=tcp:127.0.0.1:${CURRENT_HTTP_PORT}-:80,hostfwd=tcp:127.0.0.1:${CURRENT_SSH_PORT}-:22"
+    -device "e1000,netdev=net0"
+  )
+
+  if [[ "$firmware" == uefi ]]; then
+    ovmf_pair="$(find_ovmf_pair)" || { fail "OVMF CODE/VARS firmware pair is missing"; return 1; }
+    ovmf_code="${ovmf_pair%%|*}"
+    ovmf_vars_source="${ovmf_pair#*|}"
+    ovmf_vars_work="$variant_dir/OVMF_VARS.fd"
+    cp "$ovmf_vars_source" "$ovmf_vars_work"
+    qemu_args+=(
+      -drive "if=pflash,format=raw,readonly=on,file=$ovmf_code"
+      -drive "if=pflash,format=raw,file=$ovmf_vars_work"
+    )
+  elif [[ "$firmware" != bios ]]; then
+    fail "internal error: unsupported firmware mode $firmware"
+    return 1
+  fi
+
+  case "$media" in
+    raw_gz)
+      gzip -t "$image_path"
+      disk_image="$variant_dir/disk.img"
+      gzip -dc "$image_path" > "$disk_image"
+      qemu_args+=( -drive "file=$disk_image,format=raw,if=ide" -boot order=c )
+      ;;
+    iso)
+      file "$image_path" | grep -Eqi 'ISO 9660|CD-ROM filesystem' || {
+        fail "$variant is not recognized as an ISO 9660 image"
+        return 1
+      }
+      qemu_args+=( -drive "file=$image_path,format=raw,media=cdrom,readonly=on,if=ide" -boot order=d )
+      ;;
+    vmdk)
+      qemu-img info --output=json "$image_path" | python3 -c \
+        'import json,sys; d=json.load(sys.stdin); data=d.get("format-specific", {}).get("data", {}); raise SystemExit(0 if d.get("format") == "vmdk" and data.get("create-type") == "streamOptimized" else 1)' || {
+          fail "$variant is not a streamOptimized VMDK"
+          return 1
+        }
+      qemu-img check -f vmdk "$image_path" >"$variant_dir/qemu-img-check.txt" 2>&1 || {
+        cat "$variant_dir/qemu-img-check.txt" >&2 || true
+        fail "$variant failed qemu-img check"
+        return 1
+      }
+      # streamOptimized is an import transport format, so QEMU must never write
+      # the release base. The global -snapshot option provides a temporary layer.
+      qemu_args+=( -drive "file=$image_path,format=vmdk,if=ide" -boot order=c )
+      ;;
+    *)
+      fail "internal error: unsupported media mode $media"
+      return 1
+      ;;
+  esac
+
+  printf 'Starting %s with QEMU %s validation (ESXi not tested).\n' "$variant" "$firmware"
+  qemu-system-x86_64 "${qemu_args[@]}" >"$variant_dir/qemu-stderr.log" 2>&1 &
+  CURRENT_QEMU_PID=$!
+
+  deadline=$((SECONDS + BOOT_TIMEOUT))
+  while (( SECONDS < deadline )); do
+    if ! kill -0 "$CURRENT_QEMU_PID" 2>/dev/null; then
+      wait "$CURRENT_QEMU_PID" || true
+      dump_variant_diagnostics "$variant"
+      fail "QEMU exited before $variant runtime validation completed"
+      return 1
+    fi
+    if [[ "$serial_labels_result" != PASS ]] && serial_has_release_labels "$CURRENT_SERIAL_LOG"; then
+      serial_labels_result=PASS
+    fi
+    if [[ "$ssh_runtime_result" != PASS ]] && serial_has_ssh_runtime_evidence "$CURRENT_SERIAL_LOG"; then
+      ssh_runtime_result=PASS
+    fi
+    if [[ "$http_result_local" != PASS ]] && probe_luci_http >/dev/null 2>&1; then
+      http_result_local=PASS
+    fi
+    if [[ "$ssh_runtime_result" == PASS && "$http_result_local" == PASS && "$ssh_port_result" != PASS ]] && probe_no_ssh_service; then
+      ssh_port_result=PASS
+    fi
+    [[ "$serial_labels_result" == PASS && "$http_result_local" == PASS && "$ssh_runtime_result" == PASS && "$ssh_port_result" == PASS ]] && break
+    sleep 3
+  done
+
+  if [[ "$serial_labels_result" != PASS || "$http_result_local" != PASS || "$ssh_runtime_result" != PASS || "$ssh_port_result" != PASS ]]; then
+    dump_variant_diagnostics "$variant"
+    fail "$variant failed complete runtime validation within ${BOOT_TIMEOUT}s"
+    return 1
+  fi
+  if ! kill -0 "$CURRENT_QEMU_PID" 2>/dev/null; then
+    wait "$CURRENT_QEMU_PID" || true
+    fail "QEMU exited after $variant checks but before result capture"
+    return 1
+  fi
+
+  if [[ "$variant" == raw_bios ]]; then
+    serial_labels="$serial_labels_result"
+    http_result="$http_result_local"
+    ssh_runtime_evidence="$ssh_runtime_result"
+    ssh_port_probe="$ssh_port_result"
+    ssh_result="DISABLED_BY_DEFAULT"
+    authorized_keys_result="ABSENT"
+    dropbear_enabled_result="NO"
+    dropbear_running_result="NO"
+    raw_http_status="$current_http_status"
+    raw_auth_challenge="$current_auth_challenge"
+    raw_http_port="$CURRENT_HTTP_PORT"
+    raw_ssh_port="$CURRENT_SSH_PORT"
+    raw_serial_log="$CURRENT_SERIAL_LOG"
+    raw_ssh_probe_log="$CURRENT_SSH_PROBE"
+  fi
+
+  set_variant_result "$variant" runtime-pass
+  stop_current_qemu
+}
 
 write_report() {
   local status="$1"
   {
     printf 'status=%s\n' "$status"
     printf 'target=%s\n' "$TARGET"
-    printf 'image=%s\n' "${IMAGE_GZ:-}"
+    printf 'release_contract=vm-x86_64/v2\n'
     printf 'vm_only=true\n'
     printf 'not_ax9000_firmware=true\n'
     printf 'hardware_validation=false\n'
     printf 'nss_validation=false\n'
     printf 'exact_release_image=true\n'
-    printf 'qemu_boot=%s\n' "$qemu_boot_result"
     printf 'serial_labels=%s\n' "$serial_labels"
     printf 'http=%s\n' "$http_result"
     printf 'ssh_runtime_evidence=%s\n' "$ssh_runtime_evidence"
@@ -236,121 +412,124 @@ write_report() {
     printf 'authorized_keys=%s\n' "$authorized_keys_result"
     printf 'dropbear_enabled=%s\n' "$dropbear_enabled_result"
     printf 'dropbear_running=%s\n' "$dropbear_running_result"
-    printf 'http_status=%s\n' "${http_status:-unknown}"
-    printf 'auth_challenge=%s\n' "$auth_challenge"
-    printf 'http_host_port=%s\n' "$HTTP_PORT"
-    printf 'ssh_host_port=%s\n' "$SSH_PORT"
-    printf 'serial_log=%s\n' "$SERIAL_LOG"
-    printf 'ssh_probe_log=%s\n' "$SSH_PROBE"
+    printf 'http_status=%s\n' "$raw_http_status"
+    printf 'auth_challenge=%s\n' "$raw_auth_challenge"
+    printf 'http_host_port=%s\n' "$raw_http_port"
+    printf 'ssh_host_port=%s\n' "$raw_ssh_port"
+    printf 'serial_log=%s\n' "$raw_serial_log"
+    printf 'ssh_probe_log=%s\n' "$raw_ssh_probe_log"
+    printf 'raw_bios_file=%s\n' "$RAW_BIOS_BASENAME"
+    printf 'raw_bios_qemu=%s\n' "$raw_bios_qemu"
+    printf 'iso_bios_file=%s\n' "$ISO_BIOS_BASENAME"
+    printf 'iso_bios_qemu=%s\n' "$iso_bios_qemu"
+    printf 'iso_efi_file=%s\n' "$ISO_EFI_BASENAME"
+    printf 'iso_efi_qemu=%s\n' "$iso_efi_qemu"
+    printf 'vmdk_bios_file=%s\n' "$VMDK_BIOS_BASENAME"
+    printf 'vmdk_bios_qemu=%s\n' "$vmdk_bios_qemu"
+    printf 'vmdk_efi_file=%s\n' "$VMDK_EFI_BASENAME"
+    printf 'vmdk_efi_qemu=%s\n' "$vmdk_efi_qemu"
+    printf 'esxi_validation=not-tested\n'
   } > "$REPORT"
 }
 
 cleanup() {
-  rc=$?
-  if [[ -n "$QEMU_PID" ]] && kill -0 "$QEMU_PID" 2>/dev/null; then
-    kill "$QEMU_PID" 2>/dev/null || true
-    for _ in {1..20}; do
-      kill -0 "$QEMU_PID" 2>/dev/null || break
-      sleep 0.25
-    done
-    kill -9 "$QEMU_PID" 2>/dev/null || true
-    wait "$QEMU_PID" 2>/dev/null || true
-  fi
-  if [[ ! -f "$REPORT" ]]; then
+  local rc=$?
+  stop_current_qemu
+  if [[ -n "${REPORT:-}" && ! -f "$REPORT" ]]; then
     write_report "$SMOKE_STATUS"
-  fi
-  if [[ "$SMOKE_STATUS" != PASS ]]; then
-    if [[ -s "$SSH_PROBE" ]]; then
-      printf '%s\n' '--- SSH host-port diagnostics ---' >&2
-      cat "$SSH_PROBE" >&2 || true
-    fi
-    if [[ -s "$SERIAL_LOG" ]]; then
-      printf '%s\n' '--- QEMU serial tail ---' >&2
-      tail -n 120 "$SERIAL_LOG" >&2 || true
-    fi
   fi
   trap - EXIT
   exit "$rc"
 }
 trap cleanup EXIT
 
+[[ $# -eq 2 ]] || { usage; exit 2; }
+TARGET="$1"
 [[ "$TARGET" == x86-64 ]] || { usage; fail "release validation supports x86-64 only"; exit 2; }
-[[ -f "$IMAGE_GZ" && ! -L "$IMAGE_GZ" ]] || { fail "image must be a regular file: $IMAGE_GZ"; exit 1; }
-case "$(basename "$IMAGE_GZ" | tr '[:upper:]' '[:lower:]')" in
-  *ax9000*) fail "VM release image filename must not identify itself as AX9000 firmware"; exit 1 ;;
-  nexawrt-x86_64-v*-generic-ext4-combined.img.gz) ;;
-  *) fail "unexpected x86_64 VM release image filename: $(basename "$IMAGE_GZ")"; exit 1 ;;
-esac
+ARTIFACT_DIR="$(cd "$2" 2>/dev/null && pwd)" || { fail "release artifact directory does not exist: $2"; exit 1; }
+[[ -d "$ARTIFACT_DIR" && ! -L "$ARTIFACT_DIR" ]] || { fail "artifact path must be a non-symlink directory: $ARTIFACT_DIR"; exit 1; }
+OUTPUT_DIR="${VM_RELEASE_OUTPUT_DIR:-$(pwd)/vm-release-results/$TARGET}"
+BOOT_TIMEOUT="${VM_RELEASE_BOOT_TIMEOUT:-300}"
 [[ "$BOOT_TIMEOUT" =~ ^[1-9][0-9]*$ ]] || { fail "VM_RELEASE_BOOT_TIMEOUT must be a positive integer"; exit 1; }
-for command_name in qemu-system-x86_64 curl gzip python3 tail grep; do
+for command_name in qemu-system-x86_64 qemu-img curl gzip python3 tail grep file sha256sum cp readlink; do
   command -v "$command_name" >/dev/null 2>&1 || { fail "required command is missing: $command_name"; exit 1; }
 done
 
-gzip -t "$IMAGE_GZ"
-gzip -dc "$IMAGE_GZ" > "$DISK_IMAGE"
-HTTP_PORT="$(allocate_port)"
-SSH_PORT="$(allocate_port)"
-[[ "$HTTP_PORT" != "$SSH_PORT" ]] || { fail "random HTTP and SSH host ports collided"; exit 1; }
+shopt -s nullglob
+raw_candidates=("$ARTIFACT_DIR"/NexaWrt-x86_64-v*-generic-ext4-combined.img.gz)
+shopt -u nullglob
+[[ "${#raw_candidates[@]}" -eq 1 ]] || { fail "artifact directory must contain exactly one raw BIOS release image"; exit 1; }
+RAW_BIOS_PATH="${raw_candidates[0]}"
+RAW_BIOS_BASENAME="${RAW_BIOS_PATH##*/}"
+if [[ ! "$RAW_BIOS_BASENAME" =~ ^NexaWrt-x86_64-(v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)-rc\.(0|[1-9][0-9]*))-generic-ext4-combined\.img\.gz$ ]]; then
+  fail "unexpected raw BIOS release filename: $RAW_BIOS_BASENAME"
+  exit 1
+fi
+RELEASE_VERSION="${BASH_REMATCH[1]}"
+ISO_BIOS_BASENAME="NexaWrt-x86_64-${RELEASE_VERSION}-generic-image.iso"
+ISO_EFI_BASENAME="NexaWrt-x86_64-${RELEASE_VERSION}-generic-image-efi.iso"
+VMDK_BIOS_BASENAME="NexaWrt-x86_64-${RELEASE_VERSION}-generic-ext4-combined.vmdk"
+VMDK_EFI_BASENAME="NexaWrt-x86_64-${RELEASE_VERSION}-generic-ext4-combined-efi.vmdk"
+ISO_BIOS_PATH="$ARTIFACT_DIR/$ISO_BIOS_BASENAME"
+ISO_EFI_PATH="$ARTIFACT_DIR/$ISO_EFI_BASENAME"
+VMDK_BIOS_PATH="$ARTIFACT_DIR/$VMDK_BIOS_BASENAME"
+VMDK_EFI_PATH="$ARTIFACT_DIR/$VMDK_EFI_BASENAME"
 
-QEMU_ARGS=(
-  -m 512
-  -smp 2
-  -display none
-  -monitor none
-  -serial "file:$SERIAL_LOG"
-  -no-reboot
-  -machine "q35,accel=tcg"
-  -drive "file=$DISK_IMAGE,format=raw,if=ide"
-  -netdev "user,id=net0,hostfwd=tcp:127.0.0.1:${HTTP_PORT}-:80,hostfwd=tcp:127.0.0.1:${SSH_PORT}-:22"
-  -device "e1000,netdev=net0"
-)
-
-printf 'Starting exact x86_64 VM release image for QEMU validation (not AX9000 hardware/NSS validation).\n'
-qemu-system-x86_64 "${QEMU_ARGS[@]}" >/dev/null 2>&1 &
-QEMU_PID=$!
-qemu_boot_result="FAIL"
-
-deadline=$((SECONDS + BOOT_TIMEOUT))
-while (( SECONDS < deadline )); do
-  if ! kill -0 "$QEMU_PID" 2>/dev/null; then
-    wait "$QEMU_PID" || true
-    fail "QEMU exited before release validation completed"
+IMAGE_PATHS=("$RAW_BIOS_PATH" "$ISO_BIOS_PATH" "$ISO_EFI_PATH" "$VMDK_BIOS_PATH" "$VMDK_EFI_PATH")
+for image_path in "${IMAGE_PATHS[@]}"; do
+  [[ -f "$image_path" && ! -L "$image_path" ]] || { fail "required release image is missing or unsafe: $image_path"; exit 1; }
+  case "$(basename "$image_path" | tr '[:upper:]' '[:lower:]')" in
+    *ax9000*) fail "VM release image filename must not identify itself as AX9000 firmware"; exit 1 ;;
+  esac
+  sidecar="${image_path}.sha256"
+  [[ -f "$sidecar" && ! -L "$sidecar" ]] || { fail "image checksum sidecar is missing or unsafe: $sidecar"; exit 1; }
+  (cd "$ARTIFACT_DIR" && sha256sum --check --status "$(basename "$sidecar")") || {
+    fail "image checksum verification failed: $(basename "$image_path")"
     exit 1
-  fi
-  if [[ "$serial_labels" != PASS ]] && serial_has_release_labels; then
-    serial_labels=PASS
-  fi
-  if [[ "$ssh_runtime_evidence" != PASS ]] && serial_has_ssh_runtime_evidence; then
-    ssh_runtime_evidence=PASS
-    ssh_result="DISABLED_BY_DEFAULT"
-    authorized_keys_result="ABSENT"
-    dropbear_enabled_result="NO"
-    dropbear_running_result="NO"
-  fi
-  if [[ "$http_result" != PASS ]] && probe_luci_http >/dev/null 2>&1; then
-    http_result=PASS
-  fi
-  if [[ "$ssh_runtime_evidence" == PASS && "$http_result" == PASS && "$ssh_port_probe" != PASS ]] && probe_no_ssh_service; then
-    ssh_port_probe=PASS
-  fi
-  [[ "$serial_labels" == PASS && "$http_result" == PASS && "$ssh_runtime_evidence" == PASS && "$ssh_port_probe" == PASS ]] && break
-  sleep 3
+  }
 done
 
-[[ "$serial_labels" == PASS ]] || { fail "serial VM-only release labels did not appear within ${BOOT_TIMEOUT}s"; exit 1; }
-[[ "$ssh_runtime_evidence" == PASS ]] || { fail "runtime Dropbear/authorized_keys evidence did not appear within ${BOOT_TIMEOUT}s"; exit 1; }
-if [[ "$http_result" != PASS ]]; then
-  fail_http "LuCI HTTP did not become healthy within ${BOOT_TIMEOUT}s"
-  exit 1
+mkdir -p "$OUTPUT_DIR"
+REPORT="$OUTPUT_DIR/smoke-report.txt"
+# Never let a stale PASS report survive a failed retry.
+if [[ -e "$REPORT" || -L "$REPORT" ]]; then
+  rm -f -- "$REPORT"
 fi
-[[ "$ssh_port_probe" == PASS ]] || { fail "forwarded guest port 22 accepted SSH or could not be verified closed"; exit 1; }
-if ! kill -0 "$QEMU_PID" 2>/dev/null; then
-  wait "$QEMU_PID" || true
-  fail "QEMU exited after completing release checks but before PASS report generation"
-  exit 1
-fi
+CURRENT_QEMU_PID=""
+SMOKE_STATUS="FAIL"
+serial_labels="FAIL"
+http_result="FAIL"
+ssh_runtime_evidence="FAIL"
+ssh_port_probe="FAIL"
+ssh_result="UNVERIFIED"
+authorized_keys_result="UNVERIFIED"
+dropbear_enabled_result="UNVERIFIED"
+dropbear_running_result="UNVERIFIED"
+raw_http_status="unknown"
+raw_auth_challenge="false"
+raw_http_port="unallocated"
+raw_ssh_port="unallocated"
+raw_serial_log="$OUTPUT_DIR/raw_bios/serial.log"
+raw_ssh_probe_log="$OUTPUT_DIR/raw_bios/ssh-port-probe.txt"
+raw_bios_qemu="unverified"
+iso_bios_qemu="unverified"
+iso_efi_qemu="unverified"
+vmdk_bios_qemu="unverified"
+vmdk_efi_qemu="unverified"
 
-qemu_boot_result="PASS"
-SMOKE_STATUS=PASS
+run_variant raw_bios "$RAW_BIOS_PATH" bios raw_gz
+run_variant iso_bios "$ISO_BIOS_PATH" bios iso
+run_variant iso_efi "$ISO_EFI_PATH" uefi iso
+run_variant vmdk_bios "$VMDK_BIOS_PATH" bios vmdk
+run_variant vmdk_efi "$VMDK_EFI_PATH" uefi vmdk
+
+for image_path in "${IMAGE_PATHS[@]}"; do
+  (cd "$ARTIFACT_DIR" && sha256sum --check --status "$(basename "$image_path").sha256") || {
+    fail "release image changed during QEMU validation: $(basename "$image_path")"
+    exit 1
+  }
+done
+
+SMOKE_STATUS="PASS"
 write_report PASS
-printf 'VM release test PASS for %s. SSH is runtime-verified disabled; this is not AX9000 hardware or NSS validation.\n' "$TARGET"
+printf 'VM release v2 PASS: five exact files passed QEMU SeaBIOS/OVMF runtime checks; ESXi remains not tested.\n'

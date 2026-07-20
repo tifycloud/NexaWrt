@@ -45,13 +45,15 @@ grep -Fq 'id="browser-build-link"' "$SITE/index.html"
 grep -Fq 'const BUILD_WORKFLOW_URL = `https://github.com/${REPOSITORY}/actions/workflows/build.yml`;' "$SITE/app.js"
 grep -Fq "device.production_ready !== false" "$SITE/app.js"
 grep -Fq "device.image_capabilities.sysupgrade !== false" "$SITE/app.js"
-grep -Fq "data.schema_version !== 3" "$SITE/app.js"
+grep -Fq "[3, 4].includes(data.schema_version)" "$SITE/app.js"
 grep -Fq '不收集、不生成密码或密钥，不会把任何设置烘焙进下载镜像' "$SITE/index.html"
 grep -Fq 'id="vm-releases"' "$SITE/index.html"
 grep -Fq 'data-vm-platform="x86_64"' "$SITE/index.html"
 grep -Fq 'VM ONLY · 不是 AX9000 固件' "$SITE/index.html"
 grep -Fq 'id="vm-history"' "$SITE/index.html"
 grep -Fq 'id="vm-history-actions"' "$SITE/index.html"
+grep -Fq 'ISO 是 Live 启动盘，不是安装盘' "$SITE/index.html"
+grep -Fq 'ESXi compatibility not yet validated' "$SITE/index.html"
 grep -Fq 'const VM_RELEASE_WORKFLOW_URL' "$SITE/app.js"
 grep -Fq 'function resetVmHistoryActions()' "$SITE/app.js"
 if grep -Fq 'href="https://github.com/tifycloud/NexaWrt/actions/workflows/vm-release.yml"' "$SITE/index.html"; then
@@ -66,7 +68,10 @@ grep -Fq '"dropbear_enabled": "NO"' "$PROOF_VERIFIER"
 grep -Fq '"dropbear_running": "NO"' "$PROOF_VERIFIER"
 grep -Fq '"ssh_runtime_evidence": "PASS"' "$PROOF_VERIFIER"
 grep -Fq '"ssh_port_probe": "PASS"' "$PROOF_VERIFIER"
-grep -Fq '"qemu_boot": "PASS"' "$PROOF_VERIFIER"
+grep -Fq 'expected_smoke["qemu_boot"] = "PASS"' "$PROOF_VERIFIER"
+grep -Fq '"release_contract": "vm-x86_64/v2"' "$PROOF_VERIFIER"
+grep -Fq '"esxi_validation": "not-tested"' "$PROOF_VERIFIER"
+grep -Fq '"PUBLISHED_VARIANTS": VM_PUBLISHED_VARIANTS' "$PROOF_VERIFIER"
 grep -Fq 'parse_vm_host_port(smoke["http_host_port"]' "$PROOF_VERIFIER"
 grep -Fq 'parse_vm_host_port(smoke["ssh_host_port"]' "$PROOF_VERIFIER"
 grep -Fq 'require_vm_result_path(smoke["serial_log"], "serial.log"' "$PROOF_VERIFIER"
@@ -166,15 +171,45 @@ def release(release_id, flavor, version, published_at, *, extra=False, immutable
         "assets": assets,
     }
 
-def vm_release(release_id, version, published_at, *, extra=False):
+def vm_names(version, contract_version):
+    prefix = f"NexaWrt-x86_64-{version}"
+    raw = f"{prefix}-generic-ext4-combined.img.gz"
+    if contract_version == 1:
+        return {
+            "image": raw, "image_checksum": f"{raw}.sha256",
+            "manifest": f"{prefix}-generic-ext4-combined.manifest",
+            "artifact_labels": "artifact-labels.env", "readme": "README-VM.txt",
+            "smoke_report": "smoke-report.txt", "checksums": "SHA256SUMS",
+            "provenance_image": "image.provenance.bundle.json",
+            "provenance_checksums": "checksums.provenance.bundle.json",
+        }
+    variants = {
+        "raw_bios": raw,
+        "iso_bios": f"{prefix}-generic-image.iso",
+        "iso_efi": f"{prefix}-generic-image-efi.iso",
+        "vmdk_bios": f"{prefix}-generic-ext4-combined.vmdk",
+        "vmdk_efi": f"{prefix}-generic-ext4-combined-efi.vmdk",
+    }
+    names = {}
+    for key, name in variants.items():
+        names[key] = name
+        names[f"{key}_checksum"] = f"{name}.sha256"
+    names.update({
+        "manifest": f"{prefix}-generic.manifest", "artifact_labels": "artifact-labels.env",
+        "readme": "README-VM.txt", "smoke_report": "smoke-report.txt", "checksums": "SHA256SUMS",
+        "provenance_raw_bios": "raw-bios.provenance.bundle.json",
+        "provenance_iso_bios": "iso-bios.provenance.bundle.json",
+        "provenance_iso_efi": "iso-efi.provenance.bundle.json",
+        "provenance_vmdk_bios": "vmdk-bios.provenance.bundle.json",
+        "provenance_vmdk_efi": "vmdk-efi.provenance.bundle.json",
+        "provenance_checksums": "checksums.provenance.bundle.json",
+    })
+    return names
+
+def vm_release(release_id, version, published_at, contract_version, *, extra=False):
     global next_asset_id
     tag = f"vm-x86_64-{version}"
-    image = f"NexaWrt-x86_64-{version}-generic-ext4-combined.img.gz"
-    names = [
-        image, f"{image}.sha256", f"NexaWrt-x86_64-{version}-generic-ext4-combined.manifest",
-        "artifact-labels.env", "README-VM.txt", "smoke-report.txt", "SHA256SUMS",
-        "image.provenance.bundle.json", "checksums.provenance.bundle.json",
-    ]
+    names = list(vm_names(version, contract_version).values())
     if extra:
         names.append("NexaWrt-AX9000-sysupgrade.bin")
     assets = []
@@ -198,8 +233,9 @@ releases = [
     release(999, "official", "v9.9.9-rc.1", "2026-07-18T02:00:00Z"),
     release(130, "official", "v2.0.0-rc.2", "2026-07-18T03:00:00Z", extra=True),
     release(140, "official", "v4.4.0-rc.1", "2026-07-18T04:00:00Z", immutable=False),
-    vm_release(210, "v0.1.0-rc.1", "2026-07-18T05:00:00Z"),
-    vm_release(211, "v0.2.0-rc.1", "2026-07-18T06:00:00Z", extra=True),
+    vm_release(210, "v0.1.0-rc.3", "2026-07-18T05:00:00Z", 1),
+    vm_release(211, "v0.2.0-rc.1", "2026-07-18T06:00:00Z", 2),
+    vm_release(212, "v0.3.0-rc.1", "2026-07-18T07:00:00Z", 2, extra=True),
 ]
 
 def proof(release_id, fill):
@@ -211,19 +247,8 @@ def proof(release_id, fill):
         "verified_subjects": ["archive", "checksums", "firmware", "sbom"],
     }
 
-def vm_proof(release_id, version, fill):
-    image = f"NexaWrt-x86_64-{version}-generic-ext4-combined.img.gz"
-    names = {
-        "image": image,
-        "image_checksum": f"{image}.sha256",
-        "manifest": f"NexaWrt-x86_64-{version}-generic-ext4-combined.manifest",
-        "artifact_labels": "artifact-labels.env",
-        "readme": "README-VM.txt",
-        "smoke_report": "smoke-report.txt",
-        "checksums": "SHA256SUMS",
-        "provenance_image": "image.provenance.bundle.json",
-        "provenance_checksums": "checksums.provenance.bundle.json",
-    }
+def vm_proof(release_id, version, fill, contract_version):
+    names = vm_names(version, contract_version)
     raw = next(item for item in releases if item["id"] == release_id)
     by_name = {asset["name"]: asset for asset in raw["assets"]}
     proof_assets = {}
@@ -232,15 +257,20 @@ def vm_proof(release_id, version, fill):
         digest = fill * 64
         asset["digest"] = f"sha256:{digest}"
         proof_assets[key] = {"id": asset["id"], "name": name, "size": asset["size"], "sha256": digest}
+    variants = ["raw_bios"] if contract_version == 1 else [
+        "raw_bios", "iso_bios", "iso_efi", "vmdk_bios", "vmdk_efi",
+    ]
     return {
         "release_id": release_id,
         "source_digest": fill * 40,
+        "contract_version": contract_version,
         "assets": proof_assets,
-        "verified_subjects": ["image", "checksums"],
+        "verified_subjects": ["image", "checksums"] if contract_version == 1 else [*variants, "checksums"],
+        "validation": {"qemu": {variant: "runtime-pass" for variant in variants}, "esxi": "not-tested"},
     }
 
 proof_document = {
-    "schema_version": 3,
+    "schema_version": 4,
     "repository": "tifycloud/NexaWrt",
     "trusted_ref": "refs/heads/main",
     "trusted_main_digest": "a" * 40,
@@ -254,13 +284,14 @@ proof_document = {
         "ram-test-nss-v3.0.0-rc.1": proof(120, "d"),
     },
     "virtual_images": {"x86_64": {
-        "vm-x86_64-v0.1.0-rc.1": vm_proof(210, "v0.1.0-rc.1", "e"),
+        "vm-x86_64-v0.1.0-rc.3": vm_proof(210, "v0.1.0-rc.3", "e", 1),
+        "vm-x86_64-v0.2.0-rc.1": vm_proof(211, "v0.2.0-rc.1", "f", 2),
     }},
 }
 with open(fixture_path, "w", encoding="utf-8") as stream:
     json.dump(releases, stream)
 with open(proof_path, "w", encoding="utf-8") as stream:
-    json.dump(proof_document, stream)
+    json.dump(proof_document, stream, sort_keys=True)
 PY
 
 python3 "$GENERATOR" --input "$fixture" --proofs "$proofs" --output "$output"
@@ -270,21 +301,36 @@ import sys
 
 with open(sys.argv[1], encoding="utf-8") as stream:
     data = json.load(stream)
-assert data["schema_version"] == 3
+assert data["schema_version"] == 4
 assert data["repository"] == "tifycloud/NexaWrt"
 assert set(data["devices"]) == {"xiaomi-ax9000"}
 vm = data["virtual_images"]["x86_64"]
 assert vm["latest"] == vm["history"][0]
-assert [item["tag"] for item in vm["history"]] == ["vm-x86_64-v0.1.0-rc.1"]
+assert [item["tag"] for item in vm["history"]] == [
+    "vm-x86_64-v0.2.0-rc.1", "vm-x86_64-v0.1.0-rc.3",
+]
 vm_release_entry = vm["latest"]
-assert vm_release_entry["artifact_class"] == "VM_DISTRIBUTION_IMAGE"
+assert vm_release_entry["artifact_class"] == "VM_DISTRIBUTION_SET"
+assert vm_release_entry["contract_version"] == 2
+assert vm_release_entry["release_contract"] == "vm-x86_64/v2"
 assert vm_release_entry["vm_only"] is True
 assert vm_release_entry["not_ax9000_firmware"] is True
 assert vm_release_entry["hardware_validation"] is False
 assert vm_release_entry["nss_validation"] is False
 assert vm_release_entry["qemu_validated"] is True
+assert vm_release_entry["esxi_validation"] == "not-tested"
 assert vm_release_entry["ssh_default"] == "disabled"
-assert set(vm_release_entry["assets"]) == {
+assert vm_release_entry["validation"] == {
+    "qemu": {key: "runtime-pass" for key in ("raw_bios", "iso_bios", "iso_efi", "vmdk_bios", "vmdk_efi")},
+    "esxi": "not-tested",
+}
+assert len(vm_release_entry["assets"]) == 21
+assert all(set(asset) == {"name", "url", "size", "sha256"} for asset in vm_release_entry["assets"].values())
+legacy = vm["history"][1]
+assert legacy["tag"] == "vm-x86_64-v0.1.0-rc.3"
+assert legacy["contract_version"] == 1
+assert legacy["artifact_class"] == "VM_DISTRIBUTION_IMAGE"
+assert set(legacy["assets"]) == {
     "image", "image_checksum", "manifest", "artifact_labels", "readme", "smoke_report",
     "checksums", "provenance_image", "provenance_checksums",
 }
@@ -320,7 +366,7 @@ serialized = json.dumps(data)
 assert "ram-test-v9.9.9-rc.1" not in serialized
 assert "ram-test-v2.0.0-rc.2" not in serialized
 assert "ram-test-v4.4.0-rc.1" not in serialized
-assert "vm-x86_64-v0.2.0-rc.1" not in serialized
+assert "vm-x86_64-v0.3.0-rc.1" not in serialized
 assert "NexaWrt-AX9000-sysupgrade.bin" not in serialized
 PY
 
@@ -361,7 +407,7 @@ python3 - "$proofs" "$tmp_dir/replayed-vm-proofs.json" <<'PY'
 import copy, json, sys
 with open(sys.argv[1], encoding="utf-8") as stream:
     data = json.load(stream)
-entry = copy.deepcopy(data["virtual_images"]["x86_64"]["vm-x86_64-v0.1.0-rc.1"])
+entry = copy.deepcopy(data["virtual_images"]["x86_64"]["vm-x86_64-v0.1.0-rc.3"])
 data["virtual_images"]["x86_64"]["vm-x86_64-v0.1.1-rc.1"] = entry
 with open(sys.argv[2], "w", encoding="utf-8") as stream:
     json.dump(data, stream)
@@ -374,7 +420,7 @@ python3 - "$fixture" "$tmp_dir/replaced-asset-id.json" <<'PY'
 import json, sys
 with open(sys.argv[1], encoding="utf-8") as stream:
     data = json.load(stream)
-vm = next(item for item in data if item["tag_name"] == "vm-x86_64-v0.1.0-rc.1")
+vm = next(item for item in data if item["tag_name"] == "vm-x86_64-v0.1.0-rc.3")
 vm["assets"][0]["id"] += 999999
 with open(sys.argv[2], "w", encoding="utf-8") as stream:
     json.dump(data, stream)
@@ -387,13 +433,38 @@ python3 - "$fixture" "$tmp_dir/bad-vm-digest.json" <<'PY'
 import json, sys
 with open(sys.argv[1], encoding="utf-8") as stream:
     data = json.load(stream)
-vm = next(item for item in data if item["tag_name"] == "vm-x86_64-v0.1.0-rc.1")
+vm = next(item for item in data if item["tag_name"] == "vm-x86_64-v0.1.0-rc.3")
 vm["assets"][0]["digest"] = "sha256:" + "0" * 64
 with open(sys.argv[2], "w", encoding="utf-8") as stream:
     json.dump(data, stream)
 PY
 if python3 "$GENERATOR" --input "$tmp_dir/bad-vm-digest.json" --proofs "$proofs" --output "$tmp_dir/bad-digest.json" >/dev/null 2>&1; then
   echo 'generator unexpectedly accepted a mismatched trusted VM asset digest' >&2
+  exit 1
+fi
+python3 - "$fixture" "$tmp_dir/missing-v2-digest.json" <<'PY'
+import json, sys
+with open(sys.argv[1], encoding="utf-8") as stream:
+    data = json.load(stream)
+vm = next(item for item in data if item["tag_name"] == "vm-x86_64-v0.2.0-rc.1")
+vm["assets"][0].pop("digest")
+with open(sys.argv[2], "w", encoding="utf-8") as stream:
+    json.dump(data, stream)
+PY
+if python3 "$GENERATOR" --input "$tmp_dir/missing-v2-digest.json" --proofs "$proofs" --output "$tmp_dir/missing-v2-digest-output.json" >/dev/null 2>&1; then
+  echo 'generator unexpectedly accepted a v2 asset without its Release API digest' >&2
+  exit 1
+fi
+python3 - "$proofs" "$tmp_dir/bad-v2-validation.json" <<'PY'
+import json, sys
+with open(sys.argv[1], encoding="utf-8") as stream:
+    data = json.load(stream)
+data["virtual_images"]["x86_64"]["vm-x86_64-v0.2.0-rc.1"]["validation"]["esxi"] = "validated"
+with open(sys.argv[2], "w", encoding="utf-8") as stream:
+    json.dump(data, stream)
+PY
+if python3 "$GENERATOR" --input "$fixture" --proofs "$tmp_dir/bad-v2-validation.json" --output "$tmp_dir/bad-v2-validation-output.json" >/dev/null 2>&1; then
+  echo 'generator unexpectedly accepted a proof claiming ESXi validation' >&2
   exit 1
 fi
 if python3 "$GENERATOR" --input "$fixture" --output "$tmp_dir/missing-proof-arg.json" >/dev/null 2>&1; then
@@ -405,4 +476,4 @@ if python3 "$GENERATOR" --input /dev/null --proofs "$proofs" --output "$tmp_dir/
   exit 1
 fi
 
-echo 'Pages policy: schema-v3 AX9000/VM catalog, attestation-gated Releases, semantic ordering, isolation, and fail-closed safety OK'
+echo 'Pages policy: schema-v4 AX9000/VM v1+v2 catalog, attestation-gated Releases, semantic ordering, isolation, and fail-closed safety OK'

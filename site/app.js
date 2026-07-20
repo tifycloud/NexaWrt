@@ -15,8 +15,24 @@ const PROVENANCE_LABELS = {
   provenance_firmware: 'Firmware bundle',
   provenance_sbom: 'SBOM bundle'
 };
-const VM_PROVENANCE_LABELS = {
-  provenance_image: 'Image bundle',
+const VM_VARIANTS = ['raw_bios', 'iso_bios', 'iso_efi', 'vmdk_bios', 'vmdk_efi'];
+const VM_DOWNLOAD_LABELS = {
+  raw_bios: 'RAW BIOS (.img.gz) ↓',
+  iso_bios: 'BIOS Live ISO ↓',
+  iso_efi: 'EFI Live ISO ↓',
+  vmdk_bios: 'BIOS VMDK ↓',
+  vmdk_efi: 'EFI VMDK ↓'
+};
+const VM_V1_PROVENANCE_LABELS = {
+  provenance_image: 'RAW image bundle',
+  provenance_checksums: 'Checksums bundle'
+};
+const VM_V2_PROVENANCE_LABELS = {
+  provenance_raw_bios: 'RAW BIOS bundle',
+  provenance_iso_bios: 'BIOS ISO bundle',
+  provenance_iso_efi: 'EFI ISO bundle',
+  provenance_vmdk_bios: 'BIOS VMDK bundle',
+  provenance_vmdk_efi: 'EFI VMDK bundle',
   provenance_checksums: 'Checksums bundle'
 };
 
@@ -151,55 +167,113 @@ function validReleaseGroup(group, flavor, device) {
   return true;
 }
 
-function validVmRelease(release) {
-  const keys = [
-    'platform', 'artifact_class', 'vm_only', 'not_ax9000_firmware', 'hardware_validation',
-    'nss_validation', 'qemu_validated', 'ssh_default', 'version', 'tag', 'published_at',
-    'release_url', 'browser_build_workflow_url', 'docs_url', 'assets'
-  ];
-  if (!exactKeys(release, keys)) return false;
-  const versionPattern = /^v(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)-rc\.(?:0|[1-9]\d*)$/;
-  const expectedTag = `vm-${VM_PLATFORM}-${release.version}`;
-  if (release.platform !== VM_PLATFORM || release.artifact_class !== 'VM_DISTRIBUTION_IMAGE' ||
-      release.vm_only !== true || release.not_ax9000_firmware !== true ||
-      release.hardware_validation !== false || release.nss_validation !== false ||
-      release.qemu_validated !== true || release.ssh_default !== 'disabled' ||
-      typeof release.version !== 'string' || !versionPattern.test(release.version) || release.tag !== expectedTag ||
-      !validUtcTimestamp(release.published_at) || release.browser_build_workflow_url !== VM_RELEASE_WORKFLOW_URL ||
-      release.docs_url !== VM_DOCS_URL ||
-      !validHttpsGitHubUrl(release.release_url, `/${REPOSITORY}/releases/tag/${expectedTag}`)) return false;
-
-  const image = `NexaWrt-${VM_PLATFORM}-${release.version}-generic-ext4-combined.img.gz`;
-  const expectedNames = {
-    image,
-    image_checksum: `${image}.sha256`,
-    manifest: `${image.slice(0, -'.img.gz'.length)}.manifest`,
+function vmExpectedNames(version, contractVersion) {
+  const prefix = `NexaWrt-${VM_PLATFORM}-${version}`;
+  const rawBios = `${prefix}-generic-ext4-combined.img.gz`;
+  if (contractVersion === 1) {
+    return {
+      image: rawBios,
+      image_checksum: `${rawBios}.sha256`,
+      manifest: `${rawBios.slice(0, -'.img.gz'.length)}.manifest`,
+      artifact_labels: 'artifact-labels.env',
+      readme: 'README-VM.txt',
+      smoke_report: 'smoke-report.txt',
+      checksums: 'SHA256SUMS',
+      provenance_image: 'image.provenance.bundle.json',
+      provenance_checksums: 'checksums.provenance.bundle.json'
+    };
+  }
+  if (contractVersion !== 2) return null;
+  const variants = {
+    raw_bios: rawBios,
+    iso_bios: `${prefix}-generic-image.iso`,
+    iso_efi: `${prefix}-generic-image-efi.iso`,
+    vmdk_bios: `${prefix}-generic-ext4-combined.vmdk`,
+    vmdk_efi: `${prefix}-generic-ext4-combined-efi.vmdk`
+  };
+  const names = {};
+  for (const variant of VM_VARIANTS) {
+    names[variant] = variants[variant];
+    names[`${variant}_checksum`] = `${variants[variant]}.sha256`;
+  }
+  return Object.assign(names, {
+    manifest: `${prefix}-generic.manifest`,
     artifact_labels: 'artifact-labels.env',
     readme: 'README-VM.txt',
     smoke_report: 'smoke-report.txt',
     checksums: 'SHA256SUMS',
-    provenance_image: 'image.provenance.bundle.json',
+    provenance_raw_bios: 'raw-bios.provenance.bundle.json',
+    provenance_iso_bios: 'iso-bios.provenance.bundle.json',
+    provenance_iso_efi: 'iso-efi.provenance.bundle.json',
+    provenance_vmdk_bios: 'vmdk-bios.provenance.bundle.json',
+    provenance_vmdk_efi: 'vmdk-efi.provenance.bundle.json',
     provenance_checksums: 'checksums.provenance.bundle.json'
-  };
-  if (!exactKeys(release.assets, Object.keys(expectedNames))) return false;
+  });
+}
+
+function validVmValidation(value, contractVersion) {
+  const variants = contractVersion === 1 ? ['raw_bios'] : VM_VARIANTS;
+  return exactKeys(value, ['qemu', 'esxi']) && value.esxi === 'not-tested' &&
+    exactKeys(value.qemu, variants) && variants.every((variant) => value.qemu[variant] === 'runtime-pass');
+}
+
+function validVmRelease(release, schemaVersion = null) {
+  const inferredSchema = schemaVersion ?? (release && Object.prototype.hasOwnProperty.call(release, 'contract_version') ? 4 : 3);
+  const legacyKeys = [
+    'platform', 'artifact_class', 'vm_only', 'not_ax9000_firmware', 'hardware_validation',
+    'nss_validation', 'qemu_validated', 'ssh_default', 'version', 'tag', 'published_at',
+    'release_url', 'browser_build_workflow_url', 'docs_url', 'assets'
+  ];
+  const v4Keys = [
+    'platform', 'artifact_class', 'contract_version', 'release_contract', 'vm_only',
+    'not_ax9000_firmware', 'hardware_validation', 'nss_validation', 'qemu_validated',
+    'esxi_validation', 'ssh_default', 'validation', 'version', 'tag', 'published_at',
+    'release_url', 'browser_build_workflow_url', 'docs_url', 'assets'
+  ];
+  if (inferredSchema === 3) {
+    if (!exactKeys(release, legacyKeys)) return false;
+  } else if (inferredSchema === 4) {
+    if (!exactKeys(release, v4Keys)) return false;
+  } else {
+    return false;
+  }
+  const versionPattern = /^v(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)-rc\.(?:0|[1-9]\d*)$/;
+  const expectedTag = `vm-${VM_PLATFORM}-${release.version}`;
+  const contractVersion = inferredSchema === 3 ? 1 : release.contract_version;
+  const expectedClass = contractVersion === 1 ? 'VM_DISTRIBUTION_IMAGE' : 'VM_DISTRIBUTION_SET';
+  if ((contractVersion !== 1 && contractVersion !== 2) || release.platform !== VM_PLATFORM ||
+      release.artifact_class !== expectedClass || release.vm_only !== true ||
+      release.not_ax9000_firmware !== true || release.hardware_validation !== false ||
+      release.nss_validation !== false || release.qemu_validated !== true || release.ssh_default !== 'disabled' ||
+      typeof release.version !== 'string' || !versionPattern.test(release.version) || release.tag !== expectedTag ||
+      !validUtcTimestamp(release.published_at) || release.browser_build_workflow_url !== VM_RELEASE_WORKFLOW_URL ||
+      release.docs_url !== VM_DOCS_URL ||
+      !validHttpsGitHubUrl(release.release_url, `/${REPOSITORY}/releases/tag/${expectedTag}`)) return false;
+  if (inferredSchema === 4 && (release.release_contract !== `vm-x86_64/v${contractVersion}` ||
+      release.esxi_validation !== 'not-tested' || !validVmValidation(release.validation, contractVersion))) return false;
+
+  const expectedNames = vmExpectedNames(release.version, contractVersion);
+  if (!expectedNames || !exactKeys(release.assets, Object.keys(expectedNames))) return false;
   return Object.entries(expectedNames).every(([key, expectedName]) => {
     const asset = release.assets[key];
-    return exactKeys(asset, ['name', 'url', 'size']) && asset.name === expectedName &&
+    const expectedAssetKeys = inferredSchema === 4 ? ['name', 'url', 'size', 'sha256'] : ['name', 'url', 'size'];
+    return exactKeys(asset, expectedAssetKeys) && asset.name === expectedName &&
       Number.isInteger(asset.size) && asset.size > 0 &&
+      (inferredSchema !== 4 || /^[0-9a-f]{64}$/.test(asset.sha256)) &&
       validHttpsGitHubUrl(asset.url, `/${REPOSITORY}/releases/download/${expectedTag}/${expectedName}`);
   });
 }
 
-function validVmReleaseGroup(group) {
+function validVmReleaseGroup(group, schemaVersion = null) {
   if (!exactKeys(group, ['latest', 'history']) || !Array.isArray(group.history) || group.history.length > 12) {
     return false;
   }
   if (group.history.length === 0) return group.latest === null;
-  if (!validVmRelease(group.latest) || JSON.stringify(group.latest) !== JSON.stringify(group.history[0])) return false;
+  if (!validVmRelease(group.latest, schemaVersion) || JSON.stringify(group.latest) !== JSON.stringify(group.history[0])) return false;
   const tags = new Set();
   let previous = null;
   for (const release of group.history) {
-    if (!validVmRelease(release) || tags.has(release.tag)) return false;
+    if (!validVmRelease(release, schemaVersion) || tags.has(release.tag)) return false;
     if (previous !== null && (release.published_at > previous.published_at ||
         (release.published_at === previous.published_at && compareVersions(release.version, previous.version) > 0))) {
       return false;
@@ -390,13 +464,17 @@ function renderVmCard(release) {
   const date = card.querySelector('[data-vm-field="date"]');
   date.textContent = formatDate(release.published_at);
   date.dateTime = release.published_at;
+  const contractVersion = release.contract_version ?? 1;
+  const downloadKeys = contractVersion === 2 ? VM_VARIANTS : ['image'];
+  const downloadLabels = contractVersion === 2 ? VM_DOWNLOAD_LABELS : { image: '下载 x86_64 RAW 镜像 ↓' };
   card.querySelector('[data-vm-field="downloads"]').replaceChildren(
-    makeLink('下载 x86_64 镜像 ↓', release.assets.image.url),
-    makeLink('SHA256SUMS', release.assets.checksums.url),
-    makeLink('Manifest', release.assets.manifest.url)
+    ...downloadKeys.map((key) => makeLink(downloadLabels[key], release.assets[key].url, 'vm-download')),
+    makeLink('SHA256SUMS', release.assets.checksums.url, 'vm-support-download'),
+    makeLink('Manifest', release.assets.manifest.url, 'vm-support-download')
   );
+  const provenanceLabels = contractVersion === 2 ? VM_V2_PROVENANCE_LABELS : VM_V1_PROVENANCE_LABELS;
   card.querySelector('[data-vm-field="provenance"]').replaceChildren(
-    ...Object.entries(VM_PROVENANCE_LABELS).map(([key, label]) => makeLink(label, release.assets[key].url))
+    ...Object.entries(provenanceLabels).map(([key, label]) => makeLink(label, release.assets[key].url))
   );
   card.querySelector('[data-vm-field="support-links"]').replaceChildren(
     makeLink('浏览器云编译 VM ↗', release.browser_build_workflow_url),
@@ -432,7 +510,8 @@ function renderVmHistory(group) {
     const date = document.createElement('time');
     date.dateTime = release.published_at;
     date.textContent = formatDate(release.published_at);
-    row.append(flavorLabel, tag, date, makeLink('Image ↓', release.assets.image.url));
+        const primaryAsset = release.contract_version === 2 ? release.assets.raw_bios : release.assets.image;
+    row.append(flavorLabel, tag, date, makeLink('RAW ↓', primaryAsset.url));
     fragment.append(row);
   }
   history.replaceChildren(fragment);
@@ -446,7 +525,7 @@ async function loadReleases() {
     if (!response.ok) throw new Error(`HTTP ${response.status}`);
     const data = await response.json();
     if (!exactKeys(data, ['schema_version', 'repository', 'generated_at', 'devices', 'flavors', 'virtual_images']) ||
-        data.schema_version !== 3 || data.repository !== REPOSITORY || !validUtcTimestamp(data.generated_at) ||
+        !([3, 4].includes(data.schema_version)) || data.repository !== REPOSITORY || !validUtcTimestamp(data.generated_at) ||
         !data.devices || typeof data.devices !== 'object' || Array.isArray(data.devices) ||
         !data.flavors || typeof data.flavors !== 'object' || Array.isArray(data.flavors) ||
         !data.virtual_images || typeof data.virtual_images !== 'object' || Array.isArray(data.virtual_images)) {
@@ -468,7 +547,7 @@ async function loadReleases() {
     const vmGroup = exactKeys(data.virtual_images, [VM_PLATFORM])
       ? data.virtual_images[VM_PLATFORM]
       : null;
-    const vmValid = validVmReleaseGroup(vmGroup);
+    const vmValid = validVmReleaseGroup(vmGroup, data.schema_version);
     if (vmValid) {
       renderVmCard(vmGroup.latest);
       renderVmHistory(vmGroup);
