@@ -73,8 +73,8 @@ for package in luci luci-ssl dropbear ca-bundle curl ethtool htop iperf3 nano tc
 done
 assert_contains 'source "$LOCK_FILE"' "$BUILD_SCRIPT"
 assert_contains 'sha256sum --check --status' "$BUILD_SCRIPT"
-assert_contains 'PROFILE="$PROFILE"' "$BUILD_SCRIPT"
-assert_contains 'FILES="$OVERLAY_WORK"' "$BUILD_SCRIPT"
+assert_contains '"PROFILE=$PROFILE"' "$BUILD_SCRIPT"
+assert_contains '"FILES=$OVERLAY_WORK"' "$BUILD_SCRIPT"
 assert_contains 'ARTIFACT_BASENAME="nexawrt-vm-smoke-openwrt-${VM_OPENWRT_VERSION}-${TARGET}.img.gz"' "$BUILD_SCRIPT"
 assert_contains 'ARTIFACT_BASENAME="NexaWrt-x86_64-${RELEASE_VERSION}-generic-ext4-combined.img.gz"' "$BUILD_SCRIPT"
 artifact_expressions="$(sed -nE 's/^[[:space:]]*ARTIFACT_BASENAME="(.*)"/\1/p' "$BUILD_SCRIPT")"

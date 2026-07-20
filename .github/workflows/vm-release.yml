@@ -32,7 +32,11 @@ jobs:
       release_tag: ${{ steps.identity.outputs.release_tag }}
       release_version: ${{ steps.identity.outputs.release_version }}
       expected_source_sha: ${{ steps.identity.outputs.expected_source_sha }}
-      image_basename: ${{ steps.identity.outputs.image_basename }}
+      raw_bios_basename: ${{ steps.identity.outputs.raw_bios_basename }}
+      iso_bios_basename: ${{ steps.identity.outputs.iso_bios_basename }}
+      iso_efi_basename: ${{ steps.identity.outputs.iso_efi_basename }}
+      vmdk_bios_basename: ${{ steps.identity.outputs.vmdk_bios_basename }}
+      vmdk_efi_basename: ${{ steps.identity.outputs.vmdk_efi_basename }}
       manifest_basename: ${{ steps.identity.outputs.manifest_basename }}
     steps:
       - name: Checkout trusted source
@@ -117,13 +121,21 @@ jobs:
             tifycloud/NexaWrt/.github/workflows/vm-release.yml@*) ;;
             *) echo "Unexpected workflow identity: $GITHUB_WORKFLOW_REF" >&2; exit 1 ;;
           esac
-          image_basename="NexaWrt-x86_64-${release_version}-generic-ext4-combined.img.gz"
-          manifest_basename="${image_basename%.img.gz}.manifest"
+          raw_bios_basename="NexaWrt-x86_64-${release_version}-generic-ext4-combined.img.gz"
+          iso_bios_basename="NexaWrt-x86_64-${release_version}-generic-image.iso"
+          iso_efi_basename="NexaWrt-x86_64-${release_version}-generic-image-efi.iso"
+          vmdk_bios_basename="NexaWrt-x86_64-${release_version}-generic-ext4-combined.vmdk"
+          vmdk_efi_basename="NexaWrt-x86_64-${release_version}-generic-ext4-combined-efi.vmdk"
+          manifest_basename="NexaWrt-x86_64-${release_version}-generic.manifest"
           {
             printf 'release_tag=%s\n' "$release_tag"
             printf 'release_version=%s\n' "$release_version"
             printf 'expected_source_sha=%s\n' "$expected_source_sha"
-            printf 'image_basename=%s\n' "$image_basename"
+            printf 'raw_bios_basename=%s\n' "$raw_bios_basename"
+            printf 'iso_bios_basename=%s\n' "$iso_bios_basename"
+            printf 'iso_efi_basename=%s\n' "$iso_efi_basename"
+            printf 'vmdk_bios_basename=%s\n' "$vmdk_bios_basename"
+            printf 'vmdk_efi_basename=%s\n' "$vmdk_efi_basename"
             printf 'manifest_basename=%s\n' "$manifest_basename"
           } >> "$GITHUB_OUTPUT"
 
@@ -131,7 +143,7 @@ jobs:
     name: Build, QEMU-test, attest, and publish VM prerelease
     needs: preflight
     runs-on: ubuntu-24.04
-    timeout-minutes: 90
+    timeout-minutes: 180
     permissions:
       contents: write
       id-token: write
@@ -140,7 +152,11 @@ jobs:
       RELEASE_TAG: ${{ needs.preflight.outputs.release_tag }}
       RELEASE_VERSION: ${{ needs.preflight.outputs.release_version }}
       EXPECTED_SOURCE_SHA: ${{ needs.preflight.outputs.expected_source_sha }}
-      IMAGE_BASENAME: ${{ needs.preflight.outputs.image_basename }}
+      RAW_BIOS_BASENAME: ${{ needs.preflight.outputs.raw_bios_basename }}
+      ISO_BIOS_BASENAME: ${{ needs.preflight.outputs.iso_bios_basename }}
+      ISO_EFI_BASENAME: ${{ needs.preflight.outputs.iso_efi_basename }}
+      VMDK_BIOS_BASENAME: ${{ needs.preflight.outputs.vmdk_bios_basename }}
+      VMDK_EFI_BASENAME: ${{ needs.preflight.outputs.vmdk_efi_basename }}
       MANIFEST_BASENAME: ${{ needs.preflight.outputs.manifest_basename }}
       ARTIFACT_DIR: ${{ github.workspace }}/dist/vm/x86-64
       RELEASE_RESULTS_DIR: ${{ github.workspace }}/vm-release-results/x86-64
@@ -178,7 +194,10 @@ jobs:
             gzip \
             libncurses-dev \
             python3 \
+            genisoimage \
+            ovmf \
             qemu-system-x86 \
+            qemu-utils \
             rsync \
             shellcheck \
             unzip \
@@ -187,11 +206,13 @@ jobs:
             zstd
       - name: Run VM release policy checks
         run: |
+          set -euo pipefail
           shellcheck -S warning \
             scripts/build-vm-image.sh \
             scripts/test-vm-smoke.sh \
             scripts/test-vm-release.sh \
             tests/test_vm_policy.sh \
+            tests/test_vm_manifest_selection.sh \
             tests/test_vm_release_policy.sh \
             vm-files/etc/uci-defaults/10-vm-smoke \
             vm-files/usr/libexec/nexawrt-vm-dangerous-command-guard \
@@ -200,9 +221,9 @@ jobs:
             vm-files-release/usr/libexec/nexawrt-vm-dangerous-command-guard \
             vm-files-release/sbin/*
           ./tests/test_vm_policy.sh
+          ./tests/test_vm_manifest_selection.sh
           ./tests/test_vm_release_policy.sh
-      - name: Build exact x86_64 VM release image
-        id: build
+      - name: Build exact x86_64 VM release set
         env:
           VM_WORK_DIR: ${{ github.workspace }}/.work/vm-release
           VM_OUTPUT_DIR: ${{ github.workspace }}/dist/vm
@@ -210,72 +231,136 @@ jobs:
       - name: Verify release build outputs before QEMU
         run: |
           set -euo pipefail
-          test -f "$ARTIFACT_DIR/$IMAGE_BASENAME"
-          test -f "$ARTIFACT_DIR/${IMAGE_BASENAME}.sha256"
+          images=(
+            "$RAW_BIOS_BASENAME"
+            "$ISO_BIOS_BASENAME"
+            "$ISO_EFI_BASENAME"
+            "$VMDK_BIOS_BASENAME"
+            "$VMDK_EFI_BASENAME"
+          )
+          for image in "${images[@]}"; do
+            test -f "$ARTIFACT_DIR/$image"
+            test ! -L "$ARTIFACT_DIR/$image"
+            test -s "$ARTIFACT_DIR/$image"
+            test -f "$ARTIFACT_DIR/${image}.sha256"
+            test ! -L "$ARTIFACT_DIR/${image}.sha256"
+            (cd "$ARTIFACT_DIR" && sha256sum --check --status "${image}.sha256")
+          done
+          for vmdk in "$VMDK_BIOS_BASENAME" "$VMDK_EFI_BASENAME"; do
+            qemu-img info --output=json "$ARTIFACT_DIR/$vmdk" | python3 -c \
+              'import json,sys; d=json.load(sys.stdin); data=d.get("format-specific", {}).get("data", {}); raise SystemExit(0 if d.get("format") == "vmdk" and data.get("create-type") == "streamOptimized" else 1)'
+            qemu-img check -f vmdk "$ARTIFACT_DIR/$vmdk"
+          done
           test -f "$ARTIFACT_DIR/$MANIFEST_BASENAME"
           test -f "$ARTIFACT_DIR/artifact-labels.env"
           test -f "$ARTIFACT_DIR/README-VM.txt"
-          grep -Fxq 'ARTIFACT_CLASS="VM_DISTRIBUTION_IMAGE"' "$ARTIFACT_DIR/artifact-labels.env"
+          grep -Fxq 'RELEASE_CONTRACT="vm-x86_64/v2"' "$ARTIFACT_DIR/artifact-labels.env"
+          grep -Fxq 'ARTIFACT_CLASS="VM_DISTRIBUTION_SET"' "$ARTIFACT_DIR/artifact-labels.env"
+          grep -Fxq 'PUBLISHED_VARIANTS="raw_bios,iso_bios,iso_efi,vmdk_bios,vmdk_efi"' "$ARTIFACT_DIR/artifact-labels.env"
+          grep -Fxq 'ESXI_VALIDATION="not-tested"' "$ARTIFACT_DIR/artifact-labels.env"
           grep -Fxq 'VM_ONLY="true"' "$ARTIFACT_DIR/artifact-labels.env"
           grep -Fxq 'NOT_AX9000_FIRMWARE="true"' "$ARTIFACT_DIR/artifact-labels.env"
           grep -Fxq 'HARDWARE_VALIDATION="false"' "$ARTIFACT_DIR/artifact-labels.env"
           grep -Fxq 'NSS_VALIDATION="false"' "$ARTIFACT_DIR/artifact-labels.env"
+          grep -Fxq 'VALIDATION_SCOPE="QEMU_RUNTIME_ALL_VARIANTS"' "$ARTIFACT_DIR/artifact-labels.env"
           grep -Fxq 'SSH_DEFAULT="disabled"' "$ARTIFACT_DIR/artifact-labels.env"
+          grep -Fxq 'SSH_AUTHORIZED_KEYS="absent"' "$ARTIFACT_DIR/artifact-labels.env"
           if find "$ARTIFACT_DIR" -maxdepth 1 -type f -iname '*AX9000*' -print -quit | grep -q .; then
             echo "VM release output must not contain AX9000-named files" >&2
             exit 1
           fi
-          (cd "$ARTIFACT_DIR" && sha256sum -c "${IMAGE_BASENAME}.sha256")
-      - name: Run QEMU release smoke test against exact image
+      - name: Run five-format QEMU release validation
         env:
           VM_RELEASE_OUTPUT_DIR: ${{ github.workspace }}/vm-release-results/x86-64
-        run: ./scripts/test-vm-release.sh x86-64 '${{ steps.build.outputs.image }}'
-      - name: Stage exact white-listed release assets
+        run: ./scripts/test-vm-release.sh x86-64 "$ARTIFACT_DIR"
+      - name: Validate smoke report and stage exact pre-provenance assets
         run: |
           set -euo pipefail
-          grep -Fxq 'status=PASS' "$RELEASE_RESULTS_DIR/smoke-report.txt"
-          grep -Fxq 'exact_release_image=true' "$RELEASE_RESULTS_DIR/smoke-report.txt"
-          grep -Fxq 'serial_labels=PASS' "$RELEASE_RESULTS_DIR/smoke-report.txt"
-          grep -Fxq 'http=PASS' "$RELEASE_RESULTS_DIR/smoke-report.txt"
-          grep -Fxq 'qemu_boot=PASS' "$RELEASE_RESULTS_DIR/smoke-report.txt"
-          grep -Fxq 'ssh_runtime_evidence=PASS' "$RELEASE_RESULTS_DIR/smoke-report.txt"
-          grep -Fxq 'ssh_port_probe=PASS' "$RELEASE_RESULTS_DIR/smoke-report.txt"
-          grep -Fxq 'ssh=DISABLED_BY_DEFAULT' "$RELEASE_RESULTS_DIR/smoke-report.txt"
-          grep -Fxq 'authorized_keys=ABSENT' "$RELEASE_RESULTS_DIR/smoke-report.txt"
-          grep -Fxq 'dropbear_enabled=NO' "$RELEASE_RESULTS_DIR/smoke-report.txt"
-          grep -Fxq 'dropbear_running=NO' "$RELEASE_RESULTS_DIR/smoke-report.txt"
-          cp "$RELEASE_RESULTS_DIR/smoke-report.txt" "$ARTIFACT_DIR/smoke-report.txt"
-          (
-            cd "$ARTIFACT_DIR"
-            sha256sum \
-              "$IMAGE_BASENAME" \
-              "${IMAGE_BASENAME}.sha256" \
-              "$MANIFEST_BASENAME" \
-              artifact-labels.env \
-              README-VM.txt \
-              smoke-report.txt > SHA256SUMS
-            sha256sum -c SHA256SUMS
-          )
-          python3 - "$ARTIFACT_DIR/SHA256SUMS" <<'PY'
+          report="$RELEASE_RESULTS_DIR/smoke-report.txt"
+          python3 - "$report" "$RAW_BIOS_BASENAME" "$ISO_BIOS_BASENAME" "$ISO_EFI_BASENAME" "$VMDK_BIOS_BASENAME" "$VMDK_EFI_BASENAME" <<'PY'
           import pathlib
           import sys
 
-          path = pathlib.Path(sys.argv[1])
-          for raw in path.read_text(encoding="utf-8").splitlines():
-              digest, name = raw.split(maxsplit=1)
-              if len(digest) != 64 or not all(c in "0123456789abcdef" for c in digest):
-                  raise SystemExit(f"invalid SHA256 line: {raw}")
-              if "AX9000" in name or "ax9000" in name:
-                  raise SystemExit(f"VM release checksum mentions AX9000: {name}")
+          report_path = pathlib.Path(sys.argv[1])
+          expected_files = dict(zip(
+              ("raw_bios_file", "iso_bios_file", "iso_efi_file", "vmdk_bios_file", "vmdk_efi_file"),
+              sys.argv[2:],
+          ))
+          expected_keys = {
+              "status", "target", "release_contract", "vm_only", "not_ax9000_firmware",
+              "hardware_validation", "nss_validation", "exact_release_image", "serial_labels", "http", "ssh_runtime_evidence", "ssh_port_probe", "ssh",
+              "authorized_keys", "dropbear_enabled", "dropbear_running", "http_status",
+              "auth_challenge", "http_host_port", "ssh_host_port", "serial_log", "ssh_probe_log",
+              "raw_bios_file", "raw_bios_qemu", "iso_bios_file", "iso_bios_qemu",
+              "iso_efi_file", "iso_efi_qemu", "vmdk_bios_file", "vmdk_bios_qemu",
+              "vmdk_efi_file", "vmdk_efi_qemu", "esxi_validation",
+          }
+          values = {}
+          for line in report_path.read_text(encoding="utf-8").splitlines():
+              key, separator, value = line.partition("=")
+              if not separator or not key or key in values:
+                  raise SystemExit(f"invalid or duplicate smoke report line: {line!r}")
+              values[key] = value
+          if set(values) != expected_keys:
+              raise SystemExit(f"smoke report keys changed: {sorted(set(values) ^ expected_keys)!r}")
+          fixed = {
+              "status": "PASS", "target": "x86-64", "release_contract": "vm-x86_64/v2",
+              "vm_only": "true", "not_ax9000_firmware": "true", "hardware_validation": "false",
+              "nss_validation": "false", "exact_release_image": "true", "serial_labels": "PASS", "http": "PASS", "ssh_runtime_evidence": "PASS",
+              "ssh_port_probe": "PASS", "ssh": "DISABLED_BY_DEFAULT", "authorized_keys": "ABSENT",
+              "dropbear_enabled": "NO", "dropbear_running": "NO", "raw_bios_qemu": "runtime-pass",
+              "iso_bios_qemu": "runtime-pass", "iso_efi_qemu": "runtime-pass",
+              "vmdk_bios_qemu": "runtime-pass", "vmdk_efi_qemu": "runtime-pass",
+              "esxi_validation": "not-tested",
+          }
+          fixed.update(expected_files)
+          for key, expected in fixed.items():
+              if values.get(key) != expected:
+                  raise SystemExit(f"smoke report mismatch for {key}: {values.get(key)!r} != {expected!r}")
+          if (values["http_status"], values["auth_challenge"]) not in {("200", "false"), ("403", "true")}:
+              raise SystemExit("smoke report has an invalid LuCI HTTP/authentication result")
+          ports = {}
+          for key in ("http_host_port", "ssh_host_port"):
+              if not values[key].isdigit() or not (1024 <= int(values[key]) <= 65535):
+                  raise SystemExit(f"smoke report {key} is invalid")
+              ports[key] = int(values[key])
+          if ports["http_host_port"] == ports["ssh_host_port"]:
+              raise SystemExit("smoke report reuses the same HTTP and SSH host port")
+          expected_result_dir = report_path.parent / "raw_bios"
+          expected_paths = {
+              "serial_log": expected_result_dir / "serial.log",
+              "ssh_probe_log": expected_result_dir / "ssh-port-probe.txt",
+          }
+          for key, expected_path in expected_paths.items():
+              actual_path = pathlib.Path(values[key])
+              if not actual_path.is_absolute() or actual_path != expected_path:
+                  raise SystemExit(f"smoke report {key} does not bind the exact v2 runtime result path")
           PY
+          cp "$report" "$ARTIFACT_DIR/smoke-report.txt"
+          (
+            cd "$ARTIFACT_DIR"
+            sha256sum \
+              "$RAW_BIOS_BASENAME" "${RAW_BIOS_BASENAME}.sha256" \
+              "$ISO_BIOS_BASENAME" "${ISO_BIOS_BASENAME}.sha256" \
+              "$ISO_EFI_BASENAME" "${ISO_EFI_BASENAME}.sha256" \
+              "$VMDK_BIOS_BASENAME" "${VMDK_BIOS_BASENAME}.sha256" \
+              "$VMDK_EFI_BASENAME" "${VMDK_EFI_BASENAME}.sha256" \
+              "$MANIFEST_BASENAME" artifact-labels.env README-VM.txt smoke-report.txt > SHA256SUMS
+            sha256sum --check SHA256SUMS
+          )
           mkdir -p "$PUBLISH_DIR"
-          cp "$ARTIFACT_DIR/$IMAGE_BASENAME" "$PUBLISH_DIR/"
-          cp "$ARTIFACT_DIR/${IMAGE_BASENAME}.sha256" "$PUBLISH_DIR/"
-          cp "$ARTIFACT_DIR/$MANIFEST_BASENAME" "$PUBLISH_DIR/"
-          cp "$ARTIFACT_DIR/artifact-labels.env" "$PUBLISH_DIR/"
-          cp "$ARTIFACT_DIR/README-VM.txt" "$PUBLISH_DIR/"
-          cp "$ARTIFACT_DIR/smoke-report.txt" "$PUBLISH_DIR/"
-          cp "$ARTIFACT_DIR/SHA256SUMS" "$PUBLISH_DIR/"
+          assets=(
+            "$RAW_BIOS_BASENAME" "${RAW_BIOS_BASENAME}.sha256"
+            "$ISO_BIOS_BASENAME" "${ISO_BIOS_BASENAME}.sha256"
+            "$ISO_EFI_BASENAME" "${ISO_EFI_BASENAME}.sha256"
+            "$VMDK_BIOS_BASENAME" "${VMDK_BIOS_BASENAME}.sha256"
+            "$VMDK_EFI_BASENAME" "${VMDK_EFI_BASENAME}.sha256"
+            "$MANIFEST_BASENAME" artifact-labels.env README-VM.txt smoke-report.txt SHA256SUMS
+          )
+          for asset in "${assets[@]}"; do
+            cp "$ARTIFACT_DIR/$asset" "$PUBLISH_DIR/$asset"
+          done
+          test "$(find "$PUBLISH_DIR" -maxdepth 1 -type f | wc -l)" -eq 15
       - name: Re-verify pinned source before attestations
         env:
           GH_TOKEN: ${{ github.token }}
@@ -289,32 +374,68 @@ jobs:
           remote_sha="$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$RELEASE_TAG" --jq '.object.sha')"
           test "$remote_type" = commit
           test "$remote_sha" = "$EXPECTED_SOURCE_SHA"
-      - name: Attest exact VM image
-        id: image_attestation
+      - name: Attest raw BIOS image
+        id: raw_bios_attestation
         uses: actions/attest-build-provenance@96278af6caaf10aea03fd8d33a09a777ca52d62f # v3.2.0
         with:
-          subject-path: ${{ env.PUBLISH_DIR }}/${{ env.IMAGE_BASENAME }}
+          subject-path: ${{ env.PUBLISH_DIR }}/${{ env.RAW_BIOS_BASENAME }}
+      - name: Attest BIOS Live ISO
+        id: iso_bios_attestation
+        uses: actions/attest-build-provenance@96278af6caaf10aea03fd8d33a09a777ca52d62f # v3.2.0
+        with:
+          subject-path: ${{ env.PUBLISH_DIR }}/${{ env.ISO_BIOS_BASENAME }}
+      - name: Attest EFI Live ISO
+        id: iso_efi_attestation
+        uses: actions/attest-build-provenance@96278af6caaf10aea03fd8d33a09a777ca52d62f # v3.2.0
+        with:
+          subject-path: ${{ env.PUBLISH_DIR }}/${{ env.ISO_EFI_BASENAME }}
+      - name: Attest BIOS VMDK
+        id: vmdk_bios_attestation
+        uses: actions/attest-build-provenance@96278af6caaf10aea03fd8d33a09a777ca52d62f # v3.2.0
+        with:
+          subject-path: ${{ env.PUBLISH_DIR }}/${{ env.VMDK_BIOS_BASENAME }}
+      - name: Attest EFI VMDK
+        id: vmdk_efi_attestation
+        uses: actions/attest-build-provenance@96278af6caaf10aea03fd8d33a09a777ca52d62f # v3.2.0
+        with:
+          subject-path: ${{ env.PUBLISH_DIR }}/${{ env.VMDK_EFI_BASENAME }}
       - name: Attest VM checksums
         id: checksums_attestation
         uses: actions/attest-build-provenance@96278af6caaf10aea03fd8d33a09a777ca52d62f # v3.2.0
         with:
           subject-path: ${{ env.PUBLISH_DIR }}/SHA256SUMS
-      - name: Attach offline attestation bundles
+      - name: Attach six offline attestation bundles
         run: |
           set -euo pipefail
-          cp '${{ steps.image_attestation.outputs.bundle-path }}' "$PUBLISH_DIR/image.provenance.bundle.json"
+          cp '${{ steps.raw_bios_attestation.outputs.bundle-path }}' "$PUBLISH_DIR/raw-bios.provenance.bundle.json"
+          cp '${{ steps.iso_bios_attestation.outputs.bundle-path }}' "$PUBLISH_DIR/iso-bios.provenance.bundle.json"
+          cp '${{ steps.iso_efi_attestation.outputs.bundle-path }}' "$PUBLISH_DIR/iso-efi.provenance.bundle.json"
+          cp '${{ steps.vmdk_bios_attestation.outputs.bundle-path }}' "$PUBLISH_DIR/vmdk-bios.provenance.bundle.json"
+          cp '${{ steps.vmdk_efi_attestation.outputs.bundle-path }}' "$PUBLISH_DIR/vmdk-efi.provenance.bundle.json"
           cp '${{ steps.checksums_attestation.outputs.bundle-path }}' "$PUBLISH_DIR/checksums.provenance.bundle.json"
-      - name: Verify exact asset whitelist
+      - name: Verify exact 21-asset whitelist
         run: |
           set -euo pipefail
-          expected_assets="$IMAGE_BASENAME
-          ${IMAGE_BASENAME}.sha256
+          expected_assets="$RAW_BIOS_BASENAME
+          ${RAW_BIOS_BASENAME}.sha256
+          $ISO_BIOS_BASENAME
+          ${ISO_BIOS_BASENAME}.sha256
+          $ISO_EFI_BASENAME
+          ${ISO_EFI_BASENAME}.sha256
+          $VMDK_BIOS_BASENAME
+          ${VMDK_BIOS_BASENAME}.sha256
+          $VMDK_EFI_BASENAME
+          ${VMDK_EFI_BASENAME}.sha256
           $MANIFEST_BASENAME
           artifact-labels.env
           README-VM.txt
           smoke-report.txt
           SHA256SUMS
-          image.provenance.bundle.json
+          raw-bios.provenance.bundle.json
+          iso-bios.provenance.bundle.json
+          iso-efi.provenance.bundle.json
+          vmdk-bios.provenance.bundle.json
+          vmdk-efi.provenance.bundle.json
           checksums.provenance.bundle.json"
           EXPECTED_ASSETS="$expected_assets" python3 - "$PUBLISH_DIR" <<'PY'
           import os
@@ -323,15 +444,15 @@ jobs:
 
           publish_dir = pathlib.Path(sys.argv[1])
           expected = {line.strip() for line in os.environ["EXPECTED_ASSETS"].splitlines() if line.strip()}
-          actual = {path.name for path in publish_dir.iterdir() if path.is_file()}
-          if actual != expected:
-              raise SystemExit(f"asset whitelist mismatch: actual={sorted(actual)!r}, expected={sorted(expected)!r}")
-          for name in actual:
-              path = publish_dir / name
-              if "AX9000" in name or "ax9000" in name:
-                  raise SystemExit(f"VM release asset must not mention AX9000: {name}")
-              if path.stat().st_size <= 0:
-                  raise SystemExit(f"release asset is empty: {name}")
+          actual_paths = [path for path in publish_dir.iterdir() if path.is_file()]
+          actual = {path.name for path in actual_paths}
+          if len(expected) != 21 or len(actual_paths) != 21 or actual != expected:
+              raise SystemExit(f"21-asset whitelist mismatch: actual={sorted(actual)!r}, expected={sorted(expected)!r}")
+          for path in actual_paths:
+              if path.is_symlink() or path.stat().st_size <= 0:
+                  raise SystemExit(f"release asset is unsafe or empty: {path.name}")
+              if "AX9000" in path.name or "ax9000" in path.name:
+                  raise SystemExit(f"VM release asset must not mention AX9000: {path.name}")
           PY
       - name: Create, verify, and publish immutable prerelease
         env:
@@ -354,7 +475,7 @@ jobs:
           release_title="NexaWrt x86_64 VM $RELEASE_VERSION prerelease"
           gh release create "$RELEASE_TAG" --verify-tag --draft --prerelease --latest=false \
             --title "$release_title" \
-            --notes "NexaWrt x86_64 VM-only prerelease. NOT Xiaomi AX9000 firmware. QEMU validation covers VM userspace/LuCI/basic networking only and does not validate AX9000 hardware, Wi-Fi, switch, NSS, NAND, sysupgrade, or recovery."
+            --notes "NexaWrt x86_64 VM-only prerelease contract vm-x86_64/v2. Five images passed QEMU SeaBIOS/OVMF runtime validation. The VMDKs are streamOptimized VMware import transport images and must be imported/converted by ESXi into datastore-backed writable disks. ESXI_VALIDATION=not-tested. NOT Xiaomi AX9000 firmware; no AX9000 hardware, Wi-Fi, switch, NSS, NAND, sysupgrade, or recovery validation is claimed."
           draft_release="$(mktemp)"
           draft_assets="$(mktemp)"
           final_release_by_id="$(mktemp)"

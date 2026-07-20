@@ -3,11 +3,8 @@ set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 BUILD_SCRIPT="$ROOT_DIR/scripts/build-vm-image.sh"
-MANIFEST_SELECTION_TEST="$ROOT_DIR/tests/test_vm_manifest_selection.sh"
-RELEASE_SCRIPT="$ROOT_DIR/scripts/test-vm-release.sh"
-RELEASE_WORKFLOW="$ROOT_DIR/.github/workflows/vm-release.yml"
-RELEASE_OVERLAY="$ROOT_DIR/vm-files-release"
-DOC="$ROOT_DIR/docs/VM-X86_64.md"
+RUNTIME_SCRIPT="$ROOT_DIR/scripts/test-vm-release.sh"
+WORKFLOW="$ROOT_DIR/.github/workflows/vm-release.yml"
 
 fail() {
   printf 'VM release policy test failed: %s\n' "$*" >&2
@@ -15,422 +12,241 @@ fail() {
 }
 
 assert_contains() {
-  local needle="$1" file="$2"
-  grep -Fq -- "$needle" "$file" || fail "$file is missing required policy text: $needle"
+  local needle="$1" path="$2"
+  grep -Fq -- "$needle" "$path" || fail "missing policy text in ${path#$ROOT_DIR/}: $needle"
 }
 
 assert_not_contains() {
-  local needle="$1" file="$2"
-  if grep -Fq -- "$needle" "$file"; then
-    fail "$file contains forbidden policy text: $needle"
+  local needle="$1" path="$2"
+  if grep -Fq -- "$needle" "$path"; then
+    fail "forbidden policy text in ${path#$ROOT_DIR/}: $needle"
   fi
 }
 
-for required in \
-  "$BUILD_SCRIPT" \
-  "$RELEASE_SCRIPT" \
-  "$RELEASE_WORKFLOW" \
-  "$DOC" \
-  "$RELEASE_OVERLAY/etc/banner" \
-  "$RELEASE_OVERLAY/etc/nexawrt-vm-release" \
-  "$RELEASE_OVERLAY/etc/uci-defaults/10-vm-release" \
-  "$RELEASE_OVERLAY/usr/libexec/nexawrt-vm-dangerous-command-guard"; do
-  [[ -f "$required" && ! -L "$required" ]] || fail "required regular file is missing: $required"
+for path in "$BUILD_SCRIPT" "$RUNTIME_SCRIPT" "$WORKFLOW"; do
+  [[ -f "$path" && ! -L "$path" ]] || fail "required policy input is missing or unsafe: $path"
 done
 
-for script in "$BUILD_SCRIPT" "$RELEASE_SCRIPT" "$RELEASE_OVERLAY/etc/uci-defaults/10-vm-release" \
-  "$RELEASE_OVERLAY/usr/libexec/nexawrt-vm-dangerous-command-guard" "$RELEASE_OVERLAY"/sbin/*; do
-  [[ -x "$script" ]] || fail "script is not executable: $script"
-  bash -n "$script" || fail "shell syntax check failed: $script"
+bash -n "$BUILD_SCRIPT"
+bash -n "$RUNTIME_SCRIPT"
+
+# Build contract: six exact upstream inputs produce five published files. The
+# native VMDKs are gzip-compressed monolithicSparse capability evidence only;
+# release VMDKs must be streamOptimized conversions from matching raw disks.
+for text in \
+  "RELEASE_CONTRACT='vm-x86_64/v2'" \
+  "PUBLISHED_VARIANTS='raw_bios,iso_bios,iso_efi,vmdk_bios,vmdk_efi'" \
+  'openwrt-${openwrt_version}-x86-64-generic' \
+  '${generic_prefix}-ext4-combined.img.gz' \
+  '${generic_prefix}-ext4-combined-efi.img.gz' \
+  '${generic_prefix}-image.iso' \
+  '${generic_prefix}-image-efi.iso' \
+  '${generic_prefix}-ext4-combined.vmdk.gz' \
+  '${generic_prefix}-ext4-combined-efi.vmdk.gz' \
+  'CONFIG_TARGET_ROOTFS_EXT4FS=y' \
+  'CONFIG_TARGET_ROOTFS_SQUASHFS=n' \
+  'CONFIG_ISO_IMAGES=y' \
+  'CONFIG_VMDK_IMAGES=y' \
+  'qemu-img convert -f raw -O vmdk -o subformat=streamOptimized' \
+  'data.get("create-type") == "monolithicSparse"' \
+  'data.get("create-type") == "streamOptimized"' \
+  'qemu-img check -f vmdk "$native_vmdk"' \
+  'qemu-img check -f vmdk "$vmdk_path"' \
+  'ARTIFACT_CLASS="VM_DISTRIBUTION_SET"' \
+  'VALIDATION_SCOPE_VALUE="QEMU_RUNTIME_ALL_VARIANTS"' \
+  'RELEASE_CONTRACT="%s"' \
+  'PUBLISHED_VARIANTS="%s"' \
+  'ESXI_VALIDATION="not-tested"' \
+  'VM_ONLY="true"' \
+  'NOT_AX9000_FIRMWARE="true"' \
+  'HARDWARE_VALIDATION="false"' \
+  'NSS_VALIDATION="false"' \
+  'SSH_DEFAULT="disabled"' \
+  'SSH_AUTHORIZED_KEYS="absent"'; do
+  assert_contains "$text" "$BUILD_SCRIPT"
 done
+assert_contains 'NexaWrt-x86_64-${RELEASE_VERSION}-generic-image.iso' "$BUILD_SCRIPT"
+assert_contains 'NexaWrt-x86_64-${RELEASE_VERSION}-generic-image-efi.iso' "$BUILD_SCRIPT"
+assert_contains 'After upload, import/convert each streamOptimized VMDK into an ESXi datastore-backed writable disk' "$BUILD_SCRIPT"
+assert_not_contains 'release build unexpectedly produced squashfs' "$BUILD_SCRIPT"
+assert_not_contains 'squashfs generation is disabled' "$BUILD_SCRIPT"
 
-grep -qx 'NEXAWRT_VM_RELEASE_METADATA_V1_BEGIN' "$RELEASE_OVERLAY/etc/nexawrt-vm-release" || \
-  fail "release VM metadata begin marker is missing"
-grep -qx 'NEXAWRT_VM_RELEASE_METADATA_V1_END' "$RELEASE_OVERLAY/etc/nexawrt-vm-release" || \
-  fail "release VM metadata end marker is missing"
-
-for label in \
-  'ARTIFACT_CLASS=VM_DISTRIBUTION_IMAGE' \
-  'VM_ONLY=1' \
-  'NOT_AX9000_FIRMWARE=1' \
-  'HARDWARE_VALIDATION=0' \
-  'NSS_VALIDATION=0' \
-  'VALIDATION_SCOPE=QEMU_BOOT_AND_USERSPACE_ONLY' \
-  'SSH_DEFAULT=disabled' \
-  'SSH_AUTHORIZED_KEYS=absent'; do
-  grep -qx "$label" "$RELEASE_OVERLAY/etc/nexawrt-vm-release" || fail "release VM label is missing: $label"
-  assert_contains "$label" "$RELEASE_OVERLAY/etc/banner"
+# Functional selector fixture mirrors the confirmed OpenWrt 25.12.5 output.
+fixture="$(mktemp -d)"
+trap 'rm -rf "$fixture"' EXIT
+version=25.12.5
+prefix="openwrt-${version}-x86-64-generic"
+expected_inputs=(
+  "${prefix}-ext4-combined.img.gz"
+  "${prefix}-ext4-combined-efi.img.gz"
+  "${prefix}-image.iso"
+  "${prefix}-image-efi.iso"
+  "${prefix}-ext4-combined.vmdk.gz"
+  "${prefix}-ext4-combined-efi.vmdk.gz"
+)
+for name in "${expected_inputs[@]}"; do
+  printf 'fixture\n' > "$fixture/$name"
 done
-assert_contains 'Remote SSH is disabled by default' "$RELEASE_OVERLAY/etc/banner"
-assert_contains '不是 Xiaomi AX9000 固件' "$RELEASE_OVERLAY/etc/banner"
-assert_contains '不得上传到 AX9000 LuCI' "$RELEASE_OVERLAY/etc/banner"
-assert_contains "set network.lan.proto='dhcp'" "$RELEASE_OVERLAY/etc/uci-defaults/10-vm-release"
-assert_contains "set uhttpd.main.redirect_https='0'" "$RELEASE_OVERLAY/etc/uci-defaults/10-vm-release"
-assert_contains "set dropbear.@dropbear[0].PasswordAuth='off'" "$RELEASE_OVERLAY/etc/uci-defaults/10-vm-release"
-assert_contains "set dropbear.@dropbear[0].RootPasswordAuth='off'" "$RELEASE_OVERLAY/etc/uci-defaults/10-vm-release"
-assert_contains '/etc/init.d/dropbear stop >/dev/null 2>&1' "$RELEASE_OVERLAY/etc/uci-defaults/10-vm-release"
-assert_contains '/etc/init.d/dropbear disable >/dev/null 2>&1' "$RELEASE_OVERLAY/etc/uci-defaults/10-vm-release"
-assert_not_contains '|| true' "$RELEASE_OVERLAY/etc/uci-defaults/10-vm-release"
-assert_contains 'if /etc/init.d/dropbear enabled >/dev/null 2>&1; then' "$RELEASE_OVERLAY/etc/uci-defaults/10-vm-release"
-assert_contains 'if pidof dropbear >/dev/null 2>&1; then' "$RELEASE_OVERLAY/etc/uci-defaults/10-vm-release"
-assert_contains 'if [ -s "$AUTHORIZED_KEYS" ]; then' "$RELEASE_OVERLAY/etc/uci-defaults/10-vm-release"
-assert_contains 'NEXAWRT_VM_SSH_RUNTIME_EVIDENCE_V1_BEGIN' "$RELEASE_OVERLAY/etc/uci-defaults/10-vm-release"
-assert_contains 'ssh=DISABLED_BY_DEFAULT' "$RELEASE_OVERLAY/etc/uci-defaults/10-vm-release"
-assert_contains 'authorized_keys=ABSENT' "$RELEASE_OVERLAY/etc/uci-defaults/10-vm-release"
-assert_contains 'dropbear_enabled=NO' "$RELEASE_OVERLAY/etc/uci-defaults/10-vm-release"
-assert_contains 'dropbear_running=NO' "$RELEASE_OVERLAY/etc/uci-defaults/10-vm-release"
-assert_contains 'cat "$RELEASE_METADATA" >/dev/console' "$RELEASE_OVERLAY/etc/uci-defaults/10-vm-release"
-assert_contains 'cat "$EVIDENCE_FILE" >/dev/console' "$RELEASE_OVERLAY/etc/uci-defaults/10-vm-release"
+# Squashfs output may still exist even with CONFIG_TARGET_ROOTFS_SQUASHFS=n.
+printf 'allowed-extra\n' > "$fixture/${prefix}-squashfs-combined.img.gz"
+printf 'allowed-extra\n' > "$fixture/${prefix}-squashfs-combined.vmdk"
+printf 'manifest\n' > "$fixture/${prefix}.manifest"
+selector_output="$(bash -c 'source "$1"; select_x86_64_release_inputs "$2" "$3"' policy "$BUILD_SCRIPT" "$fixture" "$version")"
+selected_inputs=()
+while IFS= read -r selected_input; do
+  [[ -n "$selected_input" ]] && selected_inputs+=("$selected_input")
+done <<< "$selector_output"
+[[ "${#selected_inputs[@]}" -eq 6 ]] || fail "selector did not return six exact inputs"
+for index in "${!expected_inputs[@]}"; do
+  [[ "${selected_inputs[$index]}" == "$fixture/${expected_inputs[$index]}" ]] ||
+    fail "selector order mismatch at index $index"
+done
+manifest="$(bash -c 'source "$1"; select_x86_64_release_manifest "$2" "$3" "$4"' policy \
+  "$BUILD_SCRIPT" "$fixture" "$version" "${prefix}-ext4-combined.img.gz")"
+[[ "$manifest" == "$fixture/${prefix}.manifest" ]] || fail "target-level manifest selection changed"
 
-if find "$RELEASE_OVERLAY" -type f -path '*/authorized_keys' -print -quit | grep -q .; then
-  fail "release overlay must not contain SSH authorized_keys"
+# Missing or symlinked mandatory input must fail closed.
+missing_fixture="$fixture/missing"
+mkdir -p "$missing_fixture"
+for name in "${expected_inputs[@]}"; do
+  printf 'fixture\n' > "$missing_fixture/$name"
+done
+rm "$missing_fixture/${expected_inputs[5]}"
+if bash -c 'source "$1"; select_x86_64_release_inputs "$2" "$3"' policy \
+  "$BUILD_SCRIPT" "$missing_fixture" "$version" >/dev/null 2>&1; then
+  fail "selector accepted a missing native EFI VMDK source"
+fi
+printf 'fixture\n' > "$missing_fixture/${expected_inputs[5]}"
+rm "$missing_fixture/${expected_inputs[5]}"
+ln -s "$fixture/${expected_inputs[5]}" "$missing_fixture/${expected_inputs[5]}"
+if bash -c 'source "$1"; select_x86_64_release_inputs "$2" "$3"' policy \
+  "$BUILD_SCRIPT" "$missing_fixture" "$version" >/dev/null 2>&1; then
+  fail "selector accepted a symlinked upstream input"
 fi
 
-GUARD="$RELEASE_OVERLAY/usr/libexec/nexawrt-vm-dangerous-command-guard"
-for guard_name in factoryreset firstboot jffs2mark jffs2reset mtd sysupgrade ubiattach ubidetach ubiformat; do
-  wrapper="$RELEASE_OVERLAY/sbin/$guard_name"
-  [[ -f "$wrapper" && -x "$wrapper" && ! -L "$wrapper" ]] || fail "dangerous-command wrapper is missing: $guard_name"
-  set +e
-  guard_output="$(NEXAWRT_VM_GUARD_PATH="$GUARD" "$wrapper" --policy-test 2>&1)"
-  guard_status=$?
-  set -e
-  [[ "$guard_status" -eq 74 ]] || fail "$guard_name guard returned $guard_status instead of 74"
-  grep -Fq 'VM-only safety guard' <<<"$guard_output" || fail "$guard_name guard lacks VM-only warning"
-  grep -Fq 'not hardware/NSS validation' <<<"$guard_output" || fail "$guard_name guard overstates validation"
+# Runtime contract: every format gets full QEMU validation, VMDKs are checked as
+# streamOptimized, and -snapshot prevents writes to import transport images.
+for text in \
+  '-snapshot' \
+  'run_variant raw_bios "$RAW_BIOS_PATH" bios raw_gz' \
+  'run_variant iso_bios "$ISO_BIOS_PATH" bios iso' \
+  'run_variant iso_efi "$ISO_EFI_PATH" uefi iso' \
+  'run_variant vmdk_bios "$VMDK_BIOS_PATH" bios vmdk' \
+  'run_variant vmdk_efi "$VMDK_EFI_PATH" uefi vmdk' \
+  'data.get("create-type") == "streamOptimized"' \
+  'qemu-img check -f vmdk "$image_path"' \
+  'RELEASE_CONTRACT=vm-x86_64/v2' \
+  'ARTIFACT_CLASS=VM_DISTRIBUTION_SET' \
+  'PUBLISHED_VARIANTS=raw_bios,iso_bios,iso_efi,vmdk_bios,vmdk_efi' \
+  'ESXI_VALIDATION=not-tested' \
+  'VALIDATION_SCOPE=QEMU_RUNTIME_ALL_VARIANTS' \
+  '( "$status" == 200 && "$auth_challenge" == false )' \
+  'ssh=DISABLED_BY_DEFAULT' \
+  'authorized_keys=ABSENT' \
+  'dropbear_enabled=NO' \
+  'dropbear_running=NO' \
+  "printf 'release_contract=vm-x86_64/v2\\n'" \
+  "printf 'raw_bios_qemu=%s\\n'" \
+  "printf 'iso_bios_qemu=%s\\n'" \
+  "printf 'iso_efi_qemu=%s\\n'" \
+  "printf 'vmdk_bios_qemu=%s\\n'" \
+  "printf 'vmdk_efi_qemu=%s\\n'" \
+  "printf 'esxi_validation=not-tested\\n'"; do
+  assert_contains "$text" "$RUNTIME_SCRIPT"
 done
+assert_not_contains "printf 'image=%s\\n'" "$RUNTIME_SCRIPT"
+assert_not_contains "printf 'qemu_boot=%s\\n'" "$RUNTIME_SCRIPT"
+assert_contains 'NexaWrt-x86_64-${RELEASE_VERSION}-generic-image.iso' "$RUNTIME_SCRIPT"
+assert_contains 'NexaWrt-x86_64-${RELEASE_VERSION}-generic-image-efi.iso' "$RUNTIME_SCRIPT"
 
-for required_text in \
-  'RELEASE_TAG_PATTERN=' \
-  'VM_SMOKE_AUTHORIZED_KEY_FILE must not be set in release mode' \
-  'RELEASE_VERSION="${RELEASE_TAG#vm-x86_64-}"' \
-  'ARTIFACT_BASENAME="NexaWrt-x86_64-${RELEASE_VERSION}-generic-ext4-combined.img.gz"' \
-  'ARTIFACT_CLASS="VM_DISTRIBUTION_IMAGE"' \
-  'SSH_DEFAULT="disabled"' \
-  'SSH_AUTHORIZED_KEYS="absent"' \
-  'find "$OVERLAY_WORK" -type f -path '\''*/authorized_keys'\''' \
-  'This artifact is not AX9000 firmware'; do
-  assert_contains "$required_text" "$BUILD_SCRIPT"
-done
-
-assert_not_contains 'VM_SMOKE_AUTHORIZED_KEY_FILE is required in release mode' "$BUILD_SCRIPT"
-
-for required_text in \
-  'Usage: test-vm-release.sh x86-64' \
-  'qemu-system-x86_64' \
-  'hostfwd=tcp:127.0.0.1:${HTTP_PORT}-:80,hostfwd=tcp:127.0.0.1:${SSH_PORT}-:22' \
-  'serial_has_release_labels' \
-  'serial_has_ssh_runtime_evidence' \
-  'probe_no_ssh_service' \
-  'NEXAWRT_VM_SSH_RUNTIME_EVIDENCE_V1_BEGIN' \
-  'ARTIFACT_CLASS=VM_DISTRIBUTION_IMAGE' \
-  'VM_ONLY=1' \
-  'NOT_AX9000_FIRMWARE=1' \
-  'HARDWARE_VALIDATION=0' \
-  'NSS_VALIDATION=0' \
-  'NEXAWRT_VM_RELEASE_METADATA_V1_BEGIN' \
-  'SSH_DEFAULT=disabled' \
-  'NEXAWRT_VM_RELEASE_METADATA_V1_END' \
-  'exact_release_image=true' \
-  'qemu_boot_result="UNVERIFIED"' \
-  'qemu_boot_result="FAIL"' \
-  'qemu_boot_result="PASS"' \
-  "printf 'qemu_boot=%s\\n' \"\$qemu_boot_result\"" \
-  'QEMU exited after completing release checks but before PASS report generation' \
-  'ssh_result="UNVERIFIED"' \
-  'authorized_keys_result="UNVERIFIED"' \
-  'dropbear_enabled_result="UNVERIFIED"' \
-  'dropbear_running_result="UNVERIFIED"' \
-  'ssh_runtime_evidence=PASS' \
-  'ssh_port_probe=PASS' \
-  'ssh_result="DISABLED_BY_DEFAULT"' \
-  'authorized_keys_result="ABSENT"' \
-  'dropbear_enabled_result="NO"' \
-  'dropbear_running_result="NO"' \
-  "printf 'ssh=%s\\n' \"\$ssh_result\"" \
-  "printf 'authorized_keys=%s\\n' \"\$authorized_keys_result\"" \
-  "printf 'dropbear_enabled=%s\\n' \"\$dropbear_enabled_result\"" \
-  "printf 'dropbear_running=%s\\n' \"\$dropbear_running_result\"" \
-  'http_result=PASS' \
-  'serial_labels=PASS'; do
-  assert_contains "$required_text" "$RELEASE_SCRIPT"
-done
-assert_not_contains 'ssh_result="DISABLED_BY_DEFAULT"' <(sed -n '/write_report()/,/^}/p' "$RELEASE_SCRIPT")
-
-python3 - "$RELEASE_OVERLAY/etc/uci-defaults/10-vm-release" "$RELEASE_SCRIPT" <<'PY_RUNTIME_CONTRACT'
-import pathlib
-import sys
-
-init_path = pathlib.Path(sys.argv[1])
-release_path = pathlib.Path(sys.argv[2])
-init_text = init_path.read_text(encoding="utf-8")
-release_text = release_path.read_text(encoding="utf-8")
-
-
-def init_contract(text: str) -> bool:
-    stop = "/etc/init.d/dropbear stop >/dev/null 2>&1"
-    disable = "/etc/init.d/dropbear disable >/dev/null 2>&1"
-    required = (
-        stop,
-        disable,
-        "if /etc/init.d/dropbear enabled >/dev/null 2>&1; then",
-        "if pidof dropbear >/dev/null 2>&1; then",
-        'if [ -s "$AUTHORIZED_KEYS" ]; then',
-        "NEXAWRT_VM_SSH_RUNTIME_EVIDENCE_V1_BEGIN",
-        "ssh=DISABLED_BY_DEFAULT",
-        "authorized_keys=ABSENT",
-        "dropbear_enabled=NO",
-        "dropbear_running=NO",
-        "NEXAWRT_VM_SSH_RUNTIME_EVIDENCE_V1_END",
-        'cat "$RELEASE_METADATA" >/dev/console',
-        'cat "$EVIDENCE_FILE" >/dev/console',
-    )
-    return (
-        all(item in text for item in required)
-        and "|| true" not in text
-        and text.index(stop) < text.index(disable)
-        and text.index(disable) < text.index("if /etc/init.d/dropbear enabled")
-        and text.index('if [ -s "$AUTHORIZED_KEYS" ]; then')
-        < text.index('if [ ! -f "$RELEASE_METADATA" ] || [ -L "$RELEASE_METADATA" ]; then')
-        < text.index('cat "$RELEASE_METADATA" >/dev/console')
-        < text.index('cat >"$EVIDENCE_TMP"')
-        < text.index('cat "$EVIDENCE_FILE" >/dev/console')
-    )
-
-
-def release_contract(text: str) -> bool:
-    required = (
-        "serial_has_ssh_runtime_evidence()",
-        "probe_no_ssh_service()",
-        "hostfwd=tcp:127.0.0.1:${SSH_PORT}-:22",
-        'qemu_boot_result="UNVERIFIED"',
-        'qemu_boot_result="FAIL"',
-        'qemu_boot_result="PASS"',
-        "printf 'qemu_boot=%s\\n' \"$qemu_boot_result\"",
-        'fail "QEMU exited after completing release checks but before PASS report generation"',
-        'ssh_result="UNVERIFIED"',
-        'authorized_keys_result="UNVERIFIED"',
-        'dropbear_enabled_result="UNVERIFIED"',
-        'dropbear_running_result="UNVERIFIED"',
-        'ssh_runtime_evidence=PASS',
-        'ssh_port_probe=PASS',
-        'ssh_result="DISABLED_BY_DEFAULT"',
-        'authorized_keys_result="ABSENT"',
-        'dropbear_enabled_result="NO"',
-        'dropbear_running_result="NO"',
-        "printf 'ssh=%s\\n' \"$ssh_result\"",
-        "printf 'authorized_keys=%s\\n' \"$authorized_keys_result\"",
-        "printf 'dropbear_enabled=%s\\n' \"$dropbear_enabled_result\"",
-        "printf 'dropbear_running=%s\\n' \"$dropbear_running_result\"",
-    )
-    if not all(item in text for item in required):
-        return False
-    report_body = text[text.index("write_report()") : text.index("cleanup()")]
-    qemu_started = text.index("QEMU_PID=$!")
-    qemu_failed_closed = text.index('qemu_boot_result="FAIL"', qemu_started)
-    final_ssh_gate = text.index('[[ "$ssh_port_probe" == PASS ]] ||')
-    final_alive_gate = text.index(
-        'fail "QEMU exited after completing release checks but before PASS report generation"'
-    )
-    qemu_pass = text.index('qemu_boot_result="PASS"', final_alive_gate)
-    pass_report = text.index("write_report PASS", qemu_pass)
-    return (
-        'ssh_result="DISABLED_BY_DEFAULT"' not in report_body
-        and 'qemu_boot_result="PASS"' not in report_body
-        and qemu_started < qemu_failed_closed
-        and qemu_failed_closed < final_ssh_gate < final_alive_gate < qemu_pass < pass_report
-    )
-
-
-if not init_contract(init_text):
-    raise SystemExit("positive init runtime contract failed")
-if not release_contract(release_text):
-    raise SystemExit("positive host runtime contract failed")
-
-negative_init_mutations = {
-    "stop errors swallowed": init_text.replace(
-        "/etc/init.d/dropbear stop >/dev/null 2>&1",
-        "/etc/init.d/dropbear stop >/dev/null 2>&1 || true",
-        1,
-    ),
-    "authorized_keys check removed": init_text.replace(
-        'if [ -s "$AUTHORIZED_KEYS" ]; then',
-        'if [ ! -e "$AUTHORIZED_KEYS" ]; then',
-        1,
-    ),
-    "runtime evidence field removed": init_text.replace("authorized_keys=ABSENT\n", "", 1),
-}
-for name, mutated in negative_init_mutations.items():
-    if init_contract(mutated):
-        raise SystemExit(f"negative init runtime contract unexpectedly passed: {name}")
-
-negative_release_mutations = {
-    "guest 22 forwarding removed": release_text.replace(
-        ",hostfwd=tcp:127.0.0.1:${SSH_PORT}-:22", "", 1
-    ),
-    "SSH probe removed": release_text.replace("probe_no_ssh_service()", "probe_removed()", 1),
-    "SSH success preinitialized": release_text.replace(
-        'ssh_result="UNVERIFIED"', 'ssh_result="DISABLED_BY_DEFAULT"', 1
-    ),
-    "QEMU success preinitialized": release_text.replace(
-        'qemu_boot_result="UNVERIFIED"', 'qemu_boot_result="PASS"', 1
-    ),
-    "QEMU final liveness gate removed": release_text.replace(
-        'fail "QEMU exited after completing release checks but before PASS report generation"',
-        'fail "QEMU liveness gate removed"',
-        1,
-    ),
-    "qemu_boot report field removed": release_text.replace(
-        "printf 'qemu_boot=%s\\n' \"$qemu_boot_result\"", "", 1
-    ),
-    "authorized_keys report field removed": release_text.replace(
-        "printf 'authorized_keys=%s\\n' \"$authorized_keys_result\"", "", 1
-    ),
-}
-for name, mutated in negative_release_mutations.items():
-    if release_contract(mutated):
-        raise SystemExit(f"negative host runtime contract unexpectedly passed: {name}")
-PY_RUNTIME_CONTRACT
-
-while read -r action_use; do
-  [[ "$action_use" =~ @[0-9a-f]{40}$ ]] || fail "workflow action is not pinned to a full commit: $action_use"
-done < <(sed -nE 's/^[[:space:]]*uses:[[:space:]]*([^ #]+).*/\1/p' "$RELEASE_WORKFLOW")
-
-for required_text in \
-  "name: NexaWrt x86_64 VM release" \
-  "- 'vm-x86_64-v*'" \
-  'workflow_dispatch:' \
-  'version:' \
-  'test "$GITHUB_REF" = refs/heads/main' \
-  'test "$GITHUB_SHA" = "$(git rev-parse refs/remotes/origin/main)"' \
-  'gh api --method POST "repos/$GITHUB_REPOSITORY/git/refs"' \
-  '-f ref="refs/tags/$release_tag"' \
-  'permissions: {}' \
-  'contents: write' \
-  'id-token: write' \
-  'attestations: write' \
-  'IMMUTABLE_RELEASES_READ_TOKEN' \
-  'repos/$GITHUB_REPOSITORY/immutable-releases' \
-  'tag_pattern=' \
-  'git merge-base --is-ancestor' \
-  './scripts/build-vm-image.sh x86-64 release "$RELEASE_TAG"' \
-  './scripts/test-vm-release.sh x86-64' \
-  'grep -Fxq '\''status=PASS'\''' \
-  'grep -Fxq '\''exact_release_image=true'\''' \
-  'actions/attest-build-provenance@96278af6caaf10aea03fd8d33a09a777ca52d62f' \
-  'image.provenance.bundle.json' \
-  'checksums.provenance.bundle.json' \
-  'gh release create "$RELEASE_TAG" --verify-tag --draft --prerelease --latest=false' \
-  'gh release upload "$RELEASE_TAG" "$asset"' \
-  'asset whitelist mismatch' \
-  'release.get("immutable") is not True'; do
-  assert_contains "$required_text" "$RELEASE_WORKFLOW"
-done
-
-python3 - "$RELEASE_WORKFLOW" <<'PY_STAGE_SMOKE_GATES'
-import pathlib
-import sys
-
-workflow_path = pathlib.Path(sys.argv[1])
-lines = workflow_path.read_text(encoding="utf-8").splitlines()
-step_name = "- name: Stage exact white-listed release assets"
-try:
-    start = next(index for index, line in enumerate(lines) if line.strip() == step_name)
-except StopIteration:
-    raise SystemExit(f"VM release policy test failed: workflow is missing stage step: {step_name}")
-
-step_indent = len(lines[start]) - len(lines[start].lstrip())
-end = len(lines)
-for index in range(start + 1, len(lines)):
-    stripped = lines[index].strip()
-    indent = len(lines[index]) - len(lines[index].lstrip())
-    if indent == step_indent and stripped.startswith("- name:"):
-        end = index
-        break
-
-stage_commands = {line.strip() for line in lines[start:end]}
-report = '"$RELEASE_RESULTS_DIR/smoke-report.txt"'
-required_greps = {
-    f"grep -Fxq 'qemu_boot=PASS' {report}",
-    f"grep -Fxq 'ssh_runtime_evidence=PASS' {report}",
-    f"grep -Fxq 'ssh_port_probe=PASS' {report}",
-    f"grep -Fxq 'ssh=DISABLED_BY_DEFAULT' {report}",
-    f"grep -Fxq 'authorized_keys=ABSENT' {report}",
-    f"grep -Fxq 'dropbear_enabled=NO' {report}",
-    f"grep -Fxq 'dropbear_running=NO' {report}",
-}
-missing = sorted(required_greps - stage_commands)
-if missing:
-    formatted = "\n".join(f"  - {command}" for command in missing)
-    raise SystemExit(
-        "VM release policy test failed: Stage exact white-listed release assets "
-        f"is missing exact smoke-report gates:\n{formatted}"
-    )
-PY_STAGE_SMOKE_GATES
-
-[[ "$(grep -Fc 'actions/attest-build-provenance@96278af6caaf10aea03fd8d33a09a777ca52d62f' "$RELEASE_WORKFLOW")" == 2 ]] || \
-  fail "VM release workflow must create exactly two attestations"
-assert_not_contains "- 'ram-test-v*'" "$RELEASE_WORKFLOW"
-assert_not_contains "- 'ram-test-nss-v*'" "$RELEASE_WORKFLOW"
-
-python3 - "$RELEASE_WORKFLOW" <<'PY'
+python3 - "$RUNTIME_SCRIPT" <<'PY'
 import pathlib
 import re
 import sys
 
 text = pathlib.Path(sys.argv[1]).read_text(encoding="utf-8")
-expected_assets = {
-    "$IMAGE_BASENAME",
-    "${IMAGE_BASENAME}.sha256",
-    "$MANIFEST_BASENAME",
-    "artifact-labels.env",
-    "README-VM.txt",
-    "smoke-report.txt",
-    "SHA256SUMS",
-    "image.provenance.bundle.json",
-    "checksums.provenance.bundle.json",
+match = re.search(r"^write_report\(\) \{\n(?P<body>.*?)^\}", text, re.MULTILINE | re.DOTALL)
+if match is None:
+    raise SystemExit("write_report() not found")
+keys = re.findall(r"printf '([a-z0-9_]+)=", match.group("body"))
+expected = {
+    "status", "target", "release_contract", "vm_only", "not_ax9000_firmware",
+    "hardware_validation", "nss_validation", "exact_release_image", "serial_labels", "http",
+    "ssh_runtime_evidence", "ssh_port_probe", "ssh", "authorized_keys", "dropbear_enabled",
+    "dropbear_running", "http_status", "auth_challenge", "http_host_port", "ssh_host_port",
+    "serial_log", "ssh_probe_log", "raw_bios_file", "raw_bios_qemu", "iso_bios_file",
+    "iso_bios_qemu", "iso_efi_file", "iso_efi_qemu", "vmdk_bios_file", "vmdk_bios_qemu",
+    "vmdk_efi_file", "vmdk_efi_qemu", "esxi_validation",
 }
-for asset in expected_assets:
-    if asset not in text:
-        raise SystemExit(f"VM release policy test failed: whitelist asset missing from workflow: {asset}")
-if "ram-test" in re.sub(r"ram-test-\*\|ram-test-nss-\*", "", text):
-    # The workflow may reject ram-test-* in a case pattern but must not publish that channel.
-    allowed = "ram-test-*|ram-test-nss-*|*AX9000*|*ax9000*)"
-    if allowed not in text:
-        raise SystemExit("VM release policy test failed: unexpected ram-test usage")
+if len(keys) != len(set(keys)) or set(keys) != expected:
+    raise SystemExit(f"write_report exact keys mismatch: keys={keys!r}")
+if "image" in keys or "qemu_boot" in keys:
+    raise SystemExit("v1-only report keys remain")
 PY
 
-for required_text in \
-  'vm-x86_64-vX.Y.Z-rc.N' \
-  'NexaWrt-x86_64-v0.1.0-rc.1-generic-ext4-combined.img.gz' \
-  'sha256sum -c' \
-  'qemu-system-x86_64' \
-  'http://127.0.0.1:8080/cgi-bin/luci/' \
-  'Remote SSH' \
-  'VM_ONLY=1' \
-  'NOT_AX9000_FIRMWARE=1' \
-  'HARDWARE_VALIDATION=0' \
-  'NSS_VALIDATION=0' \
-  '不能直接等同于“可以安全刷机”'; do
-  assert_contains "$required_text" "$DOC"
+# Workflow contract and supply-chain/release gates.
+for text in \
+  'runs-on: ubuntu-24.04' \
+  'timeout-minutes: 180' \
+  'genisoimage' \
+  'qemu-utils' \
+  'ovmf' \
+  './scripts/test-vm-release.sh x86-64 "$ARTIFACT_DIR"' \
+  'RELEASE_CONTRACT="vm-x86_64/v2"' \
+  'ARTIFACT_CLASS="VM_DISTRIBUTION_SET"' \
+  'PUBLISHED_VARIANTS="raw_bios,iso_bios,iso_efi,vmdk_bios,vmdk_efi"' \
+  'ESXI_VALIDATION="not-tested"' \
+  'VALIDATION_SCOPE="QEMU_RUNTIME_ALL_VARIANTS"' \
+  'data.get("create-type") == "streamOptimized"' \
+  'qemu-img check -f vmdk "$ARTIFACT_DIR/$vmdk"' \
+  'release_contract": "vm-x86_64/v2"' \
+  'raw_bios_qemu": "runtime-pass"' \
+  'iso_bios_qemu": "runtime-pass"' \
+  'iso_efi_qemu": "runtime-pass"' \
+  'vmdk_bios_qemu": "runtime-pass"' \
+  'vmdk_efi_qemu": "runtime-pass"' \
+  'esxi_validation": "not-tested"' \
+  '(values["http_status"], values["auth_challenge"]) not in {("200", "false"), ("403", "true")}' \
+  '1024 <= int(values[key]) <= 65535' \
+  'expected_result_dir = report_path.parent / "raw_bios"' \
+  'test "$(find "$PUBLISH_DIR" -maxdepth 1 -type f | wc -l)" -eq 15' \
+  'Verify exact 21-asset whitelist' \
+  'raw-bios.provenance.bundle.json' \
+  'iso-bios.provenance.bundle.json' \
+  'iso-efi.provenance.bundle.json' \
+  'vmdk-bios.provenance.bundle.json' \
+  'vmdk-efi.provenance.bundle.json' \
+  'checksums.provenance.bundle.json' \
+  'immutable-releases' \
+  'persist-credentials: false' \
+  'test "$remote_sha" = "$EXPECTED_SOURCE_SHA"' \
+  'release.get("immutable") is not True'; do
+  assert_contains "$text" "$WORKFLOW"
 done
+assert_not_contains 'IMAGE_BASENAME' "$WORKFLOW"
+assert_not_contains 'VM_DISTRIBUTION_IMAGE' "$WORKFLOW"
+assert_not_contains '"image",' "$WORKFLOW"
+assert_not_contains '"qemu_boot",' "$WORKFLOW"
 
-policy_tmp="$(mktemp -d)"
-trap 'rm -rf "$policy_tmp"' EXIT
-printf 'not-an-image\n' > "$policy_tmp/image.img.gz"
-if /bin/bash "$BUILD_SCRIPT" armsr-armv8 release vm-x86_64-v0.1.0-rc.1 >"$policy_tmp/build-armsr-release.out" 2>&1; then
-  fail "build script accepted armsr release mode"
-fi
-if /bin/bash "$BUILD_SCRIPT" x86-64 release ram-test-v0.1.0-rc.1 >"$policy_tmp/build-ram-tag.out" 2>&1; then
-  fail "build script accepted AX9000 ram-test tag as a VM release tag"
-fi
-if VM_RELEASE_OUTPUT_DIR="$policy_tmp/release-results" /bin/bash "$RELEASE_SCRIPT" armsr-armv8 "$policy_tmp/image.img.gz" >"$policy_tmp/test-armsr-release.out" 2>&1; then
-  fail "release test script accepted non-x86 target"
-fi
-FAIL_REPORT="$policy_tmp/release-results/smoke-report.txt"
-assert_contains 'status=FAIL' "$FAIL_REPORT"
-assert_contains 'qemu_boot=UNVERIFIED' "$FAIL_REPORT"
-assert_not_contains 'qemu_boot=PASS' "$FAIL_REPORT"
+python3 - "$WORKFLOW" <<'PY'
+import pathlib
+import re
+import sys
 
-"$MANIFEST_SELECTION_TEST"
+text = pathlib.Path(sys.argv[1]).read_text(encoding="utf-8")
+attest = re.findall(r"uses: actions/attest-build-provenance@([0-9a-f]{40})", text)
+if len(attest) != 6 or len(set(attest)) != 1:
+    raise SystemExit(f"workflow must contain six identically pinned provenance actions: {attest!r}")
+match = re.search(r'expected_assets="(?P<body>.*?)"\n\s+EXPECTED_ASSETS=', text, re.DOTALL)
+if match is None:
+    raise SystemExit("exact asset whitelist block not found")
+assets = [line.strip() for line in match.group("body").splitlines() if line.strip()]
+if len(assets) != 21 or len(set(assets)) != 21:
+    raise SystemExit(f"workflow whitelist is not exactly 21 unique assets: {assets!r}")
+if text.count('subject-path:') != 6:
+    raise SystemExit("workflow must attest five images plus SHA256SUMS")
+if 'ESXI_VALIDATION="tested"' in text or 'ESXI_VALIDATION=tested' in text:
+    raise SystemExit("workflow falsely claims ESXi validation")
+PY
 
 printf 'VM release policy tests passed.\n'

@@ -262,11 +262,30 @@ footer p { margin: 0; text-align: center; }
   box-shadow: 0 0 0 28px rgba(95, 196, 255, .03), 0 0 0 58px rgba(95, 196, 255, .018);
 }
 .vm-card .flavor-dot { background: #5fc4ff; box-shadow: 0 0 12px rgba(95, 196, 255, .6); }
+
+.vm-card .download-actions {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+.vm-card .download-actions .vm-download {
+  color: #071017;
+  border-color: #5fc4ff;
+  background: #5fc4ff;
+}
+.vm-card .download-actions .vm-download:hover {
+  border-color: #d9f4ff;
+  background: #8dd8ff;
+}
+.vm-card .download-actions .vm-support-download {
+  color: #b8e8ff;
+  border-color: rgba(95, 196, 255, .35);
+  background: rgba(95, 196, 255, .06);
+}
 .release-badge.vm-only { border-color: rgba(95, 196, 255, .35); color: #8dd8ff; }
 .vm-history-panel { margin-top: 34px; }
 .history-flavor.vm { color: #8dd8ff; border-color: rgba(95, 196, 255, .28); }
 
 @media (max-width: 600px) {
   .vm-card { width: 100%; }
+  .vm-card .download-actions { grid-template-columns: 1fr; }
   .vm-safety-label { white-space: nowrap; }
 }

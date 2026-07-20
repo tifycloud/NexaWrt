@@ -31,7 +31,7 @@ CHANNEL = "ram-test"
 VERSION_PATTERN = re.compile(
     r"^v(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)-rc\.(?:0|[1-9][0-9]*)$"
 )
-PROOF_SCHEMA_VERSION = 3
+PROOF_SCHEMA_VERSION = 4
 TRUSTED_REF = "refs/heads/main"
 SIGNER_WORKFLOW = f"{REPOSITORY}/.github/workflows/release.yml"
 VM_SIGNER_WORKFLOW = f"{REPOSITORY}/.github/workflows/vm-release.yml"
@@ -41,17 +41,32 @@ VM_DOCS_URL = f"{WEB_ROOT}/blob/main/docs/VM-X86_64.md"
 HEX_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 HEX_SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 VERIFIED_SUBJECTS = ["archive", "checksums", "firmware", "sbom"]
-VM_VERIFIED_SUBJECTS = ["image", "checksums"]
+VM_CONTRACT_V1 = 1
+VM_CONTRACT_V2 = 2
+VM_VARIANTS = ("raw_bios", "iso_bios", "iso_efi", "vmdk_bios", "vmdk_efi")
+VM_VERIFIED_SUBJECTS = {
+    VM_CONTRACT_V1: ["image", "checksums"],
+    VM_CONTRACT_V2: [*VM_VARIANTS, "checksums"],
+}
 PROVENANCE_ASSETS = {
     "provenance_archive": "archive.provenance.bundle.json",
     "provenance_checksums": "checksums.provenance.bundle.json",
     "provenance_firmware": "firmware.provenance.bundle.json",
     "provenance_sbom": "sbom.provenance.bundle.json",
 }
-VM_PROVENANCE_ASSETS = {
+VM_V1_PROVENANCE_ASSETS = {
     "provenance_image": "image.provenance.bundle.json",
     "provenance_checksums": "checksums.provenance.bundle.json",
 }
+VM_V2_PROVENANCE_ASSETS = {
+    "provenance_raw_bios": "raw-bios.provenance.bundle.json",
+    "provenance_iso_bios": "iso-bios.provenance.bundle.json",
+    "provenance_iso_efi": "iso-efi.provenance.bundle.json",
+    "provenance_vmdk_bios": "vmdk-bios.provenance.bundle.json",
+    "provenance_vmdk_efi": "vmdk-efi.provenance.bundle.json",
+    "provenance_checksums": "checksums.provenance.bundle.json",
+}
+
 
 
 def parse_args() -> argparse.Namespace:
@@ -93,7 +108,7 @@ def read_limited(stream: Any) -> bytes:
 def fetch_releases(token: str | None) -> Any:
     headers = {
         "Accept": "application/vnd.github+json",
-        "User-Agent": "NexaWrt-Pages-Release-Index/3",
+        "User-Agent": "NexaWrt-Pages-Release-Index/4",
         "X-GitHub-Api-Version": "2026-03-10",
     }
     if token:
@@ -204,7 +219,9 @@ def load_proofs(path: Path, metadata: dict[str, Any]) -> dict[str, dict[str, dic
     vm_entries = virtual_images[VM_PLATFORM]
     if not isinstance(vm_entries, dict) or len(vm_entries) > 100:
         raise ValueError("proof manifest VM releases must be an object of at most 100 entries")
-    vm_expected_proof = {"release_id", "source_digest", "assets", "verified_subjects"}
+    vm_expected_proof = {
+        "release_id", "source_digest", "contract_version", "assets", "verified_subjects", "validation",
+    }
     vm_validated: dict[str, dict[str, Any]] = {}
     seen_vm_release_ids: set[int] = set()
     seen_vm_asset_ids: set[int] = set()
@@ -212,6 +229,9 @@ def load_proofs(path: Path, metadata: dict[str, Any]) -> dict[str, dict[str, dic
         version = vm_identity(tag)
         if version is None or not isinstance(proof, dict) or set(proof) != vm_expected_proof:
             raise ValueError(f"VM proof entry is invalid: {tag}")
+        contract_version = proof["contract_version"]
+        if isinstance(contract_version, bool) or contract_version not in (VM_CONTRACT_V1, VM_CONTRACT_V2):
+            raise ValueError(f"VM proof contract version is invalid: {tag}")
         release_id = proof["release_id"]
         if (isinstance(release_id, bool) or not isinstance(release_id, int) or release_id <= 0 or
                 release_id in seen_vm_release_ids):
@@ -219,9 +239,12 @@ def load_proofs(path: Path, metadata: dict[str, Any]) -> dict[str, dict[str, dic
         seen_vm_release_ids.add(release_id)
         if not isinstance(proof["source_digest"], str) or not HEX_SHA_RE.fullmatch(proof["source_digest"]):
             raise ValueError(f"VM proof source digest is invalid: {tag}")
-        if proof["verified_subjects"] != VM_VERIFIED_SUBJECTS:
+        if proof["verified_subjects"] != VM_VERIFIED_SUBJECTS[contract_version]:
             raise ValueError(f"VM proof subjects are incomplete: {tag}")
-        validated_assets = validate_vm_asset_proofs(proof["assets"], vm_expected_assets(version), tag)
+        validate_vm_validation(proof["validation"], contract_version, tag)
+        validated_assets = validate_vm_asset_proofs(
+            proof["assets"], vm_expected_assets(version, contract_version), tag,
+        )
         asset_ids = {asset["id"] for asset in validated_assets.values()}
         if asset_ids & seen_vm_asset_ids:
             raise ValueError(f"VM proof asset ID is replayed across releases: {tag}")
@@ -277,20 +300,53 @@ def expected_assets(metadata: dict[str, Any], flavor: str, version: str) -> dict
     }
 
 
-def vm_expected_assets(version: str) -> dict[str, str]:
-    image = f"NexaWrt-x86_64-{version}-generic-ext4-combined.img.gz"
-    manifest = f"{image[:-len('.img.gz')]}.manifest"
-    return {
-        "image": image,
-        "image_checksum": f"{image}.sha256",
-        "manifest": manifest,
+def vm_expected_assets(version: str, contract_version: int = VM_CONTRACT_V1) -> dict[str, str]:
+    prefix = f"NexaWrt-x86_64-{version}"
+    raw_bios = f"{prefix}-generic-ext4-combined.img.gz"
+    if contract_version == VM_CONTRACT_V1:
+        return {
+            "image": raw_bios,
+            "image_checksum": f"{raw_bios}.sha256",
+            "manifest": f"{raw_bios[:-len('.img.gz')]}.manifest",
+            "artifact_labels": "artifact-labels.env",
+            "readme": "README-VM.txt",
+            "smoke_report": "smoke-report.txt",
+            "checksums": "SHA256SUMS",
+            **VM_V1_PROVENANCE_ASSETS,
+        }
+    if contract_version != VM_CONTRACT_V2:
+        raise ValueError(f"unsupported VM release contract: {contract_version}")
+    variants = {
+        "raw_bios": raw_bios,
+        "iso_bios": f"{prefix}-generic-image.iso",
+        "iso_efi": f"{prefix}-generic-image-efi.iso",
+        "vmdk_bios": f"{prefix}-generic-ext4-combined.vmdk",
+        "vmdk_efi": f"{prefix}-generic-ext4-combined-efi.vmdk",
+    }
+    result: dict[str, str] = {}
+    for key, name in variants.items():
+        result[key] = name
+        result[f"{key}_checksum"] = f"{name}.sha256"
+    result.update({
+        "manifest": f"{prefix}-generic.manifest",
         "artifact_labels": "artifact-labels.env",
         "readme": "README-VM.txt",
         "smoke_report": "smoke-report.txt",
         "checksums": "SHA256SUMS",
-        **VM_PROVENANCE_ASSETS,
-    }
+        **VM_V2_PROVENANCE_ASSETS,
+    })
+    return result
 
+
+def validate_vm_validation(value: Any, contract_version: int, tag: str) -> dict[str, Any]:
+    expected_variants = ("raw_bios",) if contract_version == VM_CONTRACT_V1 else VM_VARIANTS
+    if not isinstance(value, dict) or set(value) != {"qemu", "esxi"} or value.get("esxi") != "not-tested":
+        raise ValueError(f"VM proof validation policy is invalid: {tag}")
+    qemu = value.get("qemu")
+    if (not isinstance(qemu, dict) or set(qemu) != set(expected_variants) or
+            any(result != "runtime-pass" for result in qemu.values())):
+        raise ValueError(f"VM proof QEMU validation is invalid: {tag}")
+    return value
 
 def safe_download_url(tag: str, asset_name: str) -> str:
     return f"{WEB_ROOT}/releases/download/{quote(tag, safe='')}/{quote(asset_name, safe='')}"
@@ -389,8 +445,9 @@ def sanitize_vm_release(raw: Any, proofs: dict[str, dict[str, Any]]) -> dict[str
         return None
     if proof["release_id"] != release_id:
         return None
+    contract_version = proof["contract_version"]
     assets = raw.get("assets")
-    expected = vm_expected_assets(version)
+    expected = vm_expected_assets(version, contract_version)
     if not isinstance(assets, list) or len(assets) != len(expected):
         return None
     allowed_by_name = {name: key for key, name in expected.items()}
@@ -415,21 +472,32 @@ def sanitize_vm_release(raw: Any, proofs: dict[str, dict[str, Any]]) -> dict[str
         identity = proof_assets[key]
         if identity["id"] != asset_id or identity["name"] != name or identity["size"] != size:
             return None
+        expected_digest = f"sha256:{identity['sha256']}"
         remote_digest = asset.get("digest")
-        if remote_digest is not None and remote_digest != f"sha256:{identity['sha256']}":
+        if (contract_version == VM_CONTRACT_V2 and remote_digest != expected_digest) or (
+                contract_version == VM_CONTRACT_V1 and remote_digest is not None and remote_digest != expected_digest):
             return None
-        present[key] = {"name": name, "url": safe_download_url(tag, name), "size": size}
+        present[key] = {
+            "name": name,
+            "url": safe_download_url(tag, name),
+            "size": size,
+            "sha256": identity["sha256"],
+        }
     if remote_names != set(expected.values()) or set(present) != set(expected):
         return None
     return {
         "platform": VM_PLATFORM,
-        "artifact_class": "VM_DISTRIBUTION_IMAGE",
+        "artifact_class": "VM_DISTRIBUTION_IMAGE" if contract_version == VM_CONTRACT_V1 else "VM_DISTRIBUTION_SET",
+        "contract_version": contract_version,
+        "release_contract": "vm-x86_64/v1" if contract_version == VM_CONTRACT_V1 else "vm-x86_64/v2",
         "vm_only": True,
         "not_ax9000_firmware": True,
         "hardware_validation": False,
         "nss_validation": False,
         "qemu_validated": True,
+        "esxi_validation": "not-tested",
         "ssh_default": "disabled",
+        "validation": proof["validation"],
         "version": version,
         "tag": tag,
         "published_at": published_at,
@@ -438,7 +506,6 @@ def sanitize_vm_release(raw: Any, proofs: dict[str, dict[str, Any]]) -> dict[str
         "docs_url": VM_DOCS_URL,
         "assets": {key: present[key] for key in expected},
     }
-
 
 def version_order(version: str) -> tuple[int, int, int, int]:
     match = re.fullmatch(r"v([0-9]+)\.([0-9]+)\.([0-9]+)-rc\.([0-9]+)", version)
@@ -497,7 +564,7 @@ def build_document(
     device = public_device(metadata)
     devices = {device["id"]: device} if device["website_visible"] else {}
     return {
-        "schema_version": 3,
+        "schema_version": 4,
         "repository": REPOSITORY,
         "generated_at": generated_at,
         "devices": devices,
