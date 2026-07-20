@@ -72,6 +72,71 @@ while (($#)); do
   shift
 done
 
+COMPONENT_KCONFIG_FRAGMENT=""
+if [[ -n "${NEXAWRT_COMPONENTS:-}" || -n "${NEXAWRT_COMPONENT_TARGET:-}" ]]; then
+  [[ "${NEXAWRT_COMPONENT_TARGET:-}" == xiaomi_ax9000 ]] || {
+    echo "NEXAWRT_COMPONENT_TARGET must be xiaomi_ax9000 when components are enabled" >&2
+    exit 2
+  }
+  [[ "${NEXAWRT_COMPONENT_FLAVOR:-}" == official || "${NEXAWRT_COMPONENT_FLAVOR:-}" == nss ]] || {
+    echo "NEXAWRT_COMPONENT_FLAVOR must be official or nss when components are enabled" >&2
+    exit 2
+  }
+  [[ "${NEXAWRT_COMPONENT_CATALOG_VERSION:-}" =~ ^[0-9]{4}\.[0-9]{2}\.[0-9]{2}(\.[0-9]+)?$ ]] || {
+    echo "NEXAWRT_COMPONENT_CATALOG_VERSION must be a valid catalog version" >&2
+    exit 2
+  }
+  [[ "${NEXAWRT_COMPONENT_REQUEST_HASH:-}" =~ ^[0-9a-f]{64}$ ]] || {
+    echo "NEXAWRT_COMPONENT_REQUEST_HASH must be a full lowercase SHA256 value" >&2
+    exit 2
+  }
+  [[ ${#NEXAWRT_COMPONENTS} -le 1024 ]] || {
+    echo "NEXAWRT_COMPONENTS exceeds the bounded component ID list length" >&2
+    exit 2
+  }
+  if [[ -n "$NEXAWRT_COMPONENTS" ]]; then
+    [[ "$NEXAWRT_COMPONENTS" =~ ^[a-z0-9][a-z0-9_-]{0,63}(,[a-z0-9][a-z0-9_-]{0,63})*$ ]] || {
+      echo "Non-empty NEXAWRT_COMPONENTS accepts only comma-separated catalog component IDs" >&2
+      exit 2
+    }
+  fi
+  component_resolver_args=(--target xiaomi_ax9000 --flavor "$NEXAWRT_COMPONENT_FLAVOR")
+  if [[ -n "$NEXAWRT_COMPONENTS" ]]; then
+    IFS=',' read -r -a component_ids <<< "$NEXAWRT_COMPONENTS"
+    for component_id in "${component_ids[@]}"; do
+      component_resolver_args+=(--component "$component_id")
+    done
+  fi
+  COMPONENT_KCONFIG_FRAGMENT="$(
+    python3 "$ROOT_DIR/scripts/resolve-components.py" "${component_resolver_args[@]}" |
+      EXPECTED_FLAVOR="$NEXAWRT_COMPONENT_FLAVOR" \
+      EXPECTED_CATALOG_VERSION="$NEXAWRT_COMPONENT_CATALOG_VERSION" \
+      EXPECTED_REQUEST_HASH="$NEXAWRT_COMPONENT_REQUEST_HASH" \
+      python3 -c '
+import json, os, sys
+request = json.load(sys.stdin)
+if request.get("flavor") != os.environ["EXPECTED_FLAVOR"]:
+    raise SystemExit("component flavor mismatch")
+if request.get("catalog_version") != os.environ["EXPECTED_CATALOG_VERSION"]:
+    raise SystemExit("component catalog version mismatch")
+if request.get("request_hash") != os.environ["EXPECTED_REQUEST_HASH"]:
+    raise SystemExit("component request hash mismatch")
+sys.stdout.write(request["kconfig_fragment"])
+'
+  )" || {
+    echo "Component selection was rejected by the repository catalog" >&2
+    exit 2
+  }
+fi
+
+apply_component_kconfig() {
+  [[ -n "$COMPONENT_KCONFIG_FRAGMENT" ]] || return 0
+  {
+    printf '\n# NexaWrt allow-listed component selection\n'
+    printf '%s\n' "$COMPONENT_KCONFIG_FRAGMENT"
+  } >> .config
+}
+
 if [[ "$(uname -s)" == Darwin && "$WITH_FEEDS" == 1 && "${ALLOW_UNSUPPORTED_HOST:-0}" != 1 ]]; then
   cat >&2 <<'MSG'
 On macOS, use --no-feeds for patch/static validation and use the GitHub Actions
@@ -677,6 +742,7 @@ if ((WITH_FEEDS)); then
   # seed. make defconfig may regenerate feed indexes, which are removed before
   # the complete checkout/link policy is verified again.
   cp "$SEED_CONFIG" .config
+  apply_component_kconfig
   make defconfig
   remove_generated_feed_metadata
   feed_checkouts_match_locks && feed_top_level_matches_locks && \

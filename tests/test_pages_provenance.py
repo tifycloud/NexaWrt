@@ -293,6 +293,56 @@ def verify_vm_fixture(payloads: dict[str, bytes], version: str = "v0.1.0-rc.1", 
     finally:
         module.resolve_tag_commit, module.require_main_ancestor, module.download_asset, module.verify_vm_attestation = originals
 
+
+def verify_vm_stable_fixture(payloads: dict[str, bytes], source_proof: dict,
+                             *, mutate_body: str | None = None) -> tuple[str, dict]:
+    source_version = "v0.1.0-rc.1"
+    stable_version = "v0.1.0"
+    source_tag = f"vm-x86_64-{source_version}"
+    stable_tag = f"vm-x86_64-{stable_version}"
+    digest = "c" * 40
+    names = module.vm_expected_names(source_version, module.VM_CONTRACT_V2)
+    source_raw = {
+        "id": source_proof["release_id"], "tag_name": source_tag, "draft": False,
+        "prerelease": True, "immutable": True, "published_at": "2026-07-18T02:00:00Z",
+        "assets": [{"id": asset["id"], "name": asset["name"], "state": "uploaded", "size": asset["size"]}
+                   for asset in source_proof["assets"].values()],
+    }
+    body = "\n".join([
+        f"# NexaWrt x86_64 VM {stable_version}", "",
+        f"This stable release is an **in-place promotion of {source_tag}** after user-performed VMware ESXi acceptance.", "",
+        "## Byte and source identity",
+        f"- Stable tag: `{stable_tag}`",
+        f"- Source RC tag: `{source_tag}`",
+        f"- Source commit: `{digest}` (both tags point to this exact commit)",
+        f"- Evidence path: `evidence/vm-esxi/{source_tag}.json` at repository commit `{'d' * 40}`",
+    ])
+    if mutate_body is not None:
+        body = mutate_body
+    stable_raw = {
+        "id": 190, "tag_name": stable_tag, "target_commitish": digest,
+        "name": f"NexaWrt x86_64 VM {stable_version}", "body": body,
+        "draft": False, "prerelease": False, "immutable": True, "published_at": "2026-07-19T02:00:00Z",
+        "assets": [
+            {"id": 19000 + index, "name": name, "state": "uploaded", "size": len(payloads[name]),
+             "digest": f"sha256:{hashlib.sha256(payloads[name]).hexdigest()}"}
+            for index, name in enumerate(names.values(), 1)
+        ],
+    }
+    source_candidate = module.vm_candidate_assets(source_raw)
+    stable_candidate = module.vm_candidate_assets(stable_raw)
+    assert source_candidate is not None and stable_candidate is not None
+    originals = (module.resolve_tag_commit, module.require_main_ancestor, module.download_asset, module.verify_vm_stable_evidence)
+    try:
+        module.resolve_tag_commit = lambda gh, tag: digest
+        module.require_main_ancestor = lambda commit, trusted: None
+        module.download_asset = lambda gh, asset, destination, budget: (budget.reserve(asset["size"]), destination.write_bytes(payloads[asset["name"]]))
+        module.verify_vm_stable_evidence = lambda promotion, trusted, release_dir, published_at: None
+        return module.verify_vm_stable_candidate(Path("/trusted/gh"), stable_candidate, source_candidate,
+                                                 source_proof, "d" * 40, module.DownloadBudget())
+    finally:
+        module.resolve_tag_commit, module.require_main_ancestor, module.download_asset, module.verify_vm_stable_evidence = originals
+
 def main() -> None:
     archive = archive_bytes()
     archive_name = "NexaWrt-AX9000-official-v1.10.0-rc.1-verified-dist.tar.gz"
@@ -588,6 +638,26 @@ def main() -> None:
     assert v2_attested == [
         (v2_names[variant], v2_names[f"provenance_{variant}"]) for variant in module.VM_VARIANTS
     ] + [(v2_names["checksums"], v2_names["provenance_checksums"])]
+    stable_tag, stable_proof = verify_vm_stable_fixture(v2_payloads, v2_proof)
+    assert stable_tag == "vm-x86_64-v0.1.0"
+    assert stable_proof["source_rc_tag"] == v2_tag
+    assert stable_proof["source_rc_release_id"] == v2_proof["release_id"]
+    assert stable_proof["source_digest"] == v2_proof["source_digest"]
+    assert stable_proof["validation"] == {
+        "qemu": {variant: "runtime-pass" for variant in module.VM_VARIANTS},
+        "esxi": "validated",
+    }
+    assert all(
+        stable_proof["assets"][key][field] == v2_proof["assets"][key][field]
+        for key in stable_proof["assets"] for field in ("name", "size", "sha256")
+    )
+    assert all(stable_proof["assets"][key]["id"] != v2_proof["assets"][key]["id"] for key in stable_proof["assets"])
+    invalid_stable = {
+        "id": 191, "tag_name": "vm-x86_64-v0.1.0", "target_commitish": "c" * 40,
+        "name": "NexaWrt x86_64 VM v0.1.0", "body": "missing promotion bindings",
+        "draft": False, "prerelease": False, "immutable": True, "published_at": "2026-07-19T02:00:00Z", "assets": [],
+    }
+    assert module.vm_candidate_assets(invalid_stable) is None
     for key in ("RELEASE_CONTRACT", "PUBLISHED_VARIANTS", "ESXI_VALIDATION"):
         expect_verification_error(
             lambda key=key: verify_vm_fixture(

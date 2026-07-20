@@ -5,6 +5,8 @@ set -euo pipefail
 unset GITHUB_ACTIONS GITHUB_REF GITHUB_REPOSITORY GITHUB_RUN_ATTEMPT \
   GITHUB_RUN_ID GITHUB_SHA GITHUB_WORKFLOW_REF GITHUB_WORKFLOW_SHA
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+python3 "$ROOT_DIR/tests/test_component_catalog.py"
+"$ROOT_DIR/tests/test_custom_build_policy.sh"
 
 # Always exercise both static policies. If a source path is supplied, validate
 # it using the caller-selected flavor after the repository-only checks.
@@ -61,5 +63,7 @@ echo 'flavor policy: official default, isolated nss work tree, and official-only
 "$ROOT_DIR/tests/test_browser_build_policy.sh"
 "$ROOT_DIR/tests/test_vm_policy.sh"
 "$ROOT_DIR/tests/test_vm_release_policy.sh"
+# Includes strict identity-matched, idempotent stable-draft recovery coverage.
+"$ROOT_DIR/tests/test_vm_promotion_policy.sh"
 "$ROOT_DIR/tests/test_pages_policy.sh"
 "$ROOT_DIR/tests/test_workflow_policy.sh"

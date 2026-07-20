@@ -1,0 +1,584 @@
+name: Promote ESXi-accepted VM RC
+
+on:
+  workflow_dispatch:
+    inputs:
+      rc_tag:
+        description: 'Exact immutable RC tag, for example vm-x86_64-v0.1.0-rc.4'
+        required: true
+        type: string
+      evidence_path:
+        description: 'Committed JSON below evidence/vm-esxi/'
+        required: true
+        type: string
+
+permissions: {}
+
+concurrency:
+  group: nexawrt-vm-promote-${{ inputs.rc_tag }}
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  promote:
+    name: Verify human ESXi evidence and promote exact RC bytes
+    if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' && github.repository == 'tifycloud/NexaWrt'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    permissions:
+      contents: write
+    env:
+      RC_TAG: ${{ inputs.rc_tag }}
+      EVIDENCE_PATH: ${{ inputs.evidence_path }}
+    steps:
+      - name: Checkout exact main revision containing the evidence
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Initialize private promotion paths
+        run: |
+          set -euo pipefail
+          printf 'RC_DIR=%s/nexawrt-vm-rc\n' "$RUNNER_TEMP" >> "$GITHUB_ENV"
+          printf 'STABLE_DIR=%s/nexawrt-vm-stable-download\n' "$RUNNER_TEMP" >> "$GITHUB_ENV"
+
+      - name: Require repository immutable releases
+        env:
+          GH_TOKEN: ${{ secrets.IMMUTABLE_RELEASES_READ_TOKEN }}
+        run: |
+          set -euo pipefail
+          test -n "$GH_TOKEN"
+          gh api \
+            -H 'Accept: application/vnd.github+json' \
+            -H 'X-GitHub-Api-Version: 2026-03-10' \
+            "repos/$GITHUB_REPOSITORY/immutable-releases" \
+            --jq 'select(.enabled == true) | .enabled' | grep -Fxq true
+
+      - name: Bind dispatch, main, RC tag, commit, and immutable RC release
+        id: source
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          test "$GITHUB_EVENT_NAME" = workflow_dispatch
+          test "$GITHUB_REF" = refs/heads/main
+          test "$GITHUB_WORKFLOW" = 'Promote ESXi-accepted VM RC'
+          case "$GITHUB_WORKFLOW_REF" in
+            tifycloud/NexaWrt/.github/workflows/vm-promote.yml@refs/heads/main) ;;
+            *) echo "Unexpected workflow identity: $GITHUB_WORKFLOW_REF" >&2; exit 1 ;;
+          esac
+
+          rc_pattern='^vm-x86_64-(v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)-rc\.(0|[1-9][0-9]*))$'
+          [[ "$RC_TAG" =~ $rc_pattern ]] || { echo "Invalid VM RC tag: $RC_TAG" >&2; exit 1; }
+          rc_version="${BASH_REMATCH[1]}"
+          stable_version="${rc_version%%-rc.*}"
+          stable_tag="vm-x86_64-${stable_version}"
+
+          git fetch --force origin main:refs/remotes/origin/main "+refs/tags/$RC_TAG:refs/tags/$RC_TAG"
+          main_sha="$(gh api "repos/$GITHUB_REPOSITORY/git/ref/heads/main" --jq '.object.sha')"
+          test "$main_sha" = "$GITHUB_SHA"
+          test "$main_sha" = "$(git rev-parse HEAD)"
+          test "$main_sha" = "$(git rev-parse refs/remotes/origin/main)"
+
+          test "$(git cat-file -t "refs/tags/$RC_TAG")" = commit
+          rc_commit="$(git rev-parse "refs/tags/$RC_TAG")"
+          [[ "$rc_commit" =~ ^[0-9a-f]{40}$ ]]
+          remote_rc_type="$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$RC_TAG" --jq '.object.type')"
+          remote_rc_commit="$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$RC_TAG" --jq '.object.sha')"
+          test "$remote_rc_type" = commit
+          test "$remote_rc_commit" = "$rc_commit"
+          git merge-base --is-ancestor "$rc_commit" refs/remotes/origin/main
+
+          gh api \
+            -H 'Accept: application/vnd.github+json' \
+            -H 'X-GitHub-Api-Version: 2026-03-10' \
+            "repos/$GITHUB_REPOSITORY/releases/tags/$RC_TAG" > "$RUNNER_TEMP/rc-release.json"
+
+          python3 - "$RUNNER_TEMP/rc-release.json" "$RC_TAG" "$rc_version" "$rc_commit" "$RUNNER_TEMP/rc-assets.tsv" <<'PY'
+          import json
+          import re
+          import sys
+          from pathlib import Path
+
+          release_path, rc_tag, version, rc_commit, output_path = sys.argv[1:]
+          release = json.loads(Path(release_path).read_text(encoding="utf-8"))
+          if release.get("tag_name") != rc_tag:
+              raise SystemExit("RC release tag mismatch")
+          if release.get("draft") is not False or release.get("prerelease") is not True:
+              raise SystemExit("source release must be a published prerelease")
+          if release.get("immutable") is not True:
+              raise SystemExit("source RC release is not immutable")
+          if release.get("target_commitish") not in (rc_commit, "main"):
+              raise SystemExit("unexpected RC release target_commitish")
+          published_at = release.get("published_at")
+          if not isinstance(published_at, str) or not re.fullmatch(r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z", published_at):
+              raise SystemExit("RC release published_at is invalid")
+
+          prefix = f"NexaWrt-x86_64-{version}"
+          raw = f"{prefix}-generic-ext4-combined.img.gz"
+          iso_bios = f"{prefix}-generic-image.iso"
+          iso_efi = f"{prefix}-generic-image-efi.iso"
+          vmdk_bios = f"{prefix}-generic-ext4-combined.vmdk"
+          vmdk_efi = f"{prefix}-generic-ext4-combined-efi.vmdk"
+          expected = [
+              raw, f"{raw}.sha256",
+              iso_bios, f"{iso_bios}.sha256",
+              iso_efi, f"{iso_efi}.sha256",
+              vmdk_bios, f"{vmdk_bios}.sha256",
+              vmdk_efi, f"{vmdk_efi}.sha256",
+              f"{prefix}-generic.manifest",
+              "artifact-labels.env", "README-VM.txt", "smoke-report.txt", "SHA256SUMS",
+              "raw-bios.provenance.bundle.json", "iso-bios.provenance.bundle.json",
+              "iso-efi.provenance.bundle.json", "vmdk-bios.provenance.bundle.json",
+              "vmdk-efi.provenance.bundle.json", "checksums.provenance.bundle.json",
+          ]
+          assets = release.get("assets")
+          if not isinstance(assets, list) or len(assets) != len(expected):
+              raise SystemExit("RC release does not contain exactly 21 assets")
+          by_name = {}
+          ids = set()
+          for asset in assets:
+              name = asset.get("name")
+              asset_id = asset.get("id")
+              if name in by_name or not isinstance(asset_id, int) or isinstance(asset_id, bool) or asset_id <= 0 or asset_id in ids:
+                  raise SystemExit("RC release contains duplicate or invalid asset metadata")
+              if asset.get("state") != "uploaded" or not isinstance(asset.get("size"), int) or asset["size"] <= 0:
+                  raise SystemExit(f"RC asset is not fully uploaded: {name}")
+              by_name[name] = asset
+              ids.add(asset_id)
+          if set(by_name) != set(expected):
+              raise SystemExit("RC release asset names do not match vm-x86_64/v2")
+          with Path(output_path).open("w", encoding="utf-8", newline="\n") as handle:
+              for name in expected:
+                  handle.write(f"{by_name[name]['id']}\t{name}\n")
+          print(published_at)
+          PY
+          rc_published_at="$(tail -n 1 < <(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["published_at"])' "$RUNNER_TEMP/rc-release.json"))"
+
+          {
+            printf 'rc_version=%s\n' "$rc_version"
+            printf 'stable_version=%s\n' "$stable_version"
+            printf 'stable_tag=%s\n' "$stable_tag"
+            printf 'rc_commit=%s\n' "$rc_commit"
+            printf 'rc_published_at=%s\n' "$rc_published_at"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Download the exact immutable RC assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          umask 077
+          rm -rf "$RC_DIR"
+          mkdir -p "$RC_DIR"
+          while IFS=$'\t' read -r asset_id asset_name; do
+            [[ "$asset_id" =~ ^[1-9][0-9]*$ ]]
+            [[ "$asset_name" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]]
+            gh api \
+              -H 'Accept: application/octet-stream' \
+              -H 'X-GitHub-Api-Version: 2026-03-10' \
+              "repos/$GITHUB_REPOSITORY/releases/assets/$asset_id" > "$RC_DIR/$asset_name"
+            test -s "$RC_DIR/$asset_name"
+          done < "$RUNNER_TEMP/rc-assets.tsv"
+          test "$(find "$RC_DIR" -maxdepth 1 -type f | wc -l | tr -d ' ')" = 21
+
+      - name: Verify committed human ESXi evidence and RC SHA256SUMS
+        run: |
+          set -euo pipefail
+          python3 scripts/verify-vm-esxi-evidence.py \
+            --schema schemas/vm-esxi-evidence.schema.json \
+            --evidence "$EVIDENCE_PATH" \
+            --repo-root "$GITHUB_WORKSPACE" \
+            --release-dir "$RC_DIR" \
+            --rc-tag "$RC_TAG" \
+            --rc-commit '${{ steps.source.outputs.rc_commit }}' \
+            --rc-published-at '${{ steps.source.outputs.rc_published_at }}'
+          (
+            cd "$RC_DIR"
+            sha256sum --check SHA256SUMS
+            find . -maxdepth 1 -type f -printf '%f\n' | LC_ALL=C sort | while IFS= read -r name; do
+              printf '%s  %s\n' "$(sha256sum "$name" | cut -d' ' -f1)" "$name"
+            done > "$RUNNER_TEMP/rc-all-assets.sha256"
+          )
+          test "$(wc -l < "$RUNNER_TEMP/rc-all-assets.sha256" | tr -d ' ')" = 21
+
+      - name: Recheck trusted RC and evidence before stable mutation
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RC_COMMIT: ${{ steps.source.outputs.rc_commit }}
+        run: |
+          set -euo pipefail
+          git fetch --force origin main:refs/remotes/origin/main "+refs/tags/$RC_TAG:refs/tags/$RC_TAG"
+          test "$GITHUB_SHA" = "$(git rev-parse refs/remotes/origin/main)"
+          test "$RC_COMMIT" = "$(git rev-parse "refs/tags/$RC_TAG")"
+          test "$RC_COMMIT" = "$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$RC_TAG" --jq '.object.sha')"
+          test "$(gh api "repos/$GITHUB_REPOSITORY/releases/tags/$RC_TAG" --jq '.immutable')" = true
+          git diff --quiet HEAD -- "$EVIDENCE_PATH"
+          git diff --cached --quiet -- "$EVIDENCE_PATH"
+
+      - name: Create or resume only the strictly matching stable draft
+        id: stable
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RC_COMMIT: ${{ steps.source.outputs.rc_commit }}
+          STABLE_TAG: ${{ steps.source.outputs.stable_tag }}
+          STABLE_VERSION: ${{ steps.source.outputs.stable_version }}
+        run: |
+          set -euo pipefail
+          imported_vmdk="$(jq -r '.checks.vmdk_import.asset_name' "$EVIDENCE_PATH")"
+          tester="$(jq -r '.tester.github_login' "$EVIDENCE_PATH")"
+          tested_at="$(jq -r '.tested_at' "$EVIDENCE_PATH")"
+          esxi_version="$(jq -r '.esxi.version' "$EVIDENCE_PATH")"
+          esxi_build="$(jq -r '.esxi.build' "$EVIDENCE_PATH")"
+          cat > "$RUNNER_TEMP/stable-release-notes.md" <<EOF
+          # NexaWrt x86_64 VM ${STABLE_VERSION}
+
+          This stable release is an **in-place promotion of ${RC_TAG}** after user-performed VMware ESXi acceptance. No firmware or VM image was rebuilt.
+
+          ## Byte and source identity
+          - Stable tag: \`${STABLE_TAG}\`
+          - Source RC tag: \`${RC_TAG}\`
+          - Source commit: \`${RC_COMMIT}\` (both tags point to this exact commit)
+          - Evidence path: \`${EVIDENCE_PATH}\` at repository commit \`${GITHUB_SHA}\`
+          - All 21 release assets were downloaded from the immutable RC, verified against its \`SHA256SUMS\` plus the committed evidence, uploaded without modification, downloaded again, and byte-compared.
+          - Asset filenames intentionally retain the RC version suffix because changing packaged content or rebuilding is forbidden during promotion.
+
+          ## Real VMware ESXi validation scope
+          Human tester \`${tester}\` completed the acceptance at \`${tested_at}\` on VMware ESXi ${esxi_version} build ${esxi_build}. The imported asset was \`${imported_vmdk}\`.
+
+          The committed machine-readable evidence records PASS for: datastore-backed VMDK import and boot, exactly two NICs, HTTPS, HTTP-to-HTTPS redirect, firewall enabled/running with WAN management blocked, WAN DHCP, LAN DHCP, LAN-client NAT and DNS, and post-reboot persistence of installation_id and the recorded configuration fingerprint.
+
+          ## Scope limitation
+          This validates the recorded VMDK/firmware combination on the recorded ESXi host. It does not claim that every ESXi hardware combination or both VMDK firmware variants were tested. It is x86_64 VM software and is **not Xiaomi AX9000 firmware or AX9000 hardware validation**.
+          EOF
+
+          jq -n \
+            --arg tag "$STABLE_TAG" \
+            --arg commit "$RC_COMMIT" \
+            --arg name "NexaWrt x86_64 VM ${STABLE_VERSION}" \
+            --rawfile body "$RUNNER_TEMP/stable-release-notes.md" \
+            '{tag_name:$tag,target_commitish:$commit,name:$name,body:$body,draft:true,prerelease:false}' \
+            > "$RUNNER_TEMP/stable-identity.json"
+
+          fetch_optional_json() {
+            local endpoint="$1" output="$2" error_file="$3" status
+            set +e
+            gh api "$endpoint" >"$output" 2>"$error_file"
+            status=$?
+            set -e
+            if [[ $status -eq 0 ]]; then
+              return 0
+            fi
+            rm -f "$output"
+            if grep -Eqi '404|not found' "$error_file"; then
+              return 1
+            fi
+            cat "$error_file" >&2
+            exit "$status"
+          }
+
+          tag_exists=false
+          if fetch_optional_json \
+            "repos/$GITHUB_REPOSITORY/git/ref/tags/$STABLE_TAG" \
+            "$RUNNER_TEMP/stable-tag.json" "$RUNNER_TEMP/stable-tag.error"; then
+            tag_exists=true
+            jq -e --arg commit "$RC_COMMIT" \
+              '.object.type == "commit" and .object.sha == $commit' \
+              "$RUNNER_TEMP/stable-tag.json" >/dev/null || {
+                echo "Existing stable tag does not point to the exact RC commit; refusing recovery" >&2
+                exit 1
+              }
+          fi
+
+          gh api --paginate --slurp \
+            "repos/$GITHUB_REPOSITORY/releases?per_page=100" \
+            > "$RUNNER_TEMP/all-releases-pages.json"
+          python3 - "$RUNNER_TEMP/all-releases-pages.json" "$STABLE_TAG" "$RUNNER_TEMP/stable-existing.json" <<'PY'
+          import json
+          import sys
+          from pathlib import Path
+
+          pages_path, stable_tag, output_path = sys.argv[1:]
+          pages = json.loads(Path(pages_path).read_text(encoding="utf-8"))
+          if not isinstance(pages, list) or any(not isinstance(page, list) for page in pages):
+              raise SystemExit("release listing did not return paginated arrays")
+          matches = [release for page in pages for release in page if release.get("tag_name") == stable_tag]
+          if len(matches) > 1:
+              raise SystemExit("multiple releases claim the stable tag; refusing recovery")
+          output = Path(output_path)
+          if matches:
+              output.write_text(json.dumps(matches[0]), encoding="utf-8")
+          else:
+              output.unlink(missing_ok=True)
+          PY
+          release_exists=false
+          if [[ -f "$RUNNER_TEMP/stable-existing.json" ]]; then
+            release_exists=true
+          fi
+          if [[ "$release_exists" == true && "$tag_exists" != true ]]; then
+            echo "Existing stable release has no matching stable tag; refusing recovery" >&2
+            exit 1
+          fi
+
+          if [[ "$tag_exists" != true ]]; then
+            gh api --method POST "repos/$GITHUB_REPOSITORY/git/refs" \
+              -f ref="refs/tags/$STABLE_TAG" \
+              -f sha="$RC_COMMIT" >/dev/null
+          fi
+          test "$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$STABLE_TAG" --jq '.object.type')" = commit
+          test "$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$STABLE_TAG" --jq '.object.sha')" = "$RC_COMMIT"
+
+          if [[ "$release_exists" == true ]]; then
+            jq -e --slurpfile expected "$RUNNER_TEMP/stable-identity.json" '
+              (.id | type == "number" and . > 0) and
+              .tag_name == $expected[0].tag_name and
+              .target_commitish == $expected[0].target_commitish and
+              .name == $expected[0].name and
+              .body == $expected[0].body and
+              .draft == true and
+              .prerelease == false
+            ' "$RUNNER_TEMP/stable-existing.json" >/dev/null || {
+              echo "Existing stable release identity does not exactly match this RC/evidence run; refusing recovery" >&2
+              exit 1
+            }
+            cp "$RUNNER_TEMP/stable-existing.json" "$RUNNER_TEMP/stable-release.json"
+          else
+            jq '. + {make_latest:"true"}' "$RUNNER_TEMP/stable-identity.json" \
+              > "$RUNNER_TEMP/create-stable-release.json"
+            gh api --method POST "repos/$GITHUB_REPOSITORY/releases" \
+              --input "$RUNNER_TEMP/create-stable-release.json" > "$RUNNER_TEMP/stable-release.json"
+            jq -e --slurpfile expected "$RUNNER_TEMP/stable-identity.json" '
+              (.id | type == "number" and . > 0) and
+              .tag_name == $expected[0].tag_name and
+              .target_commitish == $expected[0].target_commitish and
+              .name == $expected[0].name and
+              .body == $expected[0].body and
+              .draft == true and
+              .prerelease == false
+            ' "$RUNNER_TEMP/stable-release.json" >/dev/null
+          fi
+          stable_release_id="$(jq -er '.id | select(type == "number" and . > 0)' "$RUNNER_TEMP/stable-release.json")"
+          printf 'release_id=%s\n' "$stable_release_id" >> "$GITHUB_OUTPUT"
+
+      - name: Reset only the trusted stable draft assets for an idempotent retry
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_ID: ${{ steps.stable.outputs.release_id }}
+          RC_COMMIT: ${{ steps.source.outputs.rc_commit }}
+          STABLE_TAG: ${{ steps.source.outputs.stable_tag }}
+        run: |
+          set -euo pipefail
+          gh api "repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID" > "$RUNNER_TEMP/stable-before-reset.json"
+          jq -e --slurpfile expected "$RUNNER_TEMP/stable-identity.json" '
+            (.id == ($release_id | tonumber)) and
+            .tag_name == $expected[0].tag_name and
+            .target_commitish == $expected[0].target_commitish and
+            .name == $expected[0].name and
+            .body == $expected[0].body and
+            .draft == true and
+            .prerelease == false
+          ' --arg release_id "$RELEASE_ID" "$RUNNER_TEMP/stable-before-reset.json" >/dev/null || {
+            echo "Stable draft changed before asset reset; refusing to delete anything" >&2
+            exit 1
+          }
+          test "$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$STABLE_TAG" --jq '.object.type')" = commit
+          test "$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$STABLE_TAG" --jq '.object.sha')" = "$RC_COMMIT"
+
+          gh api --paginate \
+            "repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID/assets?per_page=100" \
+            --jq '.[].id' > "$RUNNER_TEMP/stable-assets-to-delete.txt"
+          python3 - "$RUNNER_TEMP/stable-assets-to-delete.txt" <<'PY'
+          import re
+          import sys
+          from pathlib import Path
+
+          lines = Path(sys.argv[1]).read_text(encoding="utf-8").splitlines()
+          if any(re.fullmatch(r"[1-9][0-9]*", line) is None for line in lines):
+              raise SystemExit("stable draft returned an invalid asset id")
+          if len(lines) != len(set(lines)):
+              raise SystemExit("stable draft returned duplicate asset ids")
+          PY
+          while IFS= read -r asset_id; do
+            test -n "$asset_id"
+            gh api --method DELETE \
+              -H 'X-GitHub-Api-Version: 2026-03-10' \
+              "repos/$GITHUB_REPOSITORY/releases/assets/$asset_id"
+          done < "$RUNNER_TEMP/stable-assets-to-delete.txt"
+
+          gh api --paginate \
+            "repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID/assets?per_page=100" \
+            --jq '.[].id' > "$RUNNER_TEMP/stable-assets-after-reset.txt"
+          test ! -s "$RUNNER_TEMP/stable-assets-after-reset.txt"
+          gh api "repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID" > "$RUNNER_TEMP/stable-after-reset.json"
+          jq -e --slurpfile expected "$RUNNER_TEMP/stable-identity.json" '
+            (.id == ($release_id | tonumber)) and
+            .tag_name == $expected[0].tag_name and
+            .target_commitish == $expected[0].target_commitish and
+            .name == $expected[0].name and
+            .body == $expected[0].body and
+            .draft == true and
+            .prerelease == false and
+            (.assets | length == 0)
+          ' --arg release_id "$RELEASE_ID" "$RUNNER_TEMP/stable-after-reset.json" >/dev/null
+
+      - name: Upload the unchanged RC asset bytes to the empty stable draft
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_ID: ${{ steps.stable.outputs.release_id }}
+        run: |
+          set -euo pipefail
+          while IFS=$'\t' read -r _asset_id asset_name; do
+            gh api --method POST \
+              -H 'Content-Type: application/octet-stream' \
+              -H 'X-GitHub-Api-Version: 2026-03-10' \
+              "repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID/assets?name=$asset_name" \
+              --input "$RC_DIR/$asset_name" >/dev/null
+          done < "$RUNNER_TEMP/rc-assets.tsv"
+
+      - name: Download stable draft and prove every asset byte is unchanged
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_ID: ${{ steps.stable.outputs.release_id }}
+          STABLE_TAG: ${{ steps.source.outputs.stable_tag }}
+        run: |
+          set -euo pipefail
+          rm -rf "$STABLE_DIR"
+          mkdir -p "$STABLE_DIR"
+          gh api "repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID" > "$RUNNER_TEMP/stable-draft.json"
+          jq -e --slurpfile expected "$RUNNER_TEMP/stable-identity.json" '
+            (.id == ($release_id | tonumber)) and
+            .tag_name == $expected[0].tag_name and
+            .target_commitish == $expected[0].target_commitish and
+            .name == $expected[0].name and
+            .body == $expected[0].body and
+            .draft == true and
+            .prerelease == false
+          ' --arg release_id "$RELEASE_ID" "$RUNNER_TEMP/stable-draft.json" >/dev/null || {
+            echo "Stable draft identity changed after upload; refusing comparison/publish" >&2
+            exit 1
+          }
+          python3 - "$RUNNER_TEMP/stable-draft.json" "$RUNNER_TEMP/rc-assets.tsv" "$RUNNER_TEMP/stable-assets.tsv" "$STABLE_TAG" <<'PY'
+          import json
+          import sys
+          from pathlib import Path
+
+          release_path, rc_assets_path, output_path, stable_tag = sys.argv[1:]
+          release = json.loads(Path(release_path).read_text(encoding="utf-8"))
+          if release.get("tag_name") != stable_tag or release.get("draft") is not True or release.get("prerelease") is not False:
+              raise SystemExit("stable draft metadata is invalid")
+          expected = [line.split("\t", 1)[1] for line in Path(rc_assets_path).read_text(encoding="utf-8").splitlines()]
+          assets = release.get("assets")
+          if not isinstance(assets, list) or len(assets) != 21:
+              raise SystemExit("stable draft must contain exactly 21 assets")
+          by_name = {}
+          ids = set()
+          for asset in assets:
+              name, asset_id = asset.get("name"), asset.get("id")
+              if name in by_name or not isinstance(asset_id, int) or isinstance(asset_id, bool) or asset_id <= 0 or asset_id in ids:
+                  raise SystemExit("stable draft contains invalid asset metadata")
+              if asset.get("state") != "uploaded" or not isinstance(asset.get("size"), int) or asset["size"] <= 0:
+                  raise SystemExit(f"stable asset is not uploaded: {name}")
+              by_name[name] = asset
+              ids.add(asset_id)
+          if set(by_name) != set(expected):
+              raise SystemExit("stable draft assets do not match the exact RC asset set")
+          with Path(output_path).open("w", encoding="utf-8", newline="\n") as handle:
+              for name in expected:
+                  handle.write(f"{by_name[name]['id']}\t{name}\n")
+          PY
+          while IFS=$'\t' read -r asset_id asset_name; do
+            gh api \
+              -H 'Accept: application/octet-stream' \
+              -H 'X-GitHub-Api-Version: 2026-03-10' \
+              "repos/$GITHUB_REPOSITORY/releases/assets/$asset_id" > "$STABLE_DIR/$asset_name"
+            cmp -s "$RC_DIR/$asset_name" "$STABLE_DIR/$asset_name"
+          done < "$RUNNER_TEMP/stable-assets.tsv"
+          (
+            cd "$STABLE_DIR"
+            sha256sum --check SHA256SUMS
+            find . -maxdepth 1 -type f -printf '%f\n' | LC_ALL=C sort | while IFS= read -r name; do
+              printf '%s  %s\n' "$(sha256sum "$name" | cut -d' ' -f1)" "$name"
+            done > "$RUNNER_TEMP/stable-all-assets.sha256"
+          )
+          cmp -s "$RUNNER_TEMP/rc-all-assets.sha256" "$RUNNER_TEMP/stable-all-assets.sha256"
+
+      - name: Revalidate evidence and publish the non-prerelease stable release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_ID: ${{ steps.stable.outputs.release_id }}
+          RC_COMMIT: ${{ steps.source.outputs.rc_commit }}
+          STABLE_TAG: ${{ steps.source.outputs.stable_tag }}
+        run: |
+          set -euo pipefail
+          python3 scripts/verify-vm-esxi-evidence.py \
+            --schema schemas/vm-esxi-evidence.schema.json \
+            --evidence "$EVIDENCE_PATH" \
+            --repo-root "$GITHUB_WORKSPACE" \
+            --release-dir "$RC_DIR" \
+            --rc-tag "$RC_TAG" \
+            --rc-commit "$RC_COMMIT" \
+            --rc-published-at '${{ steps.source.outputs.rc_published_at }}'
+          test "$GITHUB_SHA" = "$(gh api "repos/$GITHUB_REPOSITORY/git/ref/heads/main" --jq '.object.sha')"
+          test "$RC_COMMIT" = "$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$RC_TAG" --jq '.object.sha')"
+          test "$RC_COMMIT" = "$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$STABLE_TAG" --jq '.object.sha')"
+          test "$(gh api "repos/$GITHUB_REPOSITORY/releases/tags/$RC_TAG" --jq '.immutable')" = true
+          gh api "repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID" > "$RUNNER_TEMP/stable-prepublish.json"
+          jq -e --slurpfile expected "$RUNNER_TEMP/stable-identity.json" '
+            (.id == ($release_id | tonumber)) and
+            .tag_name == $expected[0].tag_name and
+            .target_commitish == $expected[0].target_commitish and
+            .name == $expected[0].name and
+            .body == $expected[0].body and
+            .draft == true and
+            .prerelease == false and
+            (.assets | length == 21)
+          ' --arg release_id "$RELEASE_ID" "$RUNNER_TEMP/stable-prepublish.json" >/dev/null || {
+            echo "Stable draft identity changed before publish; refusing publication" >&2
+            exit 1
+          }
+          python3 - "$RUNNER_TEMP/stable-prepublish.json" "$RUNNER_TEMP/stable-assets.tsv" <<'PY'
+          import json
+          import sys
+          from pathlib import Path
+
+          release_path, expected_path = sys.argv[1:]
+          release = json.loads(Path(release_path).read_text(encoding="utf-8"))
+          expected = {}
+          for line in Path(expected_path).read_text(encoding="utf-8").splitlines():
+              asset_id, name = line.split("\t", 1)
+              expected[name] = int(asset_id)
+          actual = release.get("assets")
+          if not isinstance(actual, list) or len(actual) != 21:
+              raise SystemExit("stable draft asset count changed before publish")
+          observed = {}
+          for asset in actual:
+              name, asset_id = asset.get("name"), asset.get("id")
+              if name in observed or not isinstance(asset_id, int) or isinstance(asset_id, bool):
+                  raise SystemExit("stable draft asset identity is invalid before publish")
+              if asset.get("state") != "uploaded" or not isinstance(asset.get("size"), int) or asset["size"] <= 0:
+                  raise SystemExit("stable draft contains an incomplete asset before publish")
+              observed[name] = asset_id
+          if observed != expected:
+              raise SystemExit("stable draft asset ids/names changed after byte comparison")
+          PY
+
+          jq -n '{draft:false,prerelease:false,make_latest:"true"}' > "$RUNNER_TEMP/publish-stable-release.json"
+          gh api --method PATCH "repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID" \
+            --input "$RUNNER_TEMP/publish-stable-release.json" >/dev/null
+
+          gh api "repos/$GITHUB_REPOSITORY/releases/tags/$STABLE_TAG" > "$RUNNER_TEMP/stable-final.json"
+          jq -e --slurpfile expected "$RUNNER_TEMP/stable-identity.json" '
+            (.id == ($release_id | tonumber)) and
+            .tag_name == $expected[0].tag_name and
+            .target_commitish == $expected[0].target_commitish and
+            .name == $expected[0].name and
+            .body == $expected[0].body and
+            .draft == false and
+            .prerelease == false and
+            .immutable == true and
+            (.assets | length == 21)
+          ' --arg release_id "$RELEASE_ID" "$RUNNER_TEMP/stable-final.json" >/dev/null

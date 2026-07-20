@@ -1,0 +1,264 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://nexawrt.example/schemas/vm-esxi-evidence.schema.json",
+  "title": "NexaWrt x86_64 VMware ESXi acceptance evidence",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "evidence_type",
+    "rc_tag",
+    "rc_commit",
+    "release_version",
+    "release_contract",
+    "tested_at",
+    "tester",
+    "esxi",
+    "assets",
+    "checks"
+  ],
+  "properties": {
+    "schema_version": { "const": 1 },
+    "evidence_type": { "const": "nexawrt-vm-esxi-acceptance" },
+    "rc_tag": {
+      "type": "string",
+      "pattern": "^vm-x86_64-v(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)-rc\\.(0|[1-9][0-9]*)$"
+    },
+    "rc_commit": { "$ref": "#/$defs/sha1" },
+    "release_version": {
+      "type": "string",
+      "pattern": "^v(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)-rc\\.(0|[1-9][0-9]*)$"
+    },
+    "release_contract": { "const": "vm-x86_64/v2" },
+    "tested_at": {
+      "type": "string",
+      "format": "date-time",
+      "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$"
+    },
+    "tester": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["github_login", "performed_by_human"],
+      "properties": {
+        "github_login": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?$"
+        },
+        "performed_by_human": { "const": true }
+      }
+    },
+    "esxi": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "version",
+        "build",
+        "host_model",
+        "virtual_hardware_version",
+        "firmware",
+        "disk_controller",
+        "network_adapter_model",
+        "memory_mb",
+        "vcpu_count"
+      ],
+      "properties": {
+        "version": { "type": "string", "minLength": 1, "maxLength": 80 },
+        "build": { "type": "string", "minLength": 1, "maxLength": 80 },
+        "host_model": { "type": "string", "minLength": 1, "maxLength": 160 },
+        "virtual_hardware_version": { "type": "string", "minLength": 1, "maxLength": 40 },
+        "firmware": { "enum": ["bios", "uefi"] },
+        "disk_controller": { "type": "string", "minLength": 1, "maxLength": 80 },
+        "network_adapter_model": { "enum": ["e1000", "e1000e", "vmxnet3"] },
+        "memory_mb": { "type": "integer", "minimum": 512, "maximum": 1048576 },
+        "vcpu_count": { "type": "integer", "minimum": 1, "maximum": 1024 }
+      }
+    },
+    "assets": {
+      "type": "array",
+      "minItems": 21,
+      "maxItems": 21,
+      "uniqueItems": true,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["name", "sha256", "size"],
+        "properties": {
+          "name": {
+            "type": "string",
+            "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]*$",
+            "minLength": 1,
+            "maxLength": 255
+          },
+          "sha256": { "$ref": "#/$defs/sha256" },
+          "size": { "type": "integer", "minimum": 1 }
+        }
+      }
+    },
+    "checks": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "vmdk_import",
+        "two_nics",
+        "https",
+        "http_redirect",
+        "firewall",
+        "wan_dhcp",
+        "lan_dhcp",
+        "nat",
+        "dns",
+        "persistence"
+      ],
+      "properties": {
+        "vmdk_import": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["passed", "asset_name", "datastore_disk_created", "powered_on"],
+          "properties": {
+            "passed": { "const": true },
+            "asset_name": { "type": "string", "minLength": 1, "maxLength": 255 },
+            "datastore_disk_created": { "const": true },
+            "powered_on": { "const": true }
+          }
+        },
+        "two_nics": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["passed", "nic_count", "lan_interface", "wan_interface", "lan_port_group", "wan_port_group"],
+          "properties": {
+            "passed": { "const": true },
+            "nic_count": { "const": 2 },
+            "lan_interface": { "$ref": "#/$defs/interface" },
+            "wan_interface": { "$ref": "#/$defs/interface" },
+            "lan_port_group": { "type": "string", "minLength": 1, "maxLength": 160 },
+            "wan_port_group": { "type": "string", "minLength": 1, "maxLength": 160 }
+          }
+        },
+        "https": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["passed", "url", "status_code", "certificate_sha256"],
+          "properties": {
+            "passed": { "const": true },
+            "url": { "type": "string", "format": "uri", "minLength": 1, "maxLength": 2048 },
+            "status_code": { "enum": [200, 401, 403] },
+            "certificate_sha256": { "$ref": "#/$defs/sha256" }
+          }
+        },
+        "http_redirect": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["passed", "url", "status_code", "location"],
+          "properties": {
+            "passed": { "const": true },
+            "url": { "type": "string", "format": "uri", "minLength": 1, "maxLength": 2048 },
+            "status_code": { "enum": [301, 302, 303, 307, 308] },
+            "location": { "type": "string", "format": "uri", "minLength": 1, "maxLength": 2048 }
+          }
+        },
+        "firewall": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["passed", "enabled", "running", "wan_management_blocked"],
+          "properties": {
+            "passed": { "const": true },
+            "enabled": { "const": true },
+            "running": { "const": true },
+            "wan_management_blocked": { "const": true }
+          }
+        },
+        "wan_dhcp": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["passed", "interface", "address", "gateway"],
+          "properties": {
+            "passed": { "const": true },
+            "interface": { "$ref": "#/$defs/interface" },
+            "address": { "type": "string", "format": "ipv4" },
+            "gateway": { "type": "string", "format": "ipv4" }
+          }
+        },
+        "lan_dhcp": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["passed", "interface", "client_mac", "client_address", "lease_obtained"],
+          "properties": {
+            "passed": { "const": true },
+            "interface": { "$ref": "#/$defs/interface" },
+            "client_mac": { "type": "string", "pattern": "^[0-9A-Fa-f]{2}(?::[0-9A-Fa-f]{2}){5}$" },
+            "client_address": { "type": "string", "format": "ipv4" },
+            "lease_obtained": { "const": true }
+          }
+        },
+        "nat": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["passed", "client_address", "destination", "client_reached_wan"],
+          "properties": {
+            "passed": { "const": true },
+            "client_address": { "type": "string", "format": "ipv4" },
+            "destination": { "type": "string", "minLength": 1, "maxLength": 255 },
+            "client_reached_wan": { "const": true }
+          }
+        },
+        "dns": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["passed", "client_address", "query_name", "resolved_addresses"],
+          "properties": {
+            "passed": { "const": true },
+            "client_address": { "type": "string", "format": "ipv4" },
+            "query_name": {
+              "type": "string",
+              "pattern": "^(?=.{1,253}$)(?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\\.)+[A-Za-z]{2,63}$"
+            },
+            "resolved_addresses": {
+              "type": "array",
+              "minItems": 1,
+              "maxItems": 16,
+              "uniqueItems": true,
+              "items": { "type": "string", "format": "ipv4" }
+            }
+          }
+        },
+        "persistence": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "passed",
+            "reboot_count",
+            "installation_id_before",
+            "installation_id_after",
+            "configuration_sha256_before",
+            "configuration_sha256_after",
+            "hostname_before",
+            "hostname_after",
+            "lan_address_before",
+            "lan_address_after"
+          ],
+          "properties": {
+            "passed": { "const": true },
+            "reboot_count": { "type": "integer", "minimum": 1, "maximum": 1000 },
+            "installation_id_before": { "$ref": "#/$defs/installation_id" },
+            "installation_id_after": { "$ref": "#/$defs/installation_id" },
+            "configuration_sha256_before": { "$ref": "#/$defs/sha256" },
+            "configuration_sha256_after": { "$ref": "#/$defs/sha256" },
+            "hostname_before": { "type": "string", "minLength": 1, "maxLength": 253 },
+            "hostname_after": { "type": "string", "minLength": 1, "maxLength": 253 },
+            "lan_address_before": { "type": "string", "format": "ipv4" },
+            "lan_address_after": { "type": "string", "format": "ipv4" }
+          }
+        }
+      }
+    }
+  },
+  "$defs": {
+    "sha1": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
+    "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+    "installation_id": { "type": "string", "pattern": "^[0-9a-f]{32}$" },
+    "interface": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:-]{0,31}$"
+    }
+  }
+}

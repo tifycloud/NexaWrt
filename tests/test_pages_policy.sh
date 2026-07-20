@@ -11,8 +11,9 @@ DEVICE_METADATA="$ROOT_DIR/devices/xiaomi-ax9000/device.json"
 DEVICE_TEST="$ROOT_DIR/tests/test_device_metadata.py"
 UI_TEST="$ROOT_DIR/tests/test_pages_ui.js"
 SITE="$ROOT_DIR/site"
+CATALOG="$ROOT_DIR/components/catalog.json"
 
-for path in "$WORKFLOW" "$GENERATOR" "$PROOF_VERIFIER" "$PROOF_TEST" "$DEVICE_VALIDATOR" "$DEVICE_METADATA" "$DEVICE_TEST" "$UI_TEST" "$SITE/index.html" "$SITE/styles.css" "$SITE/app.js" "$SITE/favicon.svg" "$SITE/releases.json" "$SITE/.nojekyll"; do
+for path in "$WORKFLOW" "$GENERATOR" "$PROOF_VERIFIER" "$PROOF_TEST" "$DEVICE_VALIDATOR" "$DEVICE_METADATA" "$DEVICE_TEST" "$UI_TEST" "$CATALOG" "$SITE/index.html" "$SITE/styles.css" "$SITE/app.js" "$SITE/favicon.svg" "$SITE/releases.json" "$SITE/.nojekyll"; do
   test -f "$path" || { echo "missing Pages file: $path" >&2; exit 1; }
 done
 
@@ -42,7 +43,45 @@ grep -Fq '仅限 RAM 测试 · RAM TEST ONLY' "$SITE/index.html"
 grep -Fq '严禁刷写 · DO NOT FLASH' "$SITE/index.html"
 grep -Fq '不是 sysupgrade / factory 固件' "$SITE/index.html"
 grep -Fq 'id="browser-build-link"' "$SITE/index.html"
+# GitHub expression is intentionally matched literally.
+# shellcheck disable=SC2016
 grep -Fq 'const BUILD_WORKFLOW_URL = `https://github.com/${REPOSITORY}/actions/workflows/build.yml`;' "$SITE/app.js"
+grep -Fq 'id="custom-build"' "$SITE/index.html"
+grep -Fq 'id="component-target"' "$SITE/index.html"
+grep -Fq 'id="component-flavor"' "$SITE/index.html"
+grep -Fq 'id="component-search"' "$SITE/index.html"
+grep -Fq 'id="component-category"' "$SITE/index.html"
+grep -Fq 'id="component-list"' "$SITE/index.html"
+grep -Fq 'id="component-packages"' "$SITE/index.html"
+grep -Fq 'id="component-normalized"' "$SITE/index.html"
+grep -Fq 'id="component-request-hash"' "$SITE/index.html"
+grep -Fq 'id="component-actions-inputs"' "$SITE/index.html"
+grep -Fq 'id="custom-build-workflow-link"' "$SITE/index.html"
+grep -Fq '静态 Pages 不保存 GitHub token' "$SITE/index.html"
+grep -Fq '目前不支持匿名一键构建' "$SITE/index.html"
+grep -Fq 'Run workflow' "$SITE/index.html"
+grep -Fq "const COMPONENT_CATALOG_URL = 'components/catalog.json';" "$SITE/app.js"
+grep -Fq "const CUSTOM_BUILD_WORKFLOW_FILE = 'custom-build.yml';" "$SITE/app.js"
+grep -Fq 'function validateComponentCatalog(catalog)' "$SITE/app.js"
+grep -Fq 'function resolveComponentSelection(catalog, targetId, requestedIds)' "$SITE/app.js"
+grep -Fq 'function componentHashPayload(catalog, targetId, flavorId, resolved)' "$SITE/app.js"
+grep -Fq 'globalThis.crypto.subtle.digest' "$SITE/app.js"
+grep -Fq 'components: [...resolved.resolved_components]' "$SITE/app.js"
+grep -Fq 'flavor: flavorId' "$SITE/app.js"
+grep -Fq 'packages: [...resolved.packages]' "$SITE/app.js"
+grep -Fq 'group.history.filter((release) => validVmRelease(release, schemaVersion))' "$SITE/app.js"
+if grep -Eq 'innerHTML|insertAdjacentHTML|document\.write|eval\(' "$SITE/app.js"; then
+  echo 'unsafe DOM/code execution API found in Pages app' >&2
+  exit 1
+fi
+if grep -Eq 'localStorage|sessionStorage|Authorization:|Bearer |ghp_' "$SITE/app.js"; then
+  echo 'browser selector must not persist or embed credentials' >&2
+  exit 1
+fi
+if grep -Fq 'href="https://github.com/tifycloud/NexaWrt/actions/workflows/custom-build.yml"' "$SITE/index.html"; then
+  echo 'static custom-build workflow link bypasses fail-closed catalog validation' >&2
+  exit 1
+fi
 grep -Fq "device.production_ready !== false" "$SITE/app.js"
 grep -Fq "device.image_capabilities.sysupgrade !== false" "$SITE/app.js"
 grep -Fq "[3, 4].includes(data.schema_version)" "$SITE/app.js"
@@ -90,13 +129,16 @@ grep -Fq "default-src 'self'" "$SITE/index.html"
 
 # Pages deployment uses only official actions pinned to immutable commit SHAs.
 grep -Fq 'permissions: {}' "$WORKFLOW"
-grep -Fq "workflows: ['NexaWrt AX9000 reproducible RAM-test release', 'NexaWrt x86_64 VM release']" "$WORKFLOW"
+grep -Fq "workflows: ['NexaWrt AX9000 reproducible RAM-test release', 'NexaWrt x86_64 VM release', 'Promote ESXi-accepted VM RC']" "$WORKFLOW"
 grep -Fq 'types: [completed]' "$WORKFLOW"
 grep -Fq 'schedule:' "$WORKFLOW"
 grep -Fq "cron: '17 */6 * * *'" "$WORKFLOW"
 grep -Fq 'workflow_dispatch:' "$WORKFLOW"
 grep -Fq "github.repository == 'tifycloud/NexaWrt' &&" "$WORKFLOW"
 grep -Fq "github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success'" "$WORKFLOW"
+grep -Fq "'Promote ESXi-accepted VM RC'" "$WORKFLOW"
+grep -Fq "VM_PROMOTION_WORKFLOW" "$GENERATOR"
+grep -Fq "VM_PROMOTION_WORKFLOW" "$PROOF_VERIFIER"
 grep -Fq 'ref: refs/heads/main' "$WORKFLOW"
 grep -Fq 'fetch-depth: 0' "$WORKFLOW"
 grep -Fq 'timeout-minutes: 30' "$WORKFLOW"
@@ -111,6 +153,13 @@ grep -Fq 'url: ${{ steps.deployment.outputs.page_url }}' "$WORKFLOW"
 grep -Fq -- "- 'devices/**'" "$WORKFLOW"
 grep -Fq -- "- 'scripts/device_metadata.py'" "$WORKFLOW"
 grep -Fq -- "- 'scripts/verify-pages-releases.py'" "$WORKFLOW"
+grep -Fq -- "- 'components/**'" "$WORKFLOW"
+grep -Fq -- "- 'tests/test_pages_ui.js'" "$WORKFLOW"
+grep -Fq -- "- 'tests/test_pages_policy.sh'" "$WORKFLOW"
+grep -Fq 'node tests/test_pages_ui.js' "$WORKFLOW"
+grep -Fq 'bash tests/test_pages_policy.sh' "$WORKFLOW"
+grep -Fq 'cp components/catalog.json site/components/catalog.json' "$WORKFLOW"
+grep -Fq 'python3 -m json.tool site/components/catalog.json' "$WORKFLOW"
 grep -Fq 'NEXAWRT_ATTESTATION_VERIFIER=/usr/bin/gh' "$WORKFLOW"
 grep -Fq 'python3 scripts/verify-pages-releases.py' "$WORKFLOW"
 grep -Fq -- '--trusted-main HEAD' "$WORKFLOW"
@@ -269,14 +318,44 @@ def vm_proof(release_id, version, fill, contract_version):
         "validation": {"qemu": {variant: "runtime-pass" for variant in variants}, "esxi": "not-tested"},
     }
 
+source_v2_proof = vm_proof(211, "v0.2.0-rc.1", "f", 2)
+source_v2_release = next(item for item in releases if item["id"] == 211)
+stable_assets = []
+for source_asset in source_v2_release["assets"]:
+    next_asset_id += 1
+    stable_assets.append({
+        "id": next_asset_id, "name": source_asset["name"], "state": "uploaded", "size": source_asset["size"],
+        "digest": source_asset["digest"], "browser_download_url": "https://attacker.invalid/untrusted-field",
+    })
+stable_release = {
+    "id": 213, "tag_name": "vm-x86_64-v0.2.0", "target_commitish": "f" * 40,
+    "name": "NexaWrt x86_64 VM v0.2.0", "body": "promotion bindings verified upstream",
+    "draft": False, "prerelease": False, "immutable": True, "published_at": "2026-07-18T06:30:00Z",
+    "html_url": "https://attacker.invalid/untrusted-field", "assets": stable_assets,
+}
+releases.append(stable_release)
+stable_by_name = {asset["name"]: asset for asset in stable_assets}
+stable_proof_assets = {
+    key: {"id": stable_by_name[value["name"]]["id"], "name": value["name"], "size": value["size"], "sha256": value["sha256"]}
+    for key, value in source_v2_proof["assets"].items()
+}
+stable_proof = {
+    "release_id": 213, "source_digest": "f" * 40, "contract_version": 2, "assets": stable_proof_assets,
+    "verified_subjects": ["raw_bios", "iso_bios", "iso_efi", "vmdk_bios", "vmdk_efi", "checksums"],
+    "validation": {"qemu": dict(source_v2_proof["validation"]["qemu"]), "esxi": "validated"},
+    "source_rc_tag": "vm-x86_64-v0.2.0-rc.1", "source_rc_release_id": 211,
+    "evidence_path": "evidence/vm-esxi/vm-x86_64-v0.2.0-rc.1.json", "evidence_commit": "a" * 40,
+}
+
 proof_document = {
-    "schema_version": 4,
+    "schema_version": 5,
     "repository": "tifycloud/NexaWrt",
     "trusted_ref": "refs/heads/main",
     "trusted_main_digest": "a" * 40,
     "signer_workflows": {
         "ax9000": "tifycloud/NexaWrt/.github/workflows/release.yml",
         "vm_x86_64": "tifycloud/NexaWrt/.github/workflows/vm-release.yml",
+        "vm_x86_64_promotion": "tifycloud/NexaWrt/.github/workflows/vm-promote.yml",
     },
     "releases": {
         "ram-test-v1.9.0-rc.1": proof(110, "b"),
@@ -285,7 +364,8 @@ proof_document = {
     },
     "virtual_images": {"x86_64": {
         "vm-x86_64-v0.1.0-rc.3": vm_proof(210, "v0.1.0-rc.3", "e", 1),
-        "vm-x86_64-v0.2.0-rc.1": vm_proof(211, "v0.2.0-rc.1", "f", 2),
+        "vm-x86_64-v0.2.0-rc.1": source_v2_proof,
+        "vm-x86_64-v0.2.0": stable_proof,
     }},
 }
 with open(fixture_path, "w", encoding="utf-8") as stream:
@@ -307,7 +387,7 @@ assert set(data["devices"]) == {"xiaomi-ax9000"}
 vm = data["virtual_images"]["x86_64"]
 assert vm["latest"] == vm["history"][0]
 assert [item["tag"] for item in vm["history"]] == [
-    "vm-x86_64-v0.2.0-rc.1", "vm-x86_64-v0.1.0-rc.3",
+    "vm-x86_64-v0.2.0", "vm-x86_64-v0.2.0-rc.1", "vm-x86_64-v0.1.0-rc.3",
 ]
 vm_release_entry = vm["latest"]
 assert vm_release_entry["artifact_class"] == "VM_DISTRIBUTION_SET"
@@ -318,15 +398,20 @@ assert vm_release_entry["not_ax9000_firmware"] is True
 assert vm_release_entry["hardware_validation"] is False
 assert vm_release_entry["nss_validation"] is False
 assert vm_release_entry["qemu_validated"] is True
-assert vm_release_entry["esxi_validation"] == "not-tested"
+assert vm_release_entry["esxi_validation"] == "validated"
 assert vm_release_entry["ssh_default"] == "disabled"
 assert vm_release_entry["validation"] == {
     "qemu": {key: "runtime-pass" for key in ("raw_bios", "iso_bios", "iso_efi", "vmdk_bios", "vmdk_efi")},
-    "esxi": "not-tested",
+    "esxi": "validated",
 }
+assert vm_release_entry["version"] == "v0.2.0"
+assert all("v0.2.0-rc.1" in asset["name"] or asset["name"] in {"artifact-labels.env", "README-VM.txt", "smoke-report.txt", "SHA256SUMS", "raw-bios.provenance.bundle.json", "iso-bios.provenance.bundle.json", "iso-efi.provenance.bundle.json", "vmdk-bios.provenance.bundle.json", "vmdk-efi.provenance.bundle.json", "checksums.provenance.bundle.json"} for asset in vm_release_entry["assets"].values())
 assert len(vm_release_entry["assets"]) == 21
 assert all(set(asset) == {"name", "url", "size", "sha256"} for asset in vm_release_entry["assets"].values())
-legacy = vm["history"][1]
+source_rc = vm["history"][1]
+assert source_rc["tag"] == "vm-x86_64-v0.2.0-rc.1"
+assert source_rc["esxi_validation"] == "not-tested"
+legacy = vm["history"][2]
 assert legacy["tag"] == "vm-x86_64-v0.1.0-rc.3"
 assert legacy["contract_version"] == 1
 assert legacy["artifact_class"] == "VM_DISTRIBUTION_IMAGE"
@@ -467,6 +552,19 @@ if python3 "$GENERATOR" --input "$fixture" --proofs "$tmp_dir/bad-v2-validation.
   echo 'generator unexpectedly accepted a proof claiming ESXi validation' >&2
   exit 1
 fi
+python3 - "$proofs" "$tmp_dir/bad-stable-link.json" <<'PY'
+import json, sys
+with open(sys.argv[1], encoding="utf-8") as stream:
+    data = json.load(stream)
+stable = data["virtual_images"]["x86_64"]["vm-x86_64-v0.2.0"]
+stable["assets"]["raw_bios"]["sha256"] = "0" * 64
+with open(sys.argv[2], "w", encoding="utf-8") as stream:
+    json.dump(data, stream)
+PY
+if python3 "$GENERATOR" --input "$fixture" --proofs "$tmp_dir/bad-stable-link.json" --output "$tmp_dir/bad-stable-link-output.json" >/dev/null 2>&1; then
+  echo 'generator unexpectedly accepted stable VM bytes that differ from the source RC proof' >&2
+  exit 1
+fi
 if python3 "$GENERATOR" --input "$fixture" --output "$tmp_dir/missing-proof-arg.json" >/dev/null 2>&1; then
   echo 'generator unexpectedly ran without a proof manifest' >&2
   exit 1
@@ -476,4 +574,4 @@ if python3 "$GENERATOR" --input /dev/null --proofs "$proofs" --output "$tmp_dir/
   exit 1
 fi
 
-echo 'Pages policy: schema-v4 AX9000/VM v1+v2 catalog, attestation-gated Releases, semantic ordering, isolation, and fail-closed safety OK'
+echo 'Pages policy: release provenance plus fail-closed component catalog selector, normalized request hashing, authenticated Actions handoff, and safe DOM policy OK'

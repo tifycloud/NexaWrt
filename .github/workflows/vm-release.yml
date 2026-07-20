@@ -273,6 +273,16 @@ jobs:
         env:
           VM_RELEASE_OUTPUT_DIR: ${{ github.workspace }}/vm-release-results/x86-64
         run: ./scripts/test-vm-release.sh x86-64 "$ARTIFACT_DIR"
+      - name: Upload VM diagnostics
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: vm-release-diagnostics-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            vm-release-results/
+            dist/vm/x86-64/build.log
+          if-no-files-found: warn
+          retention-days: 14
       - name: Validate smoke report and stage exact pre-provenance assets
         run: |
           set -euo pipefail
@@ -288,12 +298,15 @@ jobs:
           ))
           expected_keys = {
               "status", "target", "release_contract", "vm_only", "not_ax9000_firmware",
-              "hardware_validation", "nss_validation", "exact_release_image", "serial_labels", "http", "ssh_runtime_evidence", "ssh_port_probe", "ssh",
-              "authorized_keys", "dropbear_enabled", "dropbear_running", "http_status",
-              "auth_challenge", "http_host_port", "ssh_host_port", "serial_log", "ssh_probe_log",
-              "raw_bios_file", "raw_bios_qemu", "iso_bios_file", "iso_bios_qemu",
-              "iso_efi_file", "iso_efi_qemu", "vmdk_bios_file", "vmdk_bios_qemu",
-              "vmdk_efi_file", "vmdk_efi_qemu", "esxi_validation",
+              "hardware_validation", "nss_validation", "exact_release_image", "serial_labels",
+              "https", "http_redirect", "runtime_evidence", "production_runtime",
+              "raw_bios_persistence", "vmdk_import_persistence", "ssh_port_probe", "ssh",
+              "authorized_keys", "dropbear_enabled", "dropbear_running", "http_redirect_status",
+              "https_status", "auth_challenge", "http_host_port", "https_host_port", "ssh_host_port",
+              "serial_log", "ssh_probe_log", "raw_bios_file", "raw_bios_qemu",
+              "iso_bios_file", "iso_bios_qemu", "iso_efi_file", "iso_efi_qemu",
+              "vmdk_bios_file", "vmdk_bios_qemu", "vmdk_efi_file", "vmdk_efi_qemu",
+              "esxi_validation",
           }
           values = {}
           for line in report_path.read_text(encoding="utf-8").splitlines():
@@ -306,8 +319,11 @@ jobs:
           fixed = {
               "status": "PASS", "target": "x86-64", "release_contract": "vm-x86_64/v2",
               "vm_only": "true", "not_ax9000_firmware": "true", "hardware_validation": "false",
-              "nss_validation": "false", "exact_release_image": "true", "serial_labels": "PASS", "http": "PASS", "ssh_runtime_evidence": "PASS",
-              "ssh_port_probe": "PASS", "ssh": "DISABLED_BY_DEFAULT", "authorized_keys": "ABSENT",
+              "nss_validation": "false", "exact_release_image": "true", "serial_labels": "PASS",
+              "https": "PASS", "http_redirect": "PASS", "runtime_evidence": "PASS",
+              "production_runtime": "PASS", "raw_bios_persistence": "PASS",
+              "vmdk_import_persistence": "PASS", "ssh_port_probe": "PASS",
+              "ssh": "DISABLED_BY_DEFAULT", "authorized_keys": "ABSENT",
               "dropbear_enabled": "NO", "dropbear_running": "NO", "raw_bios_qemu": "runtime-pass",
               "iso_bios_qemu": "runtime-pass", "iso_efi_qemu": "runtime-pass",
               "vmdk_bios_qemu": "runtime-pass", "vmdk_efi_qemu": "runtime-pass",
@@ -317,15 +333,17 @@ jobs:
           for key, expected in fixed.items():
               if values.get(key) != expected:
                   raise SystemExit(f"smoke report mismatch for {key}: {values.get(key)!r} != {expected!r}")
-          if (values["http_status"], values["auth_challenge"]) not in {("200", "false"), ("403", "true")}:
-              raise SystemExit("smoke report has an invalid LuCI HTTP/authentication result")
+          if values["http_redirect_status"] not in {"301", "302", "307", "308"}:
+              raise SystemExit("smoke report has an invalid HTTP-to-HTTPS redirect")
+          if (values["https_status"], values["auth_challenge"]) not in {("200", "false"), ("403", "true")}:
+              raise SystemExit("smoke report has an invalid LuCI HTTPS/authentication result")
           ports = {}
-          for key in ("http_host_port", "ssh_host_port"):
+          for key in ("http_host_port", "https_host_port", "ssh_host_port"):
               if not values[key].isdigit() or not (1024 <= int(values[key]) <= 65535):
                   raise SystemExit(f"smoke report {key} is invalid")
               ports[key] = int(values[key])
-          if ports["http_host_port"] == ports["ssh_host_port"]:
-              raise SystemExit("smoke report reuses the same HTTP and SSH host port")
+          if len(set(ports.values())) != len(ports):
+              raise SystemExit("smoke report reuses a host port")
           expected_result_dir = report_path.parent / "raw_bios"
           expected_paths = {
               "serial_log": expected_result_dir / "serial.log",

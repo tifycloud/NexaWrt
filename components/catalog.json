@@ -1,0 +1,255 @@
+{
+  "schema_version": 1,
+  "catalog_version": "2026.07.20",
+  "max_selected_components": 8,
+  "targets": [
+    {
+      "id": "x86_64",
+      "display_name": "NexaWrt x86/64",
+      "openwrt_target": "x86",
+      "openwrt_subtarget": "64",
+      "profile": "generic"
+    },
+    {
+      "id": "xiaomi_ax9000",
+      "display_name": "Xiaomi AX9000",
+      "openwrt_target": "qualcommax",
+      "openwrt_subtarget": "ipq807x",
+      "profile": "xiaomi_ax9000"
+    }
+  ],
+  "categories": [
+    {
+      "id": "system",
+      "title": "系统基础",
+      "description": "Web 管理、证书和基础系统能力。",
+      "order": 10
+    },
+    {
+      "id": "diagnostics",
+      "title": "诊断工具",
+      "description": "只包含经过目录审核的网络诊断工具。",
+      "order": 20
+    },
+    {
+      "id": "network",
+      "title": "网络功能",
+      "description": "VPN、QoS 与网络协议组件。",
+      "order": 30
+    },
+    {
+      "id": "services",
+      "title": "网络服务",
+      "description": "广告过滤和文件共享等可选服务。",
+      "order": 40
+    },
+    {
+      "id": "storage",
+      "title": "存储支持",
+      "description": "USB 存储、文件系统和磁盘工具。",
+      "order": 50
+    }
+  ],
+  "components": [
+    {
+      "id": "web-ui",
+      "name": "LuCI HTTPS 管理",
+      "description": "提供 LuCI、HTTPS 管理入口和系统证书。",
+      "category": "system",
+      "packages": [
+        "ca-bundle",
+        "luci-base",
+        "luci-app-firewall",
+        "luci-ssl"
+      ],
+      "depends": [],
+      "conflicts": [],
+      "supported_targets": [
+        "x86_64",
+        "xiaomi_ax9000"
+      ],
+      "default_for": [
+        "x86_64",
+        "xiaomi_ax9000"
+      ]
+    },
+    {
+      "id": "diagnostic-tools",
+      "name": "网络诊断工具",
+      "description": "提供 curl、ethtool、iperf3 和 tcpdump。",
+      "category": "diagnostics",
+      "packages": [
+        "curl",
+        "ethtool",
+        "iperf3",
+        "tcpdump"
+      ],
+      "depends": [],
+      "conflicts": [],
+      "supported_targets": [
+        "x86_64",
+        "xiaomi_ax9000"
+      ],
+      "default_for": [
+        "x86_64"
+      ]
+    },
+    {
+      "id": "wireguard",
+      "name": "WireGuard VPN",
+      "description": "提供 WireGuard 内核模块、命令行工具和 LuCI 协议支持。",
+      "category": "network",
+      "packages": [
+        "kmod-wireguard",
+        "luci-proto-wireguard",
+        "wireguard-tools"
+      ],
+      "depends": [
+        "web-ui"
+      ],
+      "conflicts": [],
+      "supported_targets": [
+        "x86_64",
+        "xiaomi_ax9000"
+      ],
+      "default_for": []
+    },
+    {
+      "id": "sqm",
+      "name": "SQM 智能队列",
+      "description": "使用 CAKE/SQM 控制缓冲膨胀；不可与 qosify 同时选择。",
+      "category": "network",
+      "packages": [
+        "kmod-sched-cake",
+        "luci-app-sqm",
+        "sqm-scripts"
+      ],
+      "depends": [
+        "web-ui"
+      ],
+      "conflicts": [
+        "qosify"
+      ],
+      "supported_targets": [
+        "x86_64",
+        "xiaomi_ax9000"
+      ],
+      "default_for": []
+    },
+    {
+      "id": "qosify",
+      "name": "qosify 流量整形",
+      "description": "提供 qosify 和 LuCI 管理；不可与 SQM 同时选择。",
+      "category": "network",
+      "packages": [
+        "kmod-sched-cake",
+        "luci-app-qosify",
+        "qosify"
+      ],
+      "depends": [
+        "web-ui"
+      ],
+      "conflicts": [
+        "sqm"
+      ],
+      "supported_targets": [
+        "x86_64",
+        "xiaomi_ax9000"
+      ],
+      "default_for": []
+    },
+    {
+      "id": "adblock",
+      "name": "广告过滤",
+      "description": "提供 OpenWrt adblock 服务和 LuCI 管理界面。",
+      "category": "services",
+      "packages": [
+        "adblock",
+        "luci-app-adblock"
+      ],
+      "depends": [
+        "web-ui"
+      ],
+      "conflicts": [],
+      "supported_targets": [
+        "x86_64",
+        "xiaomi_ax9000"
+      ],
+      "default_for": []
+    },
+    {
+      "id": "usb-storage",
+      "name": "USB 存储支持",
+      "description": "提供 USB 大容量存储、ext4 和挂载管理工具。",
+      "category": "storage",
+      "packages": [
+        "block-mount",
+        "e2fsprogs",
+        "kmod-fs-ext4",
+        "kmod-usb-storage"
+      ],
+      "depends": [],
+      "conflicts": [],
+      "supported_targets": [
+        "x86_64",
+        "xiaomi_ax9000"
+      ],
+      "default_for": []
+    },
+    {
+      "id": "ksmbd",
+      "name": "SMB 文件共享",
+      "description": "提供 ksmbd 文件共享服务和 LuCI 管理界面。",
+      "category": "services",
+      "packages": [
+        "ksmbd-server",
+        "luci-app-ksmbd"
+      ],
+      "depends": [
+        "usb-storage",
+        "web-ui"
+      ],
+      "conflicts": [],
+      "supported_targets": [
+        "x86_64",
+        "xiaomi_ax9000"
+      ],
+      "default_for": []
+    },
+    {
+      "id": "pppoe-server",
+      "name": "PPPoE 接入服务器",
+      "description": "面向实验环境的 PPPoE 服务器，仅在 x86/64 目标开放。",
+      "category": "services",
+      "packages": [
+        "rp-pppoe-server"
+      ],
+      "depends": [],
+      "conflicts": [],
+      "supported_targets": [
+        "x86_64"
+      ],
+      "default_for": []
+    },
+    {
+      "id": "usb-printer",
+      "name": "USB 打印服务",
+      "description": "提供 p910nd USB 打印服务和 LuCI 管理界面。",
+      "category": "services",
+      "packages": [
+        "kmod-usb-printer",
+        "luci-app-p910nd",
+        "p910nd"
+      ],
+      "depends": [
+        "web-ui"
+      ],
+      "conflicts": [],
+      "supported_targets": [
+        "x86_64",
+        "xiaomi_ax9000"
+      ],
+      "default_for": []
+    }
+  ]
+}

@@ -5,6 +5,8 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const path = require('node:path');
 const vm = require('node:vm');
+const { webcrypto } = require('node:crypto');
+const { TextEncoder } = require('node:util');
 
 class FakeClassList {
   constructor() { this.values = new Set(); }
@@ -27,6 +29,9 @@ class FakeElement {
     this.rel = '';
     this.value = '';
     this.disabled = false;
+    this.checked = false;
+    this.selected = false;
+    this.type = '';
     this.attributes = new Map();
     this.fields = new Map();
     this.listeners = new Map();
@@ -99,6 +104,23 @@ function makeDom() {
   selectors.get('#vm-history-actions').hidden = true;
   selectors.set('[data-vm-platform="x86_64"]', makeVmCard());
   selectors.set('#data-status', new FakeElement('p'));
+  selectors.set('#component-status', new FakeElement('p'));
+  for (const selector of ['#component-target', '#component-flavor', '#component-category']) {
+    selectors.set(selector, new FakeElement('select'));
+    selectors.get(selector).disabled = true;
+  }
+  selectors.set('#component-search', new FakeElement('input'));
+  selectors.set('#component-error', new FakeElement('p'));
+  selectors.get('#component-error').hidden = true;
+  selectors.set('#component-list', new FakeElement('div'));
+  selectors.set('#component-packages', new FakeElement('pre'));
+  selectors.set('#component-normalized', new FakeElement('code'));
+  selectors.set('#component-request-hash', new FakeElement('code'));
+  selectors.set('#component-actions-inputs', new FakeElement('code'));
+  selectors.set('#copy-actions-inputs', new FakeElement('button'));
+  selectors.get('#copy-actions-inputs').disabled = true;
+  selectors.set('#custom-build-workflow-link', new FakeElement('a'));
+  selectors.get('#custom-build-workflow-link').hidden = true;
   const configForm = new FakeElement('form');
   configForm.elements = {
     hostname: new FakeElement('input'),
@@ -129,18 +151,18 @@ function makeDom() {
 
 const root = path.resolve(__dirname, '..');
 const source = fs.readFileSync(path.join(root, 'site/app.js'), 'utf8');
-const testedSource = source.replace(/\nloadReleases\(\);\s*$/, '\n') +
-  '\nglobalThis.hooks = { validDevice, validRelease, validReleaseGroup, validVmRelease, validVmReleaseGroup, validUtcTimestamp, compareVersions, loadReleases, generateSnippet };\n';
+const testedSource = source.replace(/\nloadReleases\(\);\nloadComponentCatalog\(\);\s*$/, '\n') +
+  '\nglobalThis.hooks = { validDevice, validRelease, validReleaseGroup, validVmRelease, validVmReleaseGroup, validUtcTimestamp, compareVersions, loadReleases, generateSnippet, validateComponentCatalog, resolveComponentSelection, componentHashPayload, canonicalJson, sha256Hex, normalizedBuildRequest, actionsInputs, loadComponentCatalog, changeComponentSelection, renderComponentChoices, getRequestedComponentIds: () => [...requestedComponentIds], getResolvedComponentIds: () => [...resolvedComponentIds] };\n';
 const document = makeDom();
 const loggedErrors = [];
 const context = vm.createContext({
-  URL, Date, Set, JSON, Number, Intl,
+  URL, Date, Set, Map, JSON, Number, Intl, Uint8Array, TextEncoder, crypto: webcrypto,
   document,
   fetch: async () => { throw new Error('fetch stub not configured'); },
   console: { error: (...args) => loggedErrors.push(args) },
 });
 vm.runInContext(testedSource, context, { filename: 'site/app.js' });
-const { validDevice, validRelease, validReleaseGroup, validVmRelease, validVmReleaseGroup, validUtcTimestamp, compareVersions, loadReleases, generateSnippet } = context.hooks;
+const { validDevice, validRelease, validReleaseGroup, validVmRelease, validVmReleaseGroup, validUtcTimestamp, compareVersions, loadReleases, generateSnippet, validateComponentCatalog, resolveComponentSelection, componentHashPayload, canonicalJson, sha256Hex, normalizedBuildRequest, actionsInputs, loadComponentCatalog, changeComponentSelection, renderComponentChoices, getRequestedComponentIds, getResolvedComponentIds } = context.hooks;
 const clone = (value) => JSON.parse(JSON.stringify(value));
 
 const index = JSON.parse(fs.readFileSync(path.join(root, 'site/releases.json'), 'utf8'));
@@ -310,6 +332,22 @@ const vmV2 = makeVmReleaseV4('v0.2.0-rc.1', '2026-07-18T03:00:00Z', 2);
 assert.equal(validVmRelease(vmV1, 4), true);
 assert.equal(validVmRelease(vmV2, 4), true);
 assert.equal(validVmReleaseGroup({ latest: vmV2, history: [vmV2, vmV1] }, 4), true);
+const vmStable = clone(vmV2);
+vmStable.version = 'v0.2.0';
+vmStable.tag = 'vm-x86_64-v0.2.0';
+vmStable.published_at = '2026-07-18T04:00:00Z';
+vmStable.release_url = 'https://github.com/tifycloud/NexaWrt/releases/tag/vm-x86_64-v0.2.0';
+vmStable.esxi_validation = 'validated';
+vmStable.validation.esxi = 'validated';
+for (const asset of Object.values(vmStable.assets)) {
+  asset.url = asset.url.replace('/vm-x86_64-v0.2.0-rc.1/', '/vm-x86_64-v0.2.0/');
+}
+assert.equal(validVmRelease(vmStable, 4), true);
+assert.equal(compareVersions(vmStable.version, vmV2.version), 1);
+assert.equal(validVmReleaseGroup({ latest: vmStable, history: [vmStable, vmV2, vmV1] }, 4), true);
+const invalidStable = clone(vmStable);
+invalidStable.assets.raw_bios.name = invalidStable.assets.raw_bios.name.replace('-rc.1', '');
+assert.equal(validVmRelease(invalidStable, 4), false);
 for (const mutate of [
   (value) => { value.vm_only = false; },
   (value) => { value.not_ax9000_firmware = false; },
@@ -439,7 +477,90 @@ function assertSafeEmptyState() {
   assert.equal(document.querySelector('#data-status').classList.contains('error'), true);
 }
 
+
+const componentCatalog = JSON.parse(fs.readFileSync(path.join(root, 'components/catalog.json'), 'utf8'));
+
+async function loadCatalogWith(responseFactory) {
+  context.fetch = responseFactory;
+  await loadComponentCatalog();
+  await new Promise((resolve) => setTimeout(resolve, 20));
+}
+
+function flattenChildren(element) {
+  const output = [];
+  for (const child of element.children) output.push(child, ...flattenChildren(child));
+  return output;
+}
+
 (async () => {
+  assert.equal(validateComponentCatalog(componentCatalog), true);
+  const invalidCatalog = clone(componentCatalog);
+  invalidCatalog.components.find((item) => item.id === 'wireguard').depends = ['missing-component'];
+  assert.equal(validateComponentCatalog(invalidCatalog), false);
+  const cyclicCatalog = clone(componentCatalog);
+  cyclicCatalog.components.find((item) => item.id === 'web-ui').depends = ['wireguard'];
+  assert.equal(validateComponentCatalog(cyclicCatalog), false);
+  const asymmetricCatalog = clone(componentCatalog);
+  asymmetricCatalog.components.find((item) => item.id === 'qosify').conflicts = [];
+  assert.equal(validateComponentCatalog(asymmetricCatalog), false);
+
+  const dependencySelection = resolveComponentSelection(componentCatalog, 'x86_64', ['wireguard']);
+  assert.equal(dependencySelection.ok, true);
+  assert.deepEqual([...dependencySelection.requested_components], ['wireguard']);
+  assert.deepEqual([...dependencySelection.default_components], ['diagnostic-tools', 'web-ui']);
+  assert.deepEqual([...dependencySelection.resolved_components], ['diagnostic-tools', 'web-ui', 'wireguard']);
+  assert.equal(dependencySelection.packages.includes('wireguard-tools'), true);
+  const conflictingSelection = resolveComponentSelection(componentCatalog, 'x86_64', ['sqm', 'qosify']);
+  assert.equal(conflictingSelection.ok, false);
+  assert.match(conflictingSelection.error, /组件冲突/);
+  assert.equal(resolveComponentSelection(componentCatalog, 'xiaomi_ax9000', ['pppoe-server']).ok, false);
+
+  const hashPayload = componentHashPayload(componentCatalog, 'x86_64', 'official', dependencySelection);
+  assert.equal(canonicalJson(hashPayload), '{"catalog_version":"2026.07.20","components":["diagnostic-tools","web-ui","wireguard"],"flavor":"official","packages":["ca-bundle","curl","ethtool","iperf3","kmod-wireguard","luci-app-firewall","luci-base","luci-proto-wireguard","luci-ssl","tcpdump","wireguard-tools"],"schema_version":1,"target":"x86_64"}');
+  const normalizedHash = await sha256Hex(canonicalJson(hashPayload));
+  assert.equal(normalizedHash, '2aeca1c0914e74fa52c7e7748a5e3870e510a91883b1f647312addf678f966cf');
+  const normalized = normalizedBuildRequest(componentCatalog, 'official', dependencySelection, normalizedHash);
+  assert.match(actionsInputs(normalized), /^target=x86_64\nflavor=official\ncomponents=wireguard\ncatalog_version=2026\.07\.20\nrequest_hash=2aeca1c0914e74fa52c7e7748a5e3870e510a91883b1f647312addf678f966cf$/);
+
+  await loadCatalogWith(async (url, options) => {
+    assert.equal(url, 'components/catalog.json');
+    assert.equal(options.cache, 'no-store');
+    assert.equal(options.credentials, 'same-origin');
+    return { ok: true, json: async () => clone(componentCatalog) };
+  });
+  assert.equal(document.querySelector('#component-status').classList.contains('error'), false);
+  assert.equal(document.querySelector('#component-target').disabled, false);
+  assert.equal(document.querySelector('#component-target').value, 'x86_64');
+  assert.equal(document.querySelector('#component-flavor').value, 'official');
+  assert.deepEqual([...getRequestedComponentIds()], []);
+  assert.deepEqual([...getResolvedComponentIds()].sort(), ['diagnostic-tools', 'web-ui']);
+  assert.match(document.querySelector('#component-request-hash').textContent, /^sha256:[a-f0-9]{64}$/);
+  assert.equal(document.querySelector('#custom-build-workflow-link').href, 'https://github.com/tifycloud/NexaWrt/actions/workflows/custom-build.yml');
+  assert.equal(document.querySelector('#custom-build-workflow-link').hidden, false);
+  assert.match(document.querySelector('#component-actions-inputs').textContent, /components=\n/);
+
+  changeComponentSelection('sqm', true);
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  assert.equal(getRequestedComponentIds().includes('sqm'), true);
+  changeComponentSelection('qosify', true);
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  assert.equal(getRequestedComponentIds().includes('qosify'), false);
+  assert.equal(document.querySelector('#component-error').classList.contains('error'), true);
+  assert.match(document.querySelector('#component-error').textContent, /组件冲突/);
+
+  document.querySelector('#component-search').value = 'p910nd';
+  renderComponentChoices();
+  const visibleText = flattenChildren(document.querySelector('#component-list')).map((item) => item.textContent).join(' ');
+  assert.match(visibleText, /USB 打印服务/);
+  assert.doesNotMatch(visibleText, /SQM 智能队列/);
+  document.querySelector('#component-search').value = '';
+
+  await loadCatalogWith(async () => ({ ok: true, json: async () => ({ schema_version: 999 }) }));
+  assert.equal(document.querySelector('#component-status').classList.contains('error'), true);
+  assert.equal(document.querySelector('#custom-build-workflow-link').hidden, true);
+  assert.equal(document.querySelector('#custom-build-workflow-link').href, undefined);
+  assert.equal(document.querySelector('#copy-actions-inputs').disabled, true);
+
   const configForm = document.querySelector('#config-form');
   const configOutput = document.querySelector('#config-output');
   const configError = document.querySelector('#config-error');
@@ -559,7 +680,7 @@ function assertSafeEmptyState() {
   assertSafeEmptyState();
   assert.equal(loggedErrors.length >= 5, true);
 
-  console.log('Pages UI policy: schema-v3 legacy plus schema-v4 VM v1/v2 rendering, isolation, and fail-closed safety');
+  console.log('Pages UI policy: release rendering plus fail-closed catalog selector, dependency/conflict resolution, normalized request hashing, and authenticated Actions handoff');
 })().catch((error) => {
   console.error(error);
   process.exitCode = 1;

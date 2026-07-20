@@ -31,10 +31,11 @@ CHANNEL = "ram-test"
 VERSION_PATTERN = re.compile(
     r"^v(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)-rc\.(?:0|[1-9][0-9]*)$"
 )
-PROOF_SCHEMA_VERSION = 4
+PROOF_SCHEMA_VERSION = 5
 TRUSTED_REF = "refs/heads/main"
 SIGNER_WORKFLOW = f"{REPOSITORY}/.github/workflows/release.yml"
 VM_SIGNER_WORKFLOW = f"{REPOSITORY}/.github/workflows/vm-release.yml"
+VM_PROMOTION_WORKFLOW = f"{REPOSITORY}/.github/workflows/vm-promote.yml"
 VM_PLATFORM = "x86_64"
 VM_WORKFLOW_URL = f"{WEB_ROOT}/actions/workflows/vm-release.yml"
 VM_DOCS_URL = f"{WEB_ROOT}/blob/main/docs/VM-X86_64.md"
@@ -175,39 +176,29 @@ def validate_vm_asset_proofs(value: Any, expected: dict[str, str], tag: str) -> 
 
 def load_proofs(path: Path, metadata: dict[str, Any]) -> dict[str, dict[str, dict[str, Any]]]:
     document = load_json_file(path, "proof manifest")
-    expected_top = {
-        "schema_version", "repository", "trusted_ref", "trusted_main_digest",
-        "signer_workflows", "releases", "virtual_images",
-    }
+    expected_top = {"schema_version", "repository", "trusted_ref", "trusted_main_digest", "signer_workflows", "releases", "virtual_images"}
     if not isinstance(document, dict) or set(document) != expected_top:
         raise ValueError("proof manifest schema is invalid")
-    if document["schema_version"] != PROOF_SCHEMA_VERSION or document["repository"] != REPOSITORY:
-        raise ValueError("proof manifest identity is invalid")
-    if document["trusted_ref"] != TRUSTED_REF:
-        raise ValueError("proof manifest trust policy is invalid")
-    workflows = document["signer_workflows"]
-    if not isinstance(workflows, dict) or workflows != {"ax9000": SIGNER_WORKFLOW, "vm_x86_64": VM_SIGNER_WORKFLOW}:
+    if document["schema_version"] != PROOF_SCHEMA_VERSION or document["repository"] != REPOSITORY or document["trusted_ref"] != TRUSTED_REF:
+        raise ValueError("proof manifest identity or trust policy is invalid")
+    expected_workflows = {"ax9000": SIGNER_WORKFLOW, "vm_x86_64": VM_SIGNER_WORKFLOW, "vm_x86_64_promotion": VM_PROMOTION_WORKFLOW}
+    if document["signer_workflows"] != expected_workflows:
         raise ValueError("proof manifest signer workflow policy is invalid")
     if not isinstance(document["trusted_main_digest"], str) or not HEX_SHA_RE.fullmatch(document["trusted_main_digest"]):
         raise ValueError("proof manifest trusted main digest is invalid")
-
     releases = document["releases"]
     if not isinstance(releases, dict) or len(releases) > 100:
         raise ValueError("proof manifest releases must be an object of at most 100 entries")
-    expected_proof = {
-        "release_id", "source_digest", "archive_sha256", "checksum_sha256", "verified_subjects",
-    }
+    expected_proof = {"release_id", "source_digest", "archive_sha256", "checksum_sha256", "verified_subjects"}
     validated: dict[str, dict[str, Any]] = {}
     for tag, proof in releases.items():
         if release_identity(tag, metadata) is None or not isinstance(proof, dict) or set(proof) != expected_proof:
             raise ValueError(f"proof entry is invalid: {tag}")
-        release_id = proof["release_id"]
-        if isinstance(release_id, bool) or not isinstance(release_id, int) or release_id <= 0:
+        if isinstance(proof["release_id"], bool) or not isinstance(proof["release_id"], int) or proof["release_id"] <= 0:
             raise ValueError(f"proof release ID is invalid: {tag}")
         if not isinstance(proof["source_digest"], str) or not HEX_SHA_RE.fullmatch(proof["source_digest"]):
             raise ValueError(f"proof source digest is invalid: {tag}")
-        if any(not isinstance(proof[key], str) or not HEX_SHA256_RE.fullmatch(proof[key])
-               for key in ("archive_sha256", "checksum_sha256")):
+        if any(not isinstance(proof[key], str) or not HEX_SHA256_RE.fullmatch(proof[key]) for key in ("archive_sha256", "checksum_sha256")):
             raise ValueError(f"proof asset digest is invalid: {tag}")
         if proof["verified_subjects"] != VERIFIED_SUBJECTS:
             raise ValueError(f"proof subjects are incomplete: {tag}")
@@ -219,39 +210,56 @@ def load_proofs(path: Path, metadata: dict[str, Any]) -> dict[str, dict[str, dic
     vm_entries = virtual_images[VM_PLATFORM]
     if not isinstance(vm_entries, dict) or len(vm_entries) > 100:
         raise ValueError("proof manifest VM releases must be an object of at most 100 entries")
-    vm_expected_proof = {
-        "release_id", "source_digest", "contract_version", "assets", "verified_subjects", "validation",
-    }
     vm_validated: dict[str, dict[str, Any]] = {}
-    seen_vm_release_ids: set[int] = set()
-    seen_vm_asset_ids: set[int] = set()
+    seen_release_ids: set[int] = set()
+    seen_asset_ids: set[int] = set()
+    rc_fields = {"release_id", "source_digest", "contract_version", "assets", "verified_subjects", "validation"}
+    stable_fields = rc_fields | {"source_rc_tag", "source_rc_release_id", "evidence_path", "evidence_commit"}
     for tag, proof in vm_entries.items():
         version = vm_identity(tag)
-        if version is None or not isinstance(proof, dict) or set(proof) != vm_expected_proof:
+        stable = version is not None and VERSION_PATTERN.fullmatch(version) is None
+        if version is None or not isinstance(proof, dict) or set(proof) != (stable_fields if stable else rc_fields):
             raise ValueError(f"VM proof entry is invalid: {tag}")
-        contract_version = proof["contract_version"]
-        if isinstance(contract_version, bool) or contract_version not in (VM_CONTRACT_V1, VM_CONTRACT_V2):
+        contract = proof["contract_version"]
+        if isinstance(contract, bool) or contract not in (VM_CONTRACT_V1, VM_CONTRACT_V2) or (stable and contract != VM_CONTRACT_V2):
             raise ValueError(f"VM proof contract version is invalid: {tag}")
         release_id = proof["release_id"]
-        if (isinstance(release_id, bool) or not isinstance(release_id, int) or release_id <= 0 or
-                release_id in seen_vm_release_ids):
+        if isinstance(release_id, bool) or not isinstance(release_id, int) or release_id <= 0 or release_id in seen_release_ids:
             raise ValueError(f"VM proof release ID is invalid or replayed: {tag}")
-        seen_vm_release_ids.add(release_id)
+        seen_release_ids.add(release_id)
         if not isinstance(proof["source_digest"], str) or not HEX_SHA_RE.fullmatch(proof["source_digest"]):
             raise ValueError(f"VM proof source digest is invalid: {tag}")
-        if proof["verified_subjects"] != VM_VERIFIED_SUBJECTS[contract_version]:
+        if proof["verified_subjects"] != VM_VERIFIED_SUBJECTS[contract]:
             raise ValueError(f"VM proof subjects are incomplete: {tag}")
-        validate_vm_validation(proof["validation"], contract_version, tag)
-        validated_assets = validate_vm_asset_proofs(
-            proof["assets"], vm_expected_assets(version, contract_version), tag,
-        )
-        asset_ids = {asset["id"] for asset in validated_assets.values()}
-        if asset_ids & seen_vm_asset_ids:
+        expected_esxi = "validated" if stable else "not-tested"
+        validate_vm_validation(proof["validation"], contract, tag, expected_esxi)
+        asset_version = proof["source_rc_tag"].removeprefix(f"vm-{VM_PLATFORM}-") if stable else version
+        assets = validate_vm_asset_proofs(proof["assets"], vm_expected_assets(asset_version, contract), tag)
+        ids = {asset["id"] for asset in assets.values()}
+        if ids & seen_asset_ids:
             raise ValueError(f"VM proof asset ID is replayed across releases: {tag}")
-        seen_vm_asset_ids.update(asset_ids)
+        seen_asset_ids.update(ids)
         vm_validated[tag] = proof
+    for tag, proof in vm_validated.items():
+        version = vm_identity(tag)
+        if version is None or VERSION_PATTERN.fullmatch(version):
+            continue
+        source_tag = proof["source_rc_tag"]
+        source = vm_validated.get(source_tag)
+        source_version = vm_identity(source_tag)
+        if (source is None or source_version is None or not VERSION_PATTERN.fullmatch(source_version) or
+                source_version.split("-rc.", 1)[0] != version or source["contract_version"] != VM_CONTRACT_V2 or
+                proof["source_rc_release_id"] != source["release_id"] or proof["source_digest"] != source["source_digest"] or
+                not isinstance(proof["evidence_path"], str) or not re.fullmatch(r"evidence/vm-esxi/[A-Za-z0-9][A-Za-z0-9._/-]{0,180}\.json", proof["evidence_path"]) or
+                not isinstance(proof["evidence_commit"], str) or not HEX_SHA_RE.fullmatch(proof["evidence_commit"])):
+            raise ValueError(f"stable VM proof source linkage is invalid: {tag}")
+        for key, asset in proof["assets"].items():
+            source_asset = source["assets"][key]
+            if asset["id"] == source_asset["id"] or any(asset[field] != source_asset[field] for field in ("name", "size", "sha256")):
+                raise ValueError(f"stable VM proof assets do not exactly match source RC bytes: {tag}:{key}")
+        if proof["validation"]["qemu"] != source["validation"]["qemu"]:
+            raise ValueError(f"stable VM proof QEMU linkage is invalid: {tag}")
     return {"releases": validated, "virtual_images": {VM_PLATFORM: vm_validated}}
-
 
 def normalize_timestamp(value: Any) -> str | None:
     if not isinstance(value, str) or len(value) > 40:
@@ -286,7 +294,7 @@ def vm_identity(tag: Any) -> str | None:
     if not isinstance(tag, str) or len(tag) > 100 or not tag.startswith(prefix):
         return None
     version = tag[len(prefix):]
-    if VERSION_PATTERN.fullmatch(version) and tag == f"{prefix}{version}":
+    if (VERSION_PATTERN.fullmatch(version) or re.fullmatch(r"v(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)", version)) and tag == f"{prefix}{version}":
         return version
     return None
 
@@ -338,9 +346,9 @@ def vm_expected_assets(version: str, contract_version: int = VM_CONTRACT_V1) -> 
     return result
 
 
-def validate_vm_validation(value: Any, contract_version: int, tag: str) -> dict[str, Any]:
+def validate_vm_validation(value: Any, contract_version: int, tag: str, expected_esxi: str = "not-tested") -> dict[str, Any]:
     expected_variants = ("raw_bios",) if contract_version == VM_CONTRACT_V1 else VM_VARIANTS
-    if not isinstance(value, dict) or set(value) != {"qemu", "esxi"} or value.get("esxi") != "not-tested":
+    if not isinstance(value, dict) or set(value) != {"qemu", "esxi"} or value.get("esxi") != expected_esxi:
         raise ValueError(f"VM proof validation policy is invalid: {tag}")
     qemu = value.get("qemu")
     if (not isinstance(qemu, dict) or set(qemu) != set(expected_variants) or
@@ -427,91 +435,59 @@ def sanitize_release(
 
 
 def sanitize_vm_release(raw: Any, proofs: dict[str, dict[str, Any]]) -> dict[str, Any] | None:
-    if (
-        not isinstance(raw, dict)
-        or raw.get("draft") is not False
-        or raw.get("prerelease") is not True
-        or raw.get("immutable") is not True
-    ):
+    if not isinstance(raw, dict) or raw.get("draft") is not False or raw.get("immutable") is not True:
         return None
     tag = raw.get("tag_name")
     version = vm_identity(tag)
     published_at = normalize_timestamp(raw.get("published_at"))
     if version is None or published_at is None:
         return None
+    stable = VERSION_PATTERN.fullmatch(version) is None
+    if raw.get("prerelease") is not (not stable):
+        return None
     proof = proofs.get(tag)
     release_id = raw.get("id")
-    if proof is None or isinstance(release_id, bool) or not isinstance(release_id, int) or release_id <= 0:
-        return None
-    if proof["release_id"] != release_id:
+    if proof is None or isinstance(release_id, bool) or not isinstance(release_id, int) or release_id <= 0 or proof["release_id"] != release_id:
         return None
     contract_version = proof["contract_version"]
+    asset_version = proof["source_rc_tag"].removeprefix(f"vm-{VM_PLATFORM}-") if stable else version
+    expected = vm_expected_assets(asset_version, contract_version)
     assets = raw.get("assets")
-    expected = vm_expected_assets(version, contract_version)
     if not isinstance(assets, list) or len(assets) != len(expected):
         return None
     allowed_by_name = {name: key for key, name in expected.items()}
-    proof_assets = proof["assets"]
     present: dict[str, dict[str, Any]] = {}
-    remote_names: set[str] = set()
-    remote_ids: set[int] = set()
+    seen_names: set[str] = set(); seen_ids: set[int] = set()
     for asset in assets:
-        if not isinstance(asset, dict):
-            return None
+        if not isinstance(asset, dict): return None
         name, asset_id, size = asset.get("name"), asset.get("id"), asset.get("size")
-        if (not isinstance(name, str) or name in remote_names or "AX9000" in name or "ax9000" in name or
-                isinstance(asset_id, bool) or not isinstance(asset_id, int) or asset_id <= 0 or asset_id in remote_ids):
-            return None
-        remote_names.add(name)
-        remote_ids.add(asset_id)
         key = allowed_by_name.get(name)
-        if key is None or asset.get("state") != "uploaded":
+        if (key is None or name in seen_names or isinstance(asset_id, bool) or not isinstance(asset_id, int) or asset_id <= 0 or
+                asset_id in seen_ids or isinstance(size, bool) or not isinstance(size, int) or size <= 0 or asset.get("state") != "uploaded"):
             return None
-        if not isinstance(size, int) or isinstance(size, bool) or size <= 0:
+        seen_names.add(name); seen_ids.add(asset_id)
+        identity = proof["assets"][key]
+        if identity["id"] != asset_id or identity["name"] != name or identity["size"] != size or asset.get("digest") != f"sha256:{identity['sha256']}":
             return None
-        identity = proof_assets[key]
-        if identity["id"] != asset_id or identity["name"] != name or identity["size"] != size:
-            return None
-        expected_digest = f"sha256:{identity['sha256']}"
-        remote_digest = asset.get("digest")
-        if (contract_version == VM_CONTRACT_V2 and remote_digest != expected_digest) or (
-                contract_version == VM_CONTRACT_V1 and remote_digest is not None and remote_digest != expected_digest):
-            return None
-        present[key] = {
-            "name": name,
-            "url": safe_download_url(tag, name),
-            "size": size,
-            "sha256": identity["sha256"],
-        }
-    if remote_names != set(expected.values()) or set(present) != set(expected):
-        return None
+        present[key] = {"name": name, "url": safe_download_url(tag, name), "size": size, "sha256": identity["sha256"]}
+    if set(present) != set(expected): return None
+    validation = proof["validation"]
     return {
-        "platform": VM_PLATFORM,
-        "artifact_class": "VM_DISTRIBUTION_IMAGE" if contract_version == VM_CONTRACT_V1 else "VM_DISTRIBUTION_SET",
-        "contract_version": contract_version,
-        "release_contract": "vm-x86_64/v1" if contract_version == VM_CONTRACT_V1 else "vm-x86_64/v2",
-        "vm_only": True,
-        "not_ax9000_firmware": True,
-        "hardware_validation": False,
-        "nss_validation": False,
-        "qemu_validated": True,
-        "esxi_validation": "not-tested",
-        "ssh_default": "disabled",
-        "validation": proof["validation"],
-        "version": version,
-        "tag": tag,
-        "published_at": published_at,
-        "release_url": f"{WEB_ROOT}/releases/tag/{quote(tag, safe='')}",
-        "browser_build_workflow_url": VM_WORKFLOW_URL,
-        "docs_url": VM_DOCS_URL,
-        "assets": {key: present[key] for key in expected},
+        "platform": VM_PLATFORM, "artifact_class": "VM_DISTRIBUTION_IMAGE" if contract_version == 1 else "VM_DISTRIBUTION_SET",
+        "contract_version": contract_version, "release_contract": f"vm-x86_64/v{contract_version}", "vm_only": True,
+        "not_ax9000_firmware": True, "hardware_validation": False, "nss_validation": False, "qemu_validated": True,
+        "esxi_validation": validation["esxi"], "ssh_default": "disabled", "validation": validation,
+        "version": version, "tag": tag, "published_at": published_at,
+        "release_url": f"{WEB_ROOT}/releases/tag/{quote(tag, safe='')}", "browser_build_workflow_url": VM_WORKFLOW_URL,
+        "docs_url": VM_DOCS_URL, "assets": {key: present[key] for key in expected},
     }
 
 def version_order(version: str) -> tuple[int, int, int, int]:
-    match = re.fullmatch(r"v([0-9]+)\.([0-9]+)\.([0-9]+)-rc\.([0-9]+)", version)
+    match = re.fullmatch(r"v([0-9]+)\.([0-9]+)\.([0-9]+)(?:-rc\.([0-9]+))?", version)
     if match is None:
         raise ValueError(f"invalid release version: {version}")
-    return tuple(int(part) for part in match.groups())
+    major, minor, patch, rc = match.groups()
+    return int(major), int(minor), int(patch), (1_000_000_000 if rc is None else int(rc))
 
 
 def build_document(

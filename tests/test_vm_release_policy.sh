@@ -145,6 +145,14 @@ for text in \
   'authorized_keys=ABSENT' \
   'dropbear_enabled=NO' \
   'dropbear_running=NO' \
+  'NEXAWRT_VM_PRODUCTION_RUNTIME_V1_BEGIN' \
+  'qemu-img convert -f vmdk -O qcow2' \
+  "printf 'https=%s\\n'" \
+  "printf 'http_redirect=%s\\n'" \
+  "printf 'runtime_evidence=%s\\n'" \
+  "printf 'production_runtime=%s\\n'" \
+  "printf 'raw_bios_persistence=%s\\n'" \
+  "printf 'vmdk_import_persistence=%s\\n'" \
   "printf 'release_contract=vm-x86_64/v2\\n'" \
   "printf 'raw_bios_qemu=%s\\n'" \
   "printf 'iso_bios_qemu=%s\\n'" \
@@ -171,12 +179,14 @@ if match is None:
 keys = re.findall(r"printf '([a-z0-9_]+)=", match.group("body"))
 expected = {
     "status", "target", "release_contract", "vm_only", "not_ax9000_firmware",
-    "hardware_validation", "nss_validation", "exact_release_image", "serial_labels", "http",
-    "ssh_runtime_evidence", "ssh_port_probe", "ssh", "authorized_keys", "dropbear_enabled",
-    "dropbear_running", "http_status", "auth_challenge", "http_host_port", "ssh_host_port",
-    "serial_log", "ssh_probe_log", "raw_bios_file", "raw_bios_qemu", "iso_bios_file",
-    "iso_bios_qemu", "iso_efi_file", "iso_efi_qemu", "vmdk_bios_file", "vmdk_bios_qemu",
-    "vmdk_efi_file", "vmdk_efi_qemu", "esxi_validation",
+    "hardware_validation", "nss_validation", "exact_release_image", "serial_labels", "https",
+    "http_redirect", "runtime_evidence", "production_runtime", "raw_bios_persistence",
+    "vmdk_import_persistence", "ssh_port_probe", "ssh", "authorized_keys", "dropbear_enabled",
+    "dropbear_running", "http_redirect_status", "https_status", "auth_challenge",
+    "http_host_port", "https_host_port", "ssh_host_port", "serial_log", "ssh_probe_log",
+    "raw_bios_file", "raw_bios_qemu", "iso_bios_file", "iso_bios_qemu", "iso_efi_file",
+    "iso_efi_qemu", "vmdk_bios_file", "vmdk_bios_qemu", "vmdk_efi_file",
+    "vmdk_efi_qemu", "esxi_validation",
 }
 if len(keys) != len(set(keys)) or set(keys) != expected:
     raise SystemExit(f"write_report exact keys mismatch: keys={keys!r}")
@@ -206,7 +216,12 @@ for text in \
   'vmdk_bios_qemu": "runtime-pass"' \
   'vmdk_efi_qemu": "runtime-pass"' \
   'esxi_validation": "not-tested"' \
-  '(values["http_status"], values["auth_challenge"]) not in {("200", "false"), ("403", "true")}' \
+  '"raw_bios_persistence": "PASS"' \
+  '"vmdk_import_persistence": "PASS"' \
+  'name: vm-release-diagnostics-${{ github.run_id }}-${{ github.run_attempt }}' \
+  'values["http_redirect_status"] not in {"301", "302", "307", "308"}' \
+  '(values["https_status"], values["auth_challenge"]) not in {("200", "false"), ("403", "true")}' \
+  'for key in ("http_host_port", "https_host_port", "ssh_host_port")' \
   '1024 <= int(values[key]) <= 65535' \
   'expected_result_dir = report_path.parent / "raw_bios"' \
   'test "$(find "$PUBLISH_DIR" -maxdepth 1 -type f | wc -l)" -eq 15' \

@@ -213,6 +213,12 @@ macOS 自带的 Bash、Make 和默认大小写不敏感文件系统通常不满�
 **Artifacts** 区域下载 `NexaWrt-AX9000-<flavor>-verified-dist-<commit>`。该下载仍是 RAM-only
 真机测试候选，不是可直接写入闪存的生产刷机包。
 
+### 浏览器自选组件云编译
+
+GitHub Pages 的 **组件 / Components** 区域读取仓库审核过的 `components/catalog.json`，支持 x86_64 和 Xiaomi AX9000、组件搜索、依赖自动补齐与冲突阻止。网页只生成规范化请求和 request hash，不保存 GitHub token，也不接受任意软件包、脚本、路径或 UCI 输入。
+
+登录 GitHub 后打开 **Actions → NexaWrt custom component build → Run workflow**，按页面给出的 `target`、`flavor` 和 `components` 输入启动构建。空 `components` 表示仅使用目标默认组件；非空值只能是目录中的组件 ID。构建成功后从该次运行的 **Artifacts** 下载带 `custom-build-manifest.json` 和 `SHA256SUMS` 的产物。自定义产物是按需构建结果，不会自动冒充正式 Release；AX9000 产物仍受 RAM-only/真机门禁约束。
+
 两个 flavor 的安全构建流程都只允许 AX9000 single-large-UBI initramfs profile，artifact 名
 必须能追溯到 flavor，镜像文件名必须能追溯到 profile。当前 profile 明确关闭 sysupgrade 和
 factory 产物，产物门检会拒绝任何可刷写镜像。
@@ -255,7 +261,7 @@ OpenWrt 用户空间和自动化流程可运行，不能证明 AX9000、Qualcomm
 VM 有两条彼此隔离的路径：
 
 - **VM smoke (QEMU only)**：覆盖 `x86-64` 与 `armsr-armv8`，注入一次性 CI SSH 公钥，只用于仓库自动化冒烟检查，不发布给用户。
-- **NexaWrt x86_64 VM release**：只构建 `x86-64` 用户发行镜像，不注入任何 SSH 公钥、默认禁用 Dropbear。当前 `vm-x86_64/v2` 合同发布五种镜像：raw BIOS、BIOS Live ISO、EFI Live ISO、BIOS VMDK 和 EFI VMDK。工作流分别用 SeaBIOS/OVMF 对即将发布的五个精确文件执行 QEMU 运行时检查，验证启动存活、LuCI、串口 VM-only 标签、Dropbear 已禁用且未运行、`authorized_keys` 缺失，以及转发到 guest 22 的随机主机端口没有 SSH 服务；通过后发布独立的 `vm-x86_64-vX.Y.Z-rc.N` prerelease。两份 ISO 都是 **Live 镜像，不是安装器**，配置不保证持久；两份 VMDK 是 `streamOptimized` VMware 导入传输格式，必须由 ESXi 导入/转换成 datastore 中的可写磁盘，不能把下载文件直接当作长期可写基础盘。当前只完成 QEMU 验证，`ESXI_VALIDATION=not-tested`，尚未在真实 ESXi 上验证。
+- **NexaWrt x86_64 VM release**：只构建 `x86-64` 用户发行镜像，不注入任何 SSH 公钥、默认禁用 Dropbear。当前 `vm-x86_64/v2` 合同发布五种镜像：raw BIOS、BIOS Live ISO、EFI Live ISO、BIOS VMDK 和 EFI VMDK。工作流分别用 SeaBIOS/OVMF 对即将发布的五个精确文件执行双网卡 QEMU 运行时检查，验证静态管理 LAN `192.168.8.1/24`、DHCP WAN、firewall4/nftables、LuCI HTTPS、HTTP 重定向、独立首次启动密码、SSH 默认关闭，以及 raw/导入 VMDK 的重启持久化；通过后发布独立的 `vm-x86_64-vX.Y.Z-rc.N` prerelease。两份 ISO 都是 **Live 镜像，不是安装器**，配置不保证持久；两份 VMDK 是 `streamOptimized` VMware 导入传输格式，必须由 ESXi 导入/转换成 datastore 中的可写磁盘，不能把下载文件直接当作长期可写基础盘。自动化仍不能冒充真实 ESXi；稳定版只能在提交并验证机器可读的真实 ESXi 验收证据后，从精确 RC 资产原位晋级，不允许重编译。
 
 在浏览器中打开 **Actions → NexaWrt x86_64 VM release → Run workflow**，必须选择 `main` 并填写例如
 `vm-x86_64-v0.1.0-rc.1`。预检从 GitHub 远程读取当时的 `main` 精确 commit SHA，要求 dispatch 的
