@@ -217,16 +217,17 @@
             <label>风险 / Risk
               <select id="component-risk" disabled></select>
             </label>
-            <label>官方 Feed
+            <label>Feed
               <select id="component-feed" disabled></select>
             </label>
           </div>
-          <p id="component-package-status" class="component-message package-catalog-status" role="status">正在读取官方包索引… / Loading official package index…</p>
-          <p id="component-result-status" class="component-result-status" aria-live="polite">输入关键词后搜索官方包；精选套餐会直接显示。</p>
+          <p id="component-package-status" class="component-message package-catalog-status" role="status">正在读取软件包索引… / Loading package index…</p>
+          <p class="component-message">社区候选库使用锁定但未签名的 Packages.gz 元数据，仅用于展示 provenance；候选包全部不可选，生产构建不会克隆或执行该 feed，也不会下载或安装 dl.openwrt.ai 的 IPK。</p>
+          <p id="component-result-status" class="component-result-status" aria-live="polite">输入关键词后搜索软件包；精选套餐会直接显示。</p>
           <p id="component-error" class="component-message" role="alert" hidden></p>
           <div class="selected-packages-panel" aria-labelledby="selected-packages-title">
             <div class="selected-packages-heading">
-              <h3 id="selected-packages-title">已选 Official packages</h3>
+              <h3 id="selected-packages-title">已选软件包 / Selected packages</h3>
               <small>即使不在当前搜索结果中也会保留</small>
             </div>
             <div id="component-selected-official" class="selected-packages-list" aria-live="polite"></div>

@@ -12,6 +12,7 @@ HIGH_RISK_EXACT = frozenset(
         "fwtool",
         "kernel",
         "libc",
+        "luci-base",
         "mtd",
         "opkg",
         "procd",
@@ -55,6 +56,8 @@ ALLOWED_ARCHITECTURES = {
     ("xiaomi_ax9000", "nss"): frozenset({"noarch"}),
 }
 
+PACKAGE_SOURCES = frozenset({"official", "kiddin9"})
+
 
 def blocked_reason_for(package: str) -> str:
     """Return the mandatory block reason, or an empty string when selectable."""
@@ -65,6 +68,22 @@ def blocked_reason_for(package: str) -> str:
         return "设备固件包需按目标硬件审核，不能由通用组件目录直接选择。"
     if lower.startswith("bootloader-") or lower.endswith("-bootloader"):
         return "引导加载器组件不可由自定义构建请求直接选择。"
+    return ""
+
+
+def blocked_reason_for_record(
+    package: str, source: str, *, duplicates_official: bool = False
+) -> str:
+    """Return the source-aware block reason for one catalog record."""
+    reason = blocked_reason_for(package)
+    if reason:
+        return reason
+    if source == "kiddin9":
+        if duplicates_official:
+            return "社区候选库未审核且与 OpenWrt 官方包同名，不允许覆盖官方来源或进入生产构建。"
+        return "社区候选库未完成源码安全审核，不允许进入生产构建。"
+    if source not in PACKAGE_SOURCES:
+        return "包来源不在 NexaWrt 的允许列表中。"
     return ""
 
 

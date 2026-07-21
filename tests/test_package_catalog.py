@@ -36,8 +36,8 @@ catalog = resolver.load_catalog()
 index = resolver.load_package_catalog_index(catalog)
 
 assert set(index) == {"schema_version", "catalog_version", "openwrt_version", "shards"}
-assert index["schema_version"] == 1
-assert index["catalog_version"] == "2026.07.21"
+assert index["schema_version"] == 2
+assert index["catalog_version"] == "2026.07.21.1"
 assert index["openwrt_version"] == "25.12.5"
 assert [(item["target"], item["flavor"]) for item in index["shards"]] == [
     ("x86_64", "official"),
@@ -54,11 +54,15 @@ ROOT_KEYS = {"schema_version", "catalog_version", "openwrt_version", "shards"}
 DESCRIPTOR_KEYS = {
     "target", "flavor", "path", "sha256", "package_count", "selectable_count", "sources"
 }
-SOURCE_KEYS = {"feed", "url", "sha256"}
+OFFICIAL_SOURCE_KEYS = {"feed", "url", "sha256"}
+COMMUNITY_SOURCE_KEYS = {
+    "feed", "url", "sha256", "metadata_format", "metadata_signed",
+    "candidate_repository", "candidate_commit", "catalog_sha256",
+}
 SHARD_KEYS = {"schema_version", "catalog_version", "target", "flavor", "packages"}
 RECORD_KEYS = {
-    "id", "package", "version", "description", "feed", "installed_size", "category",
-    "arch", "risk", "selectable", "blocked_reason"
+    "id", "package", "version", "description", "feed", "source", "installed_size",
+    "category", "arch", "risk", "selectable", "blocked_reason"
 }
 TOKEN_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")
 SHA_RE = re.compile(r"^[0-9a-f]{64}$")
@@ -73,9 +77,23 @@ for descriptor in index["shards"]:
     assert descriptor["sources"]
     assert len({source["feed"] for source in descriptor["sources"]}) == len(descriptor["sources"])
     for source in descriptor["sources"]:
-        assert set(source) == SOURCE_KEYS
-        assert source["url"].startswith("https://downloads.openwrt.org/releases/25.12.5/")
-        assert source["url"].endswith("/packages.adb")
+        if source["feed"] == "kiddin9":
+            assert set(source) == COMMUNITY_SOURCE_KEYS
+            assert (descriptor["target"], descriptor["flavor"]) == ("xiaomi_ax9000", "official")
+            assert source == {
+                "feed": "kiddin9",
+                "url": "https://dl.openwrt.ai/releases/25.12/packages/aarch64_cortex-a53/kiddin9/Packages.gz",
+                "sha256": "ce97a429f7fcd414a22b3ad701118d5299319a84add12c26d401216184c8bd04",
+                "metadata_format": "opkg-packages-gzip",
+                "metadata_signed": False,
+                "candidate_repository": "https://github.com/kiddin9/op-packages.git",
+                "candidate_commit": "9f2092b4f204fc9948226d9a3f5166b69976af48",
+                "catalog_sha256": "4b14b36b0c9839f81bb6a56ffc1ac94384603c7a9c93e7f63ac48ffc4c699292",
+            }
+        else:
+            assert set(source) == OFFICIAL_SOURCE_KEYS
+            assert source["url"].startswith("https://downloads.openwrt.org/releases/25.12.5/")
+            assert source["url"].endswith("/packages.adb")
         assert SHA_RE.fullmatch(source["sha256"])
 
     path = ROOT / descriptor["path"]
@@ -88,35 +106,42 @@ for descriptor in index["shards"]:
         index, catalog, descriptor["target"], descriptor["flavor"]
     )
     assert shard == payload
-    assert shard["schema_version"] == 1
+    assert shard["schema_version"] == 2
     assert shard["catalog_version"] == catalog["catalog_version"]
     assert shard["target"] == descriptor["target"]
     assert shard["flavor"] == descriptor["flavor"]
     assert len(shard["packages"]) == descriptor["package_count"]
     assert sum(item["selectable"] for item in shard["packages"]) == descriptor["selectable_count"]
     assert shard["packages"] == sorted(
-        shard["packages"], key=lambda item: (item["package"], item["version"], item["id"])
+        shard["packages"], key=lambda item: (item["package"], item["source"], item["version"], item["id"])
     )
 
     ids = set()
     package_names = set()
+    official_names = {
+        item["package"] for item in shard["packages"] if item["source"] == "official"
+    }
     for record in shard["packages"]:
         assert set(record) == RECORD_KEYS
         assert TOKEN_RE.fullmatch(record["package"])
         assert not record["package"].startswith(("-", "+"))
-        assert record["id"] == "pkg-" + hashlib.sha256(
-            record["package"].encode("utf-8")
-        ).hexdigest()[:16]
+        id_input = record["package"] if record["source"] == "official" else f"{record['source']}\0{record['package']}"
+        assert record["id"] == "pkg-" + hashlib.sha256(id_input.encode("utf-8")).hexdigest()[:16]
         assert record["id"] not in ids
-        assert record["package"] not in package_names
+        package_key = (record["source"], record["package"])
+        assert package_key not in package_names
         ids.add(record["id"])
-        package_names.add(record["package"])
+        package_names.add(package_key)
         assert record["arch"] in policy.allowed_architectures_for(
             descriptor["target"], descriptor["flavor"]
         )
         assert record["risk"] == policy.risk_for(record["package"], record["feed"])
-        assert record["blocked_reason"] == policy.blocked_reason_for(record["package"])
-        assert record["selectable"] is (not record["blocked_reason"])
+        expected_reason = policy.blocked_reason_for_record(
+            record["package"], record["source"],
+            duplicates_official=record["source"] == "kiddin9" and record["package"] in official_names,
+        )
+        assert record["blocked_reason"] == expected_reason
+        assert record["selectable"] is (not expected_reason)
         assert type(record["installed_size"]) is int and record["installed_size"] >= 0
         assert record["description"]
         if record["selectable"]:
@@ -142,9 +167,11 @@ assert {item["arch"] for item in ax_official["packages"]} <= {
     "aarch64_cortex-a53", "noarch"
 }
 
-x86_by_name = {item["package"]: item for item in x86["packages"]}
-ax_official_by_name = {item["package"]: item for item in ax_official["packages"]}
-ax_nss_by_name = {item["package"]: item for item in ax_nss["packages"]}
+x86_by_name = {item["package"]: item for item in x86["packages"] if item["source"] == "official"}
+ax_official_by_name = {
+    item["package"]: item for item in ax_official["packages"] if item["source"] == "official"
+}
+ax_nss_by_name = {item["package"]: item for item in ax_nss["packages"] if item["source"] == "official"}
 assert x86_by_name["base-files"]["selectable"] is False
 assert x86_by_name["base-files"]["blocked_reason"]
 assert x86_by_name["kmod-3c59x"]["risk"] == "advanced"
@@ -159,6 +186,27 @@ def expect_shard_rejected(payload, descriptor, label: str) -> None:
     except resolver.CatalogError:
         return
     raise AssertionError(f"malicious shard unexpectedly accepted: {label}")
+
+
+def expect_index_rejected(payload, label: str) -> None:
+    try:
+        resolver.validate_package_catalog_index(payload, catalog)
+    except resolver.CatalogError:
+        return
+    raise AssertionError(f"malicious package index unexpectedly accepted: {label}")
+
+
+# Community provenance is bound to the reviewed lock, not merely schema-shaped.
+for field in ("sha256", "catalog_sha256"):
+    forged_index = copy.deepcopy(index)
+    community_source = next(
+        source
+        for descriptor in forged_index["shards"]
+        for source in descriptor["sources"]
+        if source["feed"] == "kiddin9"
+    )
+    community_source[field] = "0" * 64
+    expect_index_rejected(forged_index, f"community {field} differs from lock")
 
 
 # The resolver independently re-runs policy; synchronized metadata forgery is rejected.
@@ -181,7 +229,8 @@ for prefix in ("uboot-",):
     expect_shard_rejected(forged, descriptor, f"{candidate['package']} made selectable")
 
 firmware_candidate = next(
-    item for item in ax_official["packages"] if "firmware" in item["package"].lower()
+    item for item in ax_official["packages"]
+    if item["source"] == "official" and "firmware" in item["package"].lower()
 )
 firmware_forgery = copy.deepcopy(ax_official)
 firmware_record = next(
@@ -211,12 +260,83 @@ nss_arch_forgery["packages"][0]["arch"] = "aarch64_cortex-a53"
 expect_shard_rejected(nss_arch_forgery, index["shards"][2], "non-noarch package in NSS shard")
 
 
+
+# The locked community index is visible as an explicitly unsigned candidate catalog only.
+community = [item for item in ax_official["packages"] if item["source"] == "kiddin9"]
+assert len(community) == 969
+assert sum(item["selectable"] for item in community) == 0
+assert not any(item["source"] == "kiddin9" for item in x86["packages"] + ax_nss["packages"])
+assert {item["package"] for item in community} >= {
+    "luci-app-openclash", "luci-app-passwall", "luci-app-passwall2",
+    "luci-app-nikki", "nikki", "mihomo", "luci-app-ssr-plus", "luci-app-istorex",
+}
+assert sum(
+    item["package"] in ax_official_by_name for item in community
+) == 60
+community_catalog_sha256 = "4b14b36b0c9839f81bb6a56ffc1ac94384603c7a9c93e7f63ac48ffc4c699292"
+assert generator._community_catalog_sha256(community) == community_catalog_sha256
+assert resolver._community_catalog_sha256(community) == community_catalog_sha256
+openclash = next(item for item in community if item["package"] == "luci-app-openclash")
+try:
+    resolver.resolve_components(
+        catalog, "xiaomi_ax9000", "official", [openclash["id"]]
+    )
+except resolver.RequestError as error:
+    assert "blocked" in str(error) and "openclash" in str(error).lower()
+else:
+    raise AssertionError("unreviewed community candidate unexpectedly entered a build request")
+
+community_forgery = copy.deepcopy(ax_official)
+community_record = next(
+    item for item in community_forgery["packages"] if item["id"] == openclash["id"]
+)
+community_record["selectable"] = True
+community_record["blocked_reason"] = ""
+community_descriptor = copy.deepcopy(index["shards"][1])
+community_descriptor["selectable_count"] += 1
+expect_shard_rejected(
+    community_forgery, community_descriptor, "unreviewed community package made selectable"
+)
+
+# Relabeling a locked candidate as an official selectable package must still fail:
+# the complete community projection digest is authoritative.
+projection_forgery = copy.deepcopy(ax_official)
+projection_record = next(
+    item for item in projection_forgery["packages"] if item["id"] == openclash["id"]
+)
+projection_record.update({
+    "id": "pkg-" + hashlib.sha256(projection_record["package"].encode("utf-8")).hexdigest()[:16],
+    "feed": "packages",
+    "source": "official",
+    "category": "official-packages",
+    "selectable": True,
+    "blocked_reason": "",
+})
+projection_forgery["packages"].sort(
+    key=lambda item: (item["package"], item["source"], item["version"], item["id"])
+)
+projection_descriptor = copy.deepcopy(index["shards"][1])
+projection_descriptor["selectable_count"] += 1
+expect_shard_rejected(
+    projection_forgery, projection_descriptor, "community candidate relabeled as official"
+)
+
+# Production preparation never clones, executes, or installs the community feed/IPK repository.
+prepare_text = (ROOT / "scripts/prepare.sh").read_text(encoding="utf-8")
+validate_text = (ROOT / "scripts/validate.sh").read_text(encoding="utf-8")
+for forbidden in ("KIDDIN9_FEED", "op-packages.git", "community-feeds.lock", "dl.openwrt.ai"):
+    assert forbidden not in prepare_text
+    assert forbidden not in validate_text
+
 # The resolver accepts package IDs but never arbitrary package names.
 curl = x86_by_name["curl"]
 curl_request = resolver.resolve_components(catalog, "x86_64", "official", [curl["id"]])
 assert curl_request["requested_components"] == [curl["id"]]
 assert curl["id"] in curl_request["resolved_components"]
 assert "curl" in curl_request["packages"]
+assert curl_request["schema_version"] == 2
+assert curl_request["community_packages"] == []
+assert curl_request["community_feed_required"] is False
 try:
     resolver.resolve_components(catalog, "x86_64", "official", ["curl"])
 except resolver.RequestError:
@@ -295,6 +415,7 @@ reverse = generator._merge_packages(
 )
 assert forward == reverse
 assert [item["package"] for item in forward] == ["alpha", "zeta"]
+assert all(item["source"] == "official" for item in forward)
 assert generator._record(
     {"name": "+unsafe", "version": "1", "description": "x", "arch": "noarch"}, "base"
 ) is None
@@ -483,4 +604,4 @@ completed = subprocess.run(
 assert "--output-root" in completed.stdout
 assert "--apk" not in completed.stdout
 
-print("Package catalog policy: signed shards, shared safety policy, architecture isolation, safe I/O, and deterministic data OK")
+print("Package catalog policy: signed official shards, fail-closed community candidates, architecture isolation, safe I/O, and deterministic data OK")

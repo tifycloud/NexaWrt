@@ -1,14 +1,16 @@
 #!/usr/bin/env python3
 """Generate the locked OpenWrt 25.12.5 package catalog.
 
-Only signed ``packages.adb`` indexes below the allow-listed OpenWrt release
-namespace are accepted. Metadata is decoded only with apk-tools 3 from the SHA-256 locked x86/64
-ImageBuilder. Unlocked external apk binaries are intentionally unsupported.
+Official package records come only from signed ``packages.adb`` indexes below
+the allow-listed OpenWrt release namespace. A separately locked, explicitly
+unsigned OPKG index may be parsed only to display fail-closed community
+candidates; its IPK files and source feed are never used by production builds.
 """
 
 from __future__ import annotations
 
 import argparse
+import gzip
 import hashlib
 import json
 import os
@@ -30,13 +32,14 @@ if str(SCRIPT_DIR) not in sys.path:
 
 from component_package_policy import (
     allowed_architectures_for,
-    blocked_reason_for,
+    blocked_reason_for_record,
     risk_for,
 )
 
 ROOT = Path(__file__).resolve().parent.parent
 VM_LOCK_PATH = ROOT / "manifests" / "vm.lock"
-CATALOG_VERSION = "2026.07.21"
+COMMUNITY_LOCK_PATH = ROOT / "manifests" / "community-feeds.lock"
+CATALOG_VERSION = "2026.07.21.1"
 OPENWRT_VERSION = "25.12.5"
 DOWNLOAD_HOST = "downloads.openwrt.org"
 RELEASE_PREFIX = f"/releases/{OPENWRT_VERSION}/"
@@ -55,6 +58,7 @@ ALLOWED_FEEDS = (
     "telephony",
     "video",
 )
+COMMUNITY_FEED = "kiddin9"
 SHARD_SPECS = (
     ("x86_64", "official", "components/packages/x86_64-official.json"),
     ("xiaomi_ax9000", "official", "components/packages/xiaomi_ax9000-official.json"),
@@ -69,6 +73,7 @@ FEED_CATEGORY = {
     "routing": "official-routing",
     "telephony": "official-telephony",
     "video": "official-video",
+    COMMUNITY_FEED: "community-kiddin9",
 }
 
 
@@ -83,7 +88,9 @@ def _sha256_bytes(data: bytes) -> str:
 
 MAX_IMAGEBUILDER_BYTES = 1024 * 1024 * 1024
 MAX_PROFILE_BYTES = 8 * 1024 * 1024
+MAX_LOCK_BYTES = 16 * 1024
 MAX_PACKAGE_INDEX_BYTES = 64 * 1024 * 1024
+MAX_COMMUNITY_INDEX_BYTES = 8 * 1024 * 1024
 MAX_APK_DUMP_BYTES = 192 * 1024 * 1024
 IO_CHUNK_SIZE = 1024 * 1024
 NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
@@ -318,7 +325,7 @@ def _safe_write_output(output_root: Path, relative_path: str, data: bytes) -> No
 def _read_vm_lock(path: Path = VM_LOCK_PATH) -> dict[str, str]:
     values: dict[str, str] = {}
     try:
-        lines = path.read_text(encoding="utf-8").splitlines()
+        lines = _read_regular_file(path, MAX_LOCK_BYTES, "locked manifest").decode("utf-8").splitlines()
     except (OSError, UnicodeError) as error:
         raise GenerationError(f"unable to read {path}: {error}") from error
     for line in lines:
@@ -345,6 +352,50 @@ def _read_vm_lock(path: Path = VM_LOCK_PATH) -> dict[str, str]:
     if not re.fullmatch(r"[0-9a-f]{64}", values["VM_X86_64_IMAGEBUILDER_SHA256"]):
         raise GenerationError("invalid ImageBuilder SHA256 in vm.lock")
     _safe_url(values["VM_X86_64_IMAGEBUILDER_URL"], suffixes=(".tar.zst",))
+    return values
+
+
+def _read_community_lock(path: Path = COMMUNITY_LOCK_PATH) -> dict[str, str]:
+    values: dict[str, str] = {}
+    try:
+        lines = _read_regular_file(path, MAX_LOCK_BYTES, "locked manifest").decode("utf-8").splitlines()
+    except (OSError, UnicodeError) as error:
+        raise GenerationError(f"unable to read {path}: {error}") from error
+    for line in lines:
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        match = LOCK_LINE_RE.fullmatch(line)
+        if not match:
+            raise GenerationError(f"unsupported community lock syntax: {line!r}")
+        key, value = match.groups()
+        if key in values:
+            raise GenerationError(f"duplicate community lock key: {key}")
+        values[key] = value
+    required = {
+        "KIDDIN9_FEED", "KIDDIN9_REPO", "KIDDIN9_COMMIT",
+        "KIDDIN9_PACKAGES_URL", "KIDDIN9_PACKAGES_SHA256",
+        "KIDDIN9_PACKAGES_SIGNED", "KIDDIN9_CATALOG_SHA256",
+    }
+    if set(values) != required:
+        raise GenerationError("community lock schema mismatch")
+    if values["KIDDIN9_FEED"] != COMMUNITY_FEED:
+        raise GenerationError("unexpected community feed name")
+    if values["KIDDIN9_REPO"] != "https://github.com/kiddin9/op-packages.git":
+        raise GenerationError("unexpected community source repository")
+    if not re.fullmatch(r"[0-9a-f]{40}", values["KIDDIN9_COMMIT"]):
+        raise GenerationError("invalid community source commit")
+    if values["KIDDIN9_PACKAGES_URL"] != (
+        "https://dl.openwrt.ai/releases/25.12/packages/"
+        "aarch64_cortex-a53/kiddin9/Packages.gz"
+    ):
+        raise GenerationError("unexpected community metadata URL")
+    if not re.fullmatch(r"[0-9a-f]{64}", values["KIDDIN9_PACKAGES_SHA256"]):
+        raise GenerationError("invalid community metadata SHA256")
+    if values["KIDDIN9_PACKAGES_SIGNED"] != "0":
+        raise GenerationError("community metadata must remain explicitly unsigned")
+    if not re.fullmatch(r"[0-9a-f]{64}", values["KIDDIN9_CATALOG_SHA256"]):
+        raise GenerationError("invalid community catalog projection SHA256")
     return values
 
 
@@ -660,7 +711,13 @@ def _clean_text(value: Any, fallback: str, maximum: int) -> str:
     return cleaned[:maximum]
 
 
-def _record(raw: Any, feed: str) -> tuple[dict[str, Any], str] | None:
+def _record(
+    raw: Any,
+    feed: str,
+    *,
+    source: str = "official",
+    official_packages: frozenset[str] = frozenset(),
+) -> tuple[dict[str, Any], str] | None:
     if not isinstance(raw, dict):
         raise GenerationError(f"{feed} index contains a non-object package record")
     package = raw.get("name")
@@ -675,14 +732,19 @@ def _record(raw: Any, feed: str) -> tuple[dict[str, Any], str] | None:
     installed_size = raw.get("installed-size", 0)
     if type(installed_size) is not int or installed_size < 0:
         installed_size = 0
-    blocked_reason = blocked_reason_for(package)
+    blocked_reason = blocked_reason_for_record(
+        package, source, duplicates_official=package in official_packages
+    )
     selectable = not blocked_reason
     item = {
-        "id": "pkg-" + hashlib.sha256(package.encode("utf-8")).hexdigest()[:16],
+        "id": "pkg-" + hashlib.sha256(
+            (package if source == "official" else f"{source}\0{package}").encode("utf-8")
+        ).hexdigest()[:16],
         "package": package,
         "version": version,
         "description": description,
         "feed": feed,
+        "source": source,
         "installed_size": installed_size,
         "category": FEED_CATEGORY[feed],
         "arch": raw.get("arch"),
@@ -700,8 +762,8 @@ def _merge_packages(
     feed_packages: Iterable[tuple[str, list[dict[str, Any]]]], *, target: str, flavor: str
 ) -> list[dict[str, Any]]:
     allowed_arches = allowed_architectures_for(target, flavor)
-    by_package: dict[str, dict[str, Any]] = {}
-    id_to_package: dict[str, str] = {}
+    by_package: dict[tuple[str, str], dict[str, Any]] = {}
+    id_to_package: dict[str, tuple[str, str]] = {}
     for feed, raw_packages in feed_packages:
         for raw in raw_packages:
             parsed = _record(raw, feed)
@@ -716,7 +778,8 @@ def _merge_packages(
                     f"the {target}/{flavor} policy"
                 )
             package = item["package"]
-            existing = by_package.get(package)
+            key = (item["source"], package)
+            existing = by_package.get(key)
             if existing is not None:
                 comparable = {key: value for key, value in item.items() if key not in {"feed", "category"}}
                 previous = {key: value for key, value in existing.items() if key not in {"feed", "category"}}
@@ -725,11 +788,136 @@ def _merge_packages(
                 continue
             package_id = item["id"]
             collision = id_to_package.get(package_id)
-            if collision is not None and collision != package:
-                raise GenerationError(f"package ID collision: {collision} and {package}")
-            id_to_package[package_id] = package
-            by_package[package] = item
-    return sorted(by_package.values(), key=lambda item: (item["package"], item["version"], item["id"]))
+            if collision is not None and collision != key:
+                raise GenerationError(f"package ID collision: {collision} and {key}")
+            id_to_package[package_id] = key
+            by_package[key] = item
+    return sorted(
+        by_package.values(),
+        key=lambda item: (item["package"], item["source"], item["version"], item["id"]),
+    )
+
+
+def _download_community_metadata(lock: dict[str, str], destination: Path) -> bytes:
+    url = lock["KIDDIN9_PACKAGES_URL"]
+    request = urllib.request.Request(url, headers={"User-Agent": "NexaWrt-catalog/1"})
+    try:
+        with urllib.request.urlopen(request, timeout=60) as response:
+            if response.geturl() != url:
+                raise GenerationError("community metadata redirects are not allowed")
+            content_length = response.headers.get("Content-Length")
+            if content_length is not None and not 0 < int(content_length) <= MAX_COMMUNITY_INDEX_BYTES:
+                raise GenerationError("community metadata Content-Length is outside policy")
+            data = response.read(MAX_COMMUNITY_INDEX_BYTES + 1)
+    except (OSError, ValueError, urllib.error.URLError) as error:
+        raise GenerationError(f"unable to download locked community metadata: {error}") from error
+    if not data or len(data) > MAX_COMMUNITY_INDEX_BYTES:
+        raise GenerationError("community metadata is empty or exceeds the size limit")
+    if _sha256_bytes(data) != lock["KIDDIN9_PACKAGES_SHA256"]:
+        raise GenerationError("community metadata SHA256 differs from its lock")
+    destination.write_bytes(data)
+    return data
+
+
+def _parse_ipk_packages(data: bytes) -> list[dict[str, str]]:
+    try:
+        text = gzip.decompress(data).decode("utf-8", errors="strict")
+    except (OSError, UnicodeError) as error:
+        raise GenerationError(f"community Packages.gz is invalid: {error}") from error
+    records: list[dict[str, str]] = []
+    for position, paragraph in enumerate(text.strip().split("\n\n")):
+        fields: dict[str, str] = {}
+        current = ""
+        for raw_line in paragraph.splitlines():
+            if raw_line[:1].isspace() and current:
+                fields[current] = f"{fields[current]} {raw_line.strip()}".strip()
+                continue
+            if ": " not in raw_line:
+                raise GenerationError(f"malformed community metadata record {position}")
+            current, value = raw_line.split(": ", 1)
+            if current in fields:
+                raise GenerationError(f"duplicate field {current!r} in community metadata")
+            fields[current] = value.strip()
+        required = {"Package", "Version", "Architecture", "Installed-Size", "Description"}
+        if not required <= set(fields):
+            raise GenerationError(f"community metadata record {position} is incomplete")
+        records.append(fields)
+    if not 900 <= len(records) <= 1100:
+        raise GenerationError("community metadata record count is outside the reviewed range")
+    return records
+
+
+def _community_records(
+    data: bytes, *, official_packages: frozenset[str]
+) -> list[dict[str, Any]]:
+    raw_records = _parse_ipk_packages(data)
+    counts: dict[str, int] = {}
+    for raw in raw_records:
+        counts[raw["Package"]] = counts.get(raw["Package"], 0) + 1
+    records: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for raw in raw_records:
+        package = raw["Package"]
+        if package in seen:
+            continue
+        seen.add(package)
+        if counts[package] > 1:
+            continue
+        try:
+            installed_size = int(raw["Installed-Size"], 10)
+        except ValueError:
+            installed_size = 0
+        arch = "noarch" if raw["Architecture"] == "all" else raw["Architecture"]
+        parsed = _record(
+            {
+                "name": package,
+                "version": raw["Version"],
+                "description": raw["Description"],
+                "installed-size": installed_size,
+                "arch": arch,
+            },
+            COMMUNITY_FEED,
+            source="kiddin9",
+            official_packages=official_packages,
+        )
+        if parsed is None:
+            continue
+        item, item_arch = parsed
+        if item_arch not in allowed_architectures_for("xiaomi_ax9000", "official"):
+            raise GenerationError(
+                f"community package {package} has unsupported architecture {item_arch}"
+            )
+        records.append(item)
+    if not 900 <= len(records) <= 1000:
+        raise GenerationError("community package count is outside the reviewed range")
+    return sorted(
+        records,
+        key=lambda item: (item["package"], item["source"], item["version"], item["id"]),
+    )
+
+
+def _community_catalog_sha256(records: list[dict[str, Any]]) -> str:
+    ordered = sorted(
+        records,
+        key=lambda item: (item["package"], item["source"], item["version"], item["id"]),
+    )
+    payload = json.dumps(
+        ordered, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
+def _community_source(lock: dict[str, str]) -> dict[str, Any]:
+    return {
+        "feed": lock["KIDDIN9_FEED"],
+        "url": lock["KIDDIN9_PACKAGES_URL"],
+        "sha256": lock["KIDDIN9_PACKAGES_SHA256"],
+        "metadata_format": "opkg-packages-gzip",
+        "metadata_signed": False,
+        "candidate_repository": lock["KIDDIN9_REPO"],
+        "candidate_commit": lock["KIDDIN9_COMMIT"],
+        "catalog_sha256": lock["KIDDIN9_CATALOG_SHA256"],
+    }
 
 
 def _fetch_sources(
@@ -750,7 +938,7 @@ def _fetch_sources(
 
 def _write_catalog(output_root: Path, shards: list[dict[str, Any]]) -> None:
     root_payload = {
-        "schema_version": 1,
+        "schema_version": 2,
         "catalog_version": CATALOG_VERSION,
         "openwrt_version": OPENWRT_VERSION,
         "shards": shards,
@@ -768,7 +956,11 @@ def generate(output_root: Path) -> dict[str, Any]:
         x86_repositories = _parse_repositories(imagebuilder / "repositories")
         ax_repositories = _ax_repositories(workspace)
 
-        source_cache: dict[tuple[tuple[str, str], ...], tuple[list[tuple[str, list[dict[str, Any]]]], list[dict[str, str]]]] = {}
+        community_lock = _read_community_lock()
+        community_data = _download_community_metadata(
+            community_lock, workspace / "kiddin9-Packages.gz"
+        )
+        source_cache: dict[tuple[tuple[str, str], ...], tuple[list[tuple[str, list[dict[str, Any]]]], list[dict[str, Any]]]] = {}
         shard_descriptors: list[dict[str, Any]] = []
         for target, flavor, relative_path in SHARD_SPECS:
             repositories = x86_repositories if target == "x86_64" else ax_repositories
@@ -787,8 +979,25 @@ def generate(output_root: Path) -> dict[str, Any]:
                 )
             package_sets, sources = source_cache[cache_key]
             records = _merge_packages(package_sets, target=target, flavor=flavor)
+            if target == "xiaomi_ax9000" and flavor == "official":
+                community_records = _community_records(
+                    community_data,
+                    official_packages=frozenset(item["package"] for item in records),
+                )
+                community_digest = _community_catalog_sha256(community_records)
+                if community_digest != community_lock["KIDDIN9_CATALOG_SHA256"]:
+                    raise GenerationError(
+                        "community candidate projection differs from its reviewed lock"
+                    )
+                records.extend(community_records)
+                records.sort(
+                    key=lambda item: (
+                        item["package"], item["source"], item["version"], item["id"]
+                    )
+                )
+                sources = [*sources, _community_source(community_lock)]
             shard_payload = {
-                "schema_version": 1,
+                "schema_version": 2,
                 "catalog_version": CATALOG_VERSION,
                 "target": target,
                 "flavor": flavor,

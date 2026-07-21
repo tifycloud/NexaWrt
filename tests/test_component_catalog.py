@@ -47,7 +47,7 @@ def expect_request_rejected(
 
 catalog = resolver.load_catalog()
 assert catalog["schema_version"] == 1
-assert catalog["catalog_version"] == "2026.07.21"
+assert catalog["catalog_version"] == "2026.07.21.1"
 assert catalog["max_selected_components"] == 32
 assert {target["id"] for target in catalog["targets"]} >= {
     "x86_64",
@@ -75,7 +75,7 @@ assert "CONFIG_TARGET_x86_64_DEVICE_generic=y\n" in x86["kconfig_fragment"]
 assert "CONFIG_PACKAGE_kmod-wireguard=y\n" in x86["kconfig_fragment"]
 assert len(x86["request_hash"]) == 64
 assert set(x86["request_hash"]) <= set("0123456789abcdef")
-assert x86["request_hash"] == "f970820f02af793d85983ce99376ac9d3df0e74c293a0a3810d6927d607746fb"
+assert x86["request_hash"] == "cb47ea8fef1232db432d9525712c53f8256a1256a59414e5ea0cab3830b11808"
 assert json.loads(json.dumps(x86, ensure_ascii=False, sort_keys=True)) == x86
 explicit_default = resolver.resolve_components(
     catalog, "x86_64", "official", ["wireguard", "web-ui"]

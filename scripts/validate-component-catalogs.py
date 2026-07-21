@@ -134,7 +134,7 @@ def _policy_functions(
     shared module without duplicating package-name rules here.
     """
 
-    blocked_names = ("blocked_reason_for", "blocked_reason_for_package", "package_blocked_reason", "_blocked_reason")
+    blocked_names = ("blocked_reason_for_record", "blocked_reason_for", "blocked_reason_for_package", "package_blocked_reason", "_blocked_reason")
     risk_names = ("risk_for", "risk_for_package", "package_risk", "_risk")
     arch_names = ("allowed_architectures_for", "package_architectures_for")
 
@@ -185,10 +185,18 @@ def _validate_policy(
     risk_parameter_count = len(inspect.signature(package_risk).parameters)
     if risk_parameter_count not in {2, 3}:
         raise StagingError("shared package risk policy has an unsupported signature")
+    official_packages = {record["package"] for record in shard["packages"] if record.get("source") == "official"}
+    blocked_parameter_count = len(inspect.signature(blocked_reason).parameters)
+    if blocked_parameter_count not in {1, 3}:
+        raise StagingError("shared package blocked policy has an unsupported signature")
     for position, record in enumerate(shard["packages"]):
         context = f"{descriptor['path']} packages[{position}]"
         package = record["package"]
-        expected_reason = blocked_reason(package)
+        expected_reason = (
+            blocked_reason(package)
+            if blocked_parameter_count == 1
+            else blocked_reason(package, record["source"], duplicates_official=package in official_packages)
+        )
         if not isinstance(expected_reason, str):
             raise StagingError(f"package policy returned an invalid blocked reason for {package}")
         expected_selectable = not expected_reason

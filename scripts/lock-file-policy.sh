@@ -30,6 +30,11 @@ schemas = {
         "NSS_PACKAGES_FEED", "NSS_PACKAGES_REPO", "NSS_PACKAGES_COMMIT",
         "NSS_SQM_FEED", "NSS_SQM_REPO", "NSS_SQM_COMMIT",
     },
+    "community-feeds": {
+        "KIDDIN9_FEED", "KIDDIN9_REPO", "KIDDIN9_COMMIT",
+        "KIDDIN9_PACKAGES_URL", "KIDDIN9_PACKAGES_SHA256",
+        "KIDDIN9_PACKAGES_SIGNED", "KIDDIN9_CATALOG_SHA256",
+    },
 }
 if schema not in schemas:
     raise SystemExit(f"unknown lock schema: {schema}")
@@ -68,9 +73,15 @@ if schema == "apk-signing":
 elif schema == "upstream":
     require("OPENWRT_TAG", r"[A-Za-z0-9._/-]+")
     require("LAYOUT_ID", r"[A-Za-z0-9._-]+")
-else:
+elif schema == "nss":
     require("NSS_OPENWRT_BRANCH", r"[A-Za-z0-9._/-]+")
     require("NSS_PACKAGES_FEED", r"[a-z0-9_]+")
     require("NSS_SQM_FEED", r"[a-z0-9_]+")
+else:
+    require("KIDDIN9_FEED", r"[a-z0-9_]+")
+    require("KIDDIN9_PACKAGES_URL", r"https://dl\.openwrt\.ai/releases/25\.12/packages/aarch64_cortex-a53/kiddin9/Packages\.gz")
+    require("KIDDIN9_PACKAGES_SHA256", r"[0-9a-f]{64}")
+    require("KIDDIN9_PACKAGES_SIGNED", r"0")
+    require("KIDDIN9_CATALOG_SHA256", r"[0-9a-f]{64}")
 PY
 }
