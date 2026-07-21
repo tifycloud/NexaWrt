@@ -164,6 +164,22 @@ raise SystemExit(0 if all(value in text for value in required) else 1)
 PY
 }
 
+serial_runtime_failure_reason() {
+  local serial_log="$1"
+  [[ -s "$serial_log" ]] || return 1
+  python3 - "$serial_log" <<'PY_FAILURE'
+import pathlib
+import re
+import sys
+
+text = pathlib.Path(sys.argv[1]).read_bytes().decode("utf-8", errors="replace").replace("\r", "")
+reasons = re.findall(r"(?m)^NEXAWRT_VM_PRODUCTION_RUNTIME_FAILED=([a-z0-9_]+)$", text)
+if not reasons:
+    raise SystemExit(1)
+print(reasons[-1])
+PY_FAILURE
+}
+
 probe_luci_https() {
   set +e
   current_https_status="$(curl --silent --show-error --insecure \
@@ -409,6 +425,11 @@ run_variant() {
       wait "$CURRENT_QEMU_PID" || true
       dump_variant_diagnostics "$variant"
       fail "QEMU exited before $variant runtime validation completed"
+      return 1
+    fi
+    if runtime_failure_reason="$(serial_runtime_failure_reason "$CURRENT_SERIAL_LOG")"; then
+      dump_variant_diagnostics "$variant"
+      fail "$variant production runtime gate reported failure: $runtime_failure_reason"
       return 1
     fi
     if [[ "$serial_labels_result" != PASS ]] && serial_has_release_labels "$CURRENT_SERIAL_LOG"; then

@@ -5,6 +5,7 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
 WORKFLOW="$ROOT_DIR/.github/workflows/custom-build.yml"
 CUSTOM_BUILD="$ROOT_DIR/scripts/custom-build.sh"
+CUSTOM_ARTIFACTS="$ROOT_DIR/scripts/custom-artifacts.py"
 PREPARE="$ROOT_DIR/scripts/prepare.sh"
 VM_BUILD="$ROOT_DIR/scripts/build-vm-image.sh"
 
@@ -19,10 +20,12 @@ require_fixed() {
   grep -Fq -- "$text" "$file" || fail "missing required policy text in ${file#"$ROOT_DIR"/}: $text"
 }
 
-for file in "$WORKFLOW" "$CUSTOM_BUILD" "$PREPARE" "$VM_BUILD"; do
+for file in "$WORKFLOW" "$CUSTOM_BUILD" "$CUSTOM_ARTIFACTS" "$PREPARE" "$VM_BUILD"; do
   [[ -f "$file" && ! -L "$file" ]] || fail "required file is missing or symlinked: ${file#"$ROOT_DIR"/}"
 done
 [[ -x "$CUSTOM_BUILD" ]] || fail "scripts/custom-build.sh is not executable"
+[[ -x "$CUSTOM_ARTIFACTS" ]] || fail "scripts/custom-artifacts.py is not executable"
+python3 -m py_compile "$CUSTOM_ARTIFACTS"
 bash -n "$CUSTOM_BUILD"
 bash -n "$PREPARE"
 bash -n "$VM_BUILD"
@@ -71,8 +74,15 @@ require_fixed "$WORKFLOW" 'REQUESTED_CATALOG_VERSION: ${{ inputs.catalog_version
 require_fixed "$WORKFLOW" 'REQUESTED_REQUEST_HASH: ${{ inputs.request_hash }}'
 require_fixed "$WORKFLOW" '[[ "$REQUESTED_REQUEST_HASH" =~ ^[0-9a-f]{64}$ ]]'
 require_fixed "$WORKFLOW" './scripts/custom-build.sh'
+require_fixed "$WORKFLOW" 'Audit custom build artifact before upload'
+require_fixed "$WORKFLOW" 'BUILT_ARTIFACT_DIR: ${{ steps.build.outputs.artifact_dir }}'
+require_fixed "$WORKFLOW" 'BUILT_MANIFEST: ${{ steps.build.outputs.manifest }}'
+require_fixed "$WORKFLOW" 'BUILT_REQUEST_HASH: ${{ steps.build.outputs.request_hash }}'
+require_fixed "$WORKFLOW" './scripts/custom-artifacts.py audit'
+require_fixed "$WORKFLOW" 'sha256sum --check --strict SHA256SUMS'
 require_fixed "$WORKFLOW" 'if-no-files-found: error'
 require_fixed "$WORKFLOW" 'compression-level: 0'
+require_fixed "$WORKFLOW" 'include-hidden-files: true'
 
 require_fixed "$CUSTOM_BUILD" 'scripts/resolve-components.py'
 require_fixed "$CUSTOM_BUILD" 'An empty component'
@@ -89,12 +99,19 @@ require_fixed "$CUSTOM_BUILD" '"$ROOT_DIR/scripts/build-vm-image.sh" x86-64 cust
 require_fixed "$CUSTOM_BUILD" 'NEXAWRT_COMPONENT_TARGET=xiaomi_ax9000'
 require_fixed "$CUSTOM_BUILD" 'DIST_DIR_OVERRIDE="$ARTIFACT_DIR"'
 require_fixed "$CUSTOM_BUILD" 'DIST_NSS_DIR_OVERRIDE="$ARTIFACT_DIR"'
+require_fixed "$CUSTOM_BUILD" 'if ! python3 "$CUSTOM_ARTIFACTS" finalize'
+require_fixed "$CUSTOM_BUILD" 'if ! python3 "$CUSTOM_ARTIFACTS" audit'
+require_fixed "$CUSTOM_BUILD" '[[ -f "$MANIFEST_PATH" && ! -L "$MANIFEST_PATH" && -s "$MANIFEST_PATH" ]]'
+require_fixed "$CUSTOM_BUILD" '[[ -f "$CHECKSUMS_PATH" && ! -L "$CHECKSUMS_PATH" && -s "$CHECKSUMS_PATH" ]]'
+require_fixed "$CUSTOM_BUILD" 'sha256sum --check --strict SHA256SUMS'
 for manifest_field in commit catalog_version request_hash resolved_components resolved_packages packages sha256 build_environment runner image_os image_version os arch dpkg_packages tools scope; do
-  require_fixed "$CUSTOM_BUILD" "\"$manifest_field\""
+  require_fixed "$CUSTOM_ARTIFACTS" "\"$manifest_field\""
 done
-if grep -Eq '(^|[^[:alnum:]_])(eval|bash[[:space:]]+-c|sh[[:space:]]+-c)([^[:alnum:]_]|$)' "$CUSTOM_BUILD"; then
-  fail "custom build script contains a shell evaluation primitive"
-fi
+for file in "$CUSTOM_BUILD" "$CUSTOM_ARTIFACTS"; do
+  if grep -Eq '(^|[^[:alnum:]_])(eval|bash[[:space:]]+-c|sh[[:space:]]+-c)([^[:alnum:]_]|$)' "$file"; then
+    fail "custom artifact chain contains a shell evaluation primitive in ${file#"$ROOT_DIR"/}"
+  fi
+done
 
 require_fixed "$PREPARE" 'NEXAWRT_COMPONENT_TARGET must be xiaomi_ax9000'
 require_fixed "$PREPARE" 'NEXAWRT_COMPONENT_FLAVOR must be official or nss'
@@ -125,7 +142,7 @@ require_fixed "$VM_BUILD" '  dropbear'
 require_fixed "$VM_BUILD" 'VM_PACKAGES+=("$custom_package")'
 require_fixed "$VM_BUILD" 'custom-imagebuilder-packages.json'
 require_fixed "$VM_BUILD" '"PACKAGES=$PACKAGE_LIST"'
-for file in "$WORKFLOW" "$CUSTOM_BUILD" "$PREPARE" "$VM_BUILD"; do
+for file in "$WORKFLOW" "$CUSTOM_BUILD" "$CUSTOM_ARTIFACTS" "$PREPARE" "$VM_BUILD"; do
   if grep -Fq -- '--no-defaults' "$file"; then
     fail "custom build chain exposes --no-defaults in ${file#"$ROOT_DIR"/}"
   fi

@@ -1,48 +1,105 @@
 #!/bin/sh /etc/rc.common
-# shellcheck disable=SC2034 # rc.common consumes START and USE_PROCD.
+# shellcheck disable=SC2034 # rc.common consumes START, USE_PROCD and EXTRA_COMMANDS.
 
 START=99
-USE_PROCD=0
+USE_PROCD=1
+EXTRA_COMMANDS='run'
+EXTRA_HELP='\trun             Execute the production runtime checks\n'
+
+CONSOLE="${NEXAWRT_RUNTIME_CONSOLE:-/dev/console}"
+ETC_ROOT="${NEXAWRT_RUNTIME_ETC_ROOT:-/etc}"
+SYS_ROOT="${NEXAWRT_RUNTIME_SYS_ROOT:-/sys}"
+EVIDENCE_DIR="${NEXAWRT_RUNTIME_EVIDENCE_DIR:-/tmp/nexawrt-vm-release}"
+MAX_ATTEMPTS="${NEXAWRT_RUNTIME_MAX_ATTEMPTS:-120}"
+RETRY_DELAY="${NEXAWRT_RUNTIME_RETRY_DELAY:-1}"
+
+case "$MAX_ATTEMPTS" in
+  ''|*[!0-9]*) MAX_ATTEMPTS=120 ;;
+esac
+case "$RETRY_DELAY" in
+  ''|*[!0-9]*) RETRY_DELAY=1 ;;
+esac
 
 emit_failure() {
-  printf 'NEXAWRT_VM_PRODUCTION_RUNTIME_FAILED=%s\n' "$1" >/dev/console
+  reason="$1"
+  mkdir -p "$EVIDENCE_DIR" 2>/dev/null || true
+  printf 'NEXAWRT_VM_PRODUCTION_RUNTIME_FAILED=%s\n' "$reason" >"$CONSOLE"
+  printf 'NEXAWRT_VM_PRODUCTION_RUNTIME_FAILED=%s\n' "$reason" \
+    >"$EVIDENCE_DIR/production-runtime.failed" 2>/dev/null || true
   return 1
 }
 
-start() {
-  attempt=0
-  while [ "$attempt" -lt 20 ]; do
-    attempt=$((attempt + 1))
-    if /etc/init.d/firewall enabled >/dev/null 2>&1 &&
-       nft list table inet fw4 >/dev/null 2>&1 &&
-       ip -4 addr show dev eth0 | grep -q 'inet 192\.168\.8\.1/24' &&
-       [ "$(uci -q get uhttpd.main.redirect_https)" = 1 ] &&
-       [ "$(uci -q get network.lan.device)" = eth0 ] &&
-       [ "$(uci -q get network.lan.proto)" = static ] &&
-       [ "$(uci -q get dhcp.lan.ignore || printf 1)" = 0 ] &&
-       ! /etc/init.d/dropbear enabled >/dev/null 2>&1 &&
-       ! pidof dropbear >/dev/null 2>&1 &&
-       grep -Eq '^root:[^!*:]' /etc/shadow; then
-      wan_device='absent'
-      network_mode='management-only'
-      if [ -e /sys/class/net/eth1 ]; then
-        [ "$(uci -q get network.wan.device)" = eth1 ] || {
-          emit_failure wan_binding
-          return 1
-        }
-        [ "$(uci -q get network.wan.proto)" = dhcp ] || {
-          emit_failure wan_protocol
-          return 1
-        }
-        wan_device='eth1'
-        network_mode='router'
-      fi
-      installation_id="$(cat /etc/nexawrt-install-id 2>/dev/null || true)"
-      [ "${#installation_id}" -eq 32 ] || {
-        emit_failure installation_id
-        return 1
-      }
-      cat >/dev/console <<EOF_EVIDENCE
+check_runtime_state() {
+  if ! "$ETC_ROOT/init.d/firewall" enabled >/dev/null 2>&1; then
+    runtime_failure='firewall_not_enabled'
+    return 1
+  fi
+  if ! nft list table inet fw4 >/dev/null 2>&1; then
+    runtime_failure='nftables_fw4_missing'
+    return 1
+  fi
+  if ! ip -4 addr show dev eth0 | grep -q 'inet 192\.168\.8\.1/24'; then
+    runtime_failure='lan_address_not_ready'
+    return 1
+  fi
+  if [ "$(uci -q get uhttpd.main.redirect_https 2>/dev/null || true)" != 1 ]; then
+    runtime_failure='https_redirect_disabled'
+    return 1
+  fi
+  if [ "$(uci -q get network.lan.device 2>/dev/null || true)" != eth0 ]; then
+    runtime_failure='lan_binding'
+    return 1
+  fi
+  if [ "$(uci -q get network.lan.proto 2>/dev/null || true)" != static ]; then
+    runtime_failure='lan_protocol'
+    return 1
+  fi
+  if [ "$(uci -q get dhcp.lan.ignore 2>/dev/null || true)" != 0 ]; then
+    runtime_failure='lan_dhcp_disabled'
+    return 1
+  fi
+  if "$ETC_ROOT/init.d/dropbear" enabled >/dev/null 2>&1; then
+    runtime_failure='dropbear_enabled'
+    return 1
+  fi
+  if pidof dropbear >/dev/null 2>&1; then
+    runtime_failure='dropbear_running'
+    return 1
+  fi
+  if ! grep -Eq '^root:[^!*:]' "$ETC_ROOT/shadow"; then
+    runtime_failure='root_password_unset'
+    return 1
+  fi
+
+  wan_device='absent'
+  network_mode='management-only'
+  if [ -e "$SYS_ROOT/class/net/eth1" ]; then
+    if [ "$(uci -q get network.wan.device 2>/dev/null || true)" != eth1 ]; then
+      runtime_failure='wan_binding'
+      return 1
+    fi
+    if [ "$(uci -q get network.wan.proto 2>/dev/null || true)" != dhcp ]; then
+      runtime_failure='wan_protocol'
+      return 1
+    fi
+    wan_device='eth1'
+    network_mode='router'
+  fi
+
+  installation_id="$(cat "$ETC_ROOT/nexawrt-install-id" 2>/dev/null || true)"
+  if [ "${#installation_id}" -ne 32 ]; then
+    runtime_failure='installation_id'
+    return 1
+  fi
+  return 0
+}
+
+emit_success() {
+  evidence_tmp="$EVIDENCE_DIR/production-runtime.evidence.tmp.$$"
+  evidence_file="$EVIDENCE_DIR/production-runtime.evidence"
+  umask 077
+  mkdir -p "$EVIDENCE_DIR" || return 1
+  cat >"$evidence_tmp" <<EOF_EVIDENCE
 NEXAWRT_VM_PRODUCTION_RUNTIME_V1_BEGIN
 installation_id=$installation_id
 network_mode=$network_mode
@@ -57,9 +114,33 @@ root_password=UNIQUE_FIRST_BOOT_VALUE
 ssh_disabled=PASS
 NEXAWRT_VM_PRODUCTION_RUNTIME_V1_END
 EOF_EVIDENCE
-      return 0
+  mv "$evidence_tmp" "$evidence_file" || return 1
+  cat "$evidence_file" >"$CONSOLE"
+}
+
+run() {
+  attempt=0
+  runtime_failure='runtime_not_ready'
+  while [ "$attempt" -lt "$MAX_ATTEMPTS" ]; do
+    attempt=$((attempt + 1))
+    if check_runtime_state; then
+      emit_success || emit_failure evidence_write
+      return $?
     fi
-    sleep 1
+    [ "$attempt" -lt "$MAX_ATTEMPTS" ] && sleep "$RETRY_DELAY"
   done
-  emit_failure timeout
+  emit_failure "$runtime_failure"
+}
+
+start_service() {
+  # uci-defaults runs inside the early boot service. Registering the worker with
+  # procd lets it survive that caller and wait independently for network/firewall.
+  # The enabled S99 service registers the same one-shot check on every later boot.
+  procd_open_instance gate
+  # shellcheck disable=SC2154 # rc.common defines initscript before start_service.
+  procd_set_param command "$initscript" run
+  procd_set_param stdout 1
+  procd_set_param stderr 1
+  procd_set_param term_timeout 5
+  procd_close_instance
 }
