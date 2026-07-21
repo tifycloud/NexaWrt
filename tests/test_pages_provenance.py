@@ -216,6 +216,8 @@ def vm_evidence_payloads(version: str = "v0.1.0-rc.1", *,
     else:
         labels.update({
             "RELEASE_CONTRACT": "vm-x86_64/v2",
+            "RELEASE_CHANNEL": "rc",
+            "PROJECT_COMMIT": "c" * 40,
             "PUBLISHED_VARIANTS": module.VM_PUBLISHED_VARIANTS,
             "ESXI_VALIDATION": "not-tested",
         })
@@ -658,13 +660,34 @@ def main() -> None:
         "draft": False, "prerelease": False, "immutable": True, "published_at": "2026-07-19T02:00:00Z", "assets": [],
     }
     assert module.vm_candidate_assets(invalid_stable) is None
-    for key in ("RELEASE_CONTRACT", "PUBLISHED_VARIANTS", "ESXI_VALIDATION"):
+    assert len(module.VM_ARTIFACT_LABEL_KEYS[module.VM_CONTRACT_V2]) == 20
+    for key in (
+        "RELEASE_CONTRACT", "RELEASE_CHANNEL", "PROJECT_COMMIT",
+        "PUBLISHED_VARIANTS", "ESXI_VALIDATION",
+    ):
         expect_verification_error(
             lambda key=key: verify_vm_fixture(
                 vm_evidence_payloads(contract_version=2, missing_label=key), contract_version=2,
             ),
             f"v2 artifact labels accepted missing contract key: {key}",
         )
+    for key, value in (
+        ("RELEASE_CHANNEL", "stable"),
+        ("PROJECT_COMMIT", "d" * 40),
+    ):
+        expect_verification_error(
+            lambda key=key, value=value: verify_vm_fixture(
+                vm_evidence_payloads(contract_version=2, label_updates={key: value}), contract_version=2,
+            ),
+            f"v2 artifact labels accepted an unbound contract value: {key}={value}",
+        )
+    expect_verification_error(
+        lambda: verify_vm_fixture(
+            vm_evidence_payloads(contract_version=2, label_updates={"UNSUPPORTED_LABEL": "true"}),
+            contract_version=2,
+        ),
+        "v2 artifact labels accepted an unknown extra key",
+    )
     for key in ("release_contract", "raw_bios_file", "iso_bios_qemu", "vmdk_efi_file", "esxi_validation"):
         expect_verification_error(
             lambda key=key: verify_vm_fixture(

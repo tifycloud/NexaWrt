@@ -76,8 +76,9 @@ VM_ARTIFACT_LABEL_KEYS = {
         "ARTIFACT_CLASS", "OPENWRT_VERSION", "TARGET", "MODE", "VM_ONLY",
         "NOT_AX9000_FIRMWARE", "HARDWARE_VALIDATION", "NSS_VALIDATION",
         "VALIDATION_SCOPE", "IMAGEBUILDER_URL", "IMAGEBUILDER_SHA256",
-        "RELEASE_TAG", "RELEASE_VERSION", "SSH_DEFAULT", "SSH_AUTHORIZED_KEYS",
-        "RELEASE_CONTRACT", "PUBLISHED_VARIANTS", "ESXI_VALIDATION",
+        "RELEASE_TAG", "RELEASE_VERSION", "RELEASE_CHANNEL", "PROJECT_COMMIT",
+        "SSH_DEFAULT", "SSH_AUTHORIZED_KEYS", "RELEASE_CONTRACT",
+        "PUBLISHED_VARIANTS", "ESXI_VALIDATION",
     },
 }
 VM_SMOKE_REPORT_KEYS = {
@@ -811,6 +812,8 @@ def verify_vm_candidate(gh: Path, candidate: tuple[int, str, str, str, int, dict
         if contract_version == VM_CONTRACT_V2:
             expected_labels.update({
                 "RELEASE_CONTRACT": "vm-x86_64/v2",
+                "RELEASE_CHANNEL": "rc",
+                "PROJECT_COMMIT": source_digest,
                 "PUBLISHED_VARIANTS": VM_PUBLISHED_VARIANTS,
                 "ESXI_VALIDATION": "not-tested",
             })
