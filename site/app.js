@@ -983,7 +983,7 @@ function resetComponentsForTarget() {
     setComponentMessage('');
   }
   renderComponentChoices();
-  updateBuildRequest();
+  return updateBuildRequest();
 }
 
 function setupComponentBuilder(catalog) {
@@ -1002,13 +1002,13 @@ function setupComponentBuilder(catalog) {
   function updateFlavors() {
     const available = flavorsForTarget(targetSelect.value);
     populateSelect(flavorSelect, available, available[0].id);
-    resetComponentsForTarget();
+    return resetComponentsForTarget();
   }
   targetSelect.addEventListener('change', updateFlavors);
   flavorSelect.addEventListener('change', () => updateBuildRequest());
   categorySelect.addEventListener('change', renderComponentChoices);
   document.querySelector('#component-search').addEventListener('input', renderComponentChoices);
-  updateFlavors();
+  return updateFlavors();
 }
 
 async function loadComponentCatalog() {
@@ -1018,7 +1018,7 @@ async function loadComponentCatalog() {
     if (!response.ok) throw new Error(`HTTP ${response.status}`);
     const catalog = await response.json();
     if (!validateComponentCatalog(catalog)) throw new Error('unexpected component catalog schema');
-    setupComponentBuilder(catalog);
+    await setupComponentBuilder(catalog);
     status.classList.remove('error');
     status.textContent = `组件目录 ${catalog.catalog_version} 已验证 / Catalog verified`;
   } catch (error) {
