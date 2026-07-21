@@ -137,10 +137,13 @@ EOF_EVIDENCE
 mv "$EVIDENCE_TMP" "$EVIDENCE_FILE"
 cat "$EVIDENCE_FILE" >/dev/console
 
-# uci-defaults runs before late init services. Start the production gate in the
-# background so the first boot is checked after firewall and HTTPS are ready; the
-# enabled rc.d entry repeats the same check on every later boot.
-( /etc/init.d/nexawrt-runtime-gate start ) >/dev/null 2>&1 &
+# uci-defaults runs before late init services. Ask procd to own the one-shot
+# runtime worker so it survives this early-boot process and waits for network and
+# firewall readiness. The enabled S99 service repeats the check on later boots.
+/etc/init.d/nexawrt-runtime-gate start >/dev/null 2>&1 || {
+  printf '%s\n' 'NEXAWRT_VM_PRODUCTION_RUNTIME_FAILED=procd_registration' >/dev/console
+  exit 1
+}
 
 cat >/dev/console <<EOF_CONSOLE
 
