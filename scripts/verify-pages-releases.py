@@ -91,13 +91,15 @@ VM_SMOKE_REPORT_KEYS = {
     },
     VM_CONTRACT_V2: {
         "status", "target", "release_contract", "vm_only", "not_ax9000_firmware",
-        "hardware_validation", "nss_validation", "raw_bios_file", "raw_bios_qemu",
+        "hardware_validation", "nss_validation", "exact_release_image", "serial_labels",
+        "https", "http_redirect", "runtime_evidence", "production_runtime",
+        "raw_bios_persistence", "vmdk_import_persistence", "ssh_port_probe", "ssh",
+        "authorized_keys", "dropbear_enabled", "dropbear_running", "http_redirect_status",
+        "https_status", "auth_challenge", "http_host_port", "https_host_port",
+        "ssh_host_port", "serial_log", "ssh_probe_log", "raw_bios_file", "raw_bios_qemu",
         "iso_bios_file", "iso_bios_qemu", "iso_efi_file", "iso_efi_qemu",
         "vmdk_bios_file", "vmdk_bios_qemu", "vmdk_efi_file", "vmdk_efi_qemu",
-        "esxi_validation", "exact_release_image", "serial_labels", "http",
-        "ssh_runtime_evidence", "ssh_port_probe", "ssh", "authorized_keys",
-        "dropbear_enabled", "dropbear_running", "http_status", "auth_challenge",
-        "http_host_port", "ssh_host_port", "serial_log", "ssh_probe_log",
+        "esxi_validation",
     },
 }
 VM_PUBLISHED_VARIANTS = ",".join(VM_VARIANTS)
@@ -838,8 +840,6 @@ def verify_vm_candidate(gh: Path, candidate: tuple[int, str, str, str, int, dict
             "nss_validation": "false",
             "exact_release_image": "true",
             "serial_labels": "PASS",
-            "http": "PASS",
-            "ssh_runtime_evidence": "PASS",
             "ssh_port_probe": "PASS",
             "ssh": "DISABLED_BY_DEFAULT",
             "authorized_keys": "ABSENT",
@@ -847,24 +847,47 @@ def verify_vm_candidate(gh: Path, candidate: tuple[int, str, str, str, int, dict
             "dropbear_running": "NO",
         }
         if contract_version == VM_CONTRACT_V1:
-            expected_smoke["qemu_boot"] = "PASS"
+            expected_smoke.update({
+                "qemu_boot": "PASS",
+                "http": "PASS",
+                "ssh_runtime_evidence": "PASS",
+            })
         else:
             expected_smoke.update({
                 "release_contract": "vm-x86_64/v2",
+                "https": "PASS",
+                "http_redirect": "PASS",
+                "runtime_evidence": "PASS",
+                "production_runtime": "PASS",
+                "raw_bios_persistence": "PASS",
+                "vmdk_import_persistence": "PASS",
                 "esxi_validation": "not-tested",
                 **{f"{variant}_file": names[variant] for variant in VM_VARIANTS},
                 **{f"{variant}_qemu": "runtime-pass" for variant in VM_VARIANTS},
             })
         if any(smoke[key] != value for key, value in expected_smoke.items()):
             raise VerificationError("VM smoke report does not exactly prove the release safety contract")
-        if contract_version == VM_CONTRACT_V1 and Path(smoke["image"]).name != names["image"]:
-            raise VerificationError("VM smoke report did not test the exact published image")
-        if (smoke["http_status"], smoke["auth_challenge"]) not in {("200", "false"), ("403", "true")}:
-            raise VerificationError("VM smoke report contains an invalid LuCI HTTP result")
-        http_port = parse_vm_host_port(smoke["http_host_port"], "HTTP host port")
-        ssh_port = parse_vm_host_port(smoke["ssh_host_port"], "SSH host port")
-        if http_port == ssh_port:
-            raise VerificationError("VM smoke report reuses the same HTTP and SSH host port")
+        if contract_version == VM_CONTRACT_V1:
+            if Path(smoke["image"]).name != names["image"]:
+                raise VerificationError("VM smoke report did not test the exact published image")
+            if (smoke["http_status"], smoke["auth_challenge"]) not in {("200", "false"), ("403", "true")}:
+                raise VerificationError("VM smoke report contains an invalid LuCI HTTP result")
+            ports = {
+                "http": parse_vm_host_port(smoke["http_host_port"], "HTTP host port"),
+                "ssh": parse_vm_host_port(smoke["ssh_host_port"], "SSH host port"),
+            }
+        else:
+            if smoke["http_redirect_status"] not in {"301", "302", "307", "308"}:
+                raise VerificationError("VM smoke report contains an invalid HTTP-to-HTTPS redirect")
+            if (smoke["https_status"], smoke["auth_challenge"]) not in {("200", "false"), ("403", "true")}:
+                raise VerificationError("VM smoke report contains an invalid LuCI HTTPS/authentication result")
+            ports = {
+                "http": parse_vm_host_port(smoke["http_host_port"], "HTTP host port"),
+                "https": parse_vm_host_port(smoke["https_host_port"], "HTTPS host port"),
+                "ssh": parse_vm_host_port(smoke["ssh_host_port"], "SSH host port"),
+            }
+        if len(set(ports.values())) != len(ports):
+            raise VerificationError("VM smoke report reuses a host port")
         require_vm_result_path(smoke["serial_log"], "serial.log", "serial log path", contract_version)
         require_vm_result_path(smoke["ssh_probe_log"], "ssh-port-probe.txt", "SSH probe log path", contract_version)
 
