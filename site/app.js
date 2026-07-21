@@ -9,6 +9,9 @@ const RECOVERY_URL = `https://github.com/${REPOSITORY}/blob/main/docs/RECOVERY.m
 const TESTING_URL = `https://github.com/${REPOSITORY}/blob/main/docs/TESTING.md`;
 const VM_RELEASE_WORKFLOW_URL = `https://github.com/${REPOSITORY}/actions/workflows/vm-release.yml`;
 const VM_DOCS_URL = `https://github.com/${REPOSITORY}/blob/main/docs/VM-X86_64.md`;
+const CUSTOM_BUILD_WORKFLOW_FILE = 'custom-build.yml';
+const CUSTOM_BUILD_WORKFLOW_URL = `https://github.com/${REPOSITORY}/actions/workflows/${CUSTOM_BUILD_WORKFLOW_FILE}`;
+const COMPONENT_CATALOG_URL = 'components/catalog.json';
 const PROVENANCE_LABELS = {
   provenance_archive: 'Archive bundle',
   provenance_checksums: 'Checksums bundle',
@@ -99,13 +102,14 @@ function validRelease(release, flavor, device) {
     'browser_build_workflow_url', 'recovery_url', 'testing_url', 'assets'
   ];
   if (!validDevice(device) || !exactKeys(release, keys)) return false;
-  const versionPattern = /^v(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)-rc\.(?:0|[1-9]\d*)$/;
+  const rcVersionPattern = /^v(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)-rc\.(?:0|[1-9]\d*)$/;
+  const stableVersionPattern = /^v(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)$/;
   const expectedTag = flavor === 'nss' ? `ram-test-nss-${release.version}` : `ram-test-${release.version}`;
   if (release.device_id !== device.id || release.device_name !== device.display_name ||
       release.flavor !== flavor || release.flavor_experimental !== device.flavors[flavor].experimental ||
       release.channel !== 'ram-test' || release.hardware_status !== 'unverified' ||
       release.production_ready !== false || release.ram_only !== true ||
-      typeof release.version !== 'string' || !versionPattern.test(release.version) || release.tag !== expectedTag ||
+      typeof release.version !== 'string' || (!rcVersionPattern.test(release.version) && !stableVersionPattern.test(release.version)) || release.tag !== expectedTag ||
       !validUtcTimestamp(release.published_at) ||
       release.browser_build_workflow_url !== device.browser_build_workflow_url ||
       release.recovery_url !== device.recovery_url || release.testing_url !== device.testing_url ||
@@ -130,8 +134,8 @@ function validRelease(release, flavor, device) {
 }
 
 function versionTuple(version) {
-  const match = /^v(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)-rc\.(0|[1-9]\d*)$/.exec(version);
-  return match ? match.slice(1).map((part) => BigInt(part)) : null;
+  const match = /^v(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-rc\.(0|[1-9]\d*))?$/.exec(version);
+  return match ? [BigInt(match[1]), BigInt(match[2]), BigInt(match[3]), match[4] === undefined ? 1000000000n : BigInt(match[4])] : null;
 }
 
 function compareVersions(left, right) {
@@ -211,9 +215,9 @@ function vmExpectedNames(version, contractVersion) {
   });
 }
 
-function validVmValidation(value, contractVersion) {
+function validVmValidation(value, contractVersion, expectedEsxi = 'not-tested') {
   const variants = contractVersion === 1 ? ['raw_bios'] : VM_VARIANTS;
-  return exactKeys(value, ['qemu', 'esxi']) && value.esxi === 'not-tested' &&
+  return exactKeys(value, ['qemu', 'esxi']) && value.esxi === expectedEsxi &&
     exactKeys(value.qemu, variants) && variants.every((variant) => value.qemu[variant] === 'runtime-pass');
 }
 
@@ -237,7 +241,8 @@ function validVmRelease(release, schemaVersion = null) {
   } else {
     return false;
   }
-  const versionPattern = /^v(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)-rc\.(?:0|[1-9]\d*)$/;
+  const rcVersionPattern = /^v(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)-rc\.(?:0|[1-9]\d*)$/;
+  const stableVersionPattern = /^v(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)$/;
   const expectedTag = `vm-${VM_PLATFORM}-${release.version}`;
   const contractVersion = inferredSchema === 3 ? 1 : release.contract_version;
   const expectedClass = contractVersion === 1 ? 'VM_DISTRIBUTION_IMAGE' : 'VM_DISTRIBUTION_SET';
@@ -245,14 +250,24 @@ function validVmRelease(release, schemaVersion = null) {
       release.artifact_class !== expectedClass || release.vm_only !== true ||
       release.not_ax9000_firmware !== true || release.hardware_validation !== false ||
       release.nss_validation !== false || release.qemu_validated !== true || release.ssh_default !== 'disabled' ||
-      typeof release.version !== 'string' || !versionPattern.test(release.version) || release.tag !== expectedTag ||
+      typeof release.version !== 'string' || (!rcVersionPattern.test(release.version) && !stableVersionPattern.test(release.version)) || release.tag !== expectedTag ||
       !validUtcTimestamp(release.published_at) || release.browser_build_workflow_url !== VM_RELEASE_WORKFLOW_URL ||
       release.docs_url !== VM_DOCS_URL ||
       !validHttpsGitHubUrl(release.release_url, `/${REPOSITORY}/releases/tag/${expectedTag}`)) return false;
+  const stable = stableVersionPattern.test(release.version);
+  const expectedEsxi = stable ? 'validated' : 'not-tested';
+  if (stable && contractVersion !== 2) return false;
   if (inferredSchema === 4 && (release.release_contract !== `vm-x86_64/v${contractVersion}` ||
-      release.esxi_validation !== 'not-tested' || !validVmValidation(release.validation, contractVersion))) return false;
+      release.esxi_validation !== expectedEsxi || !validVmValidation(release.validation, contractVersion, expectedEsxi))) return false;
 
-  const expectedNames = vmExpectedNames(release.version, contractVersion);
+  let assetVersion = release.version;
+  if (stable) {
+    const rawName = release.assets?.raw_bios?.name;
+    const match = typeof rawName === 'string' ? /^NexaWrt-x86_64-(v(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)-rc\.(?:0|[1-9]\d*))-generic-ext4-combined\.img\.gz$/.exec(rawName) : null;
+    if (!match || match[1].split('-rc.', 1)[0] !== release.version) return false;
+    assetVersion = match[1];
+  }
+  const expectedNames = vmExpectedNames(assetVersion, contractVersion);
   if (!expectedNames || !exactKeys(release.assets, Object.keys(expectedNames))) return false;
   return Object.entries(expectedNames).every(([key, expectedName]) => {
     const asset = release.assets[key];
@@ -486,10 +501,10 @@ function renderVmCard(release) {
   card.querySelector('details').hidden = false;
 }
 
-function renderVmHistory(group) {
+function renderVmHistory(group, schemaVersion = null) {
   const history = document.querySelector('#vm-history');
   if (!history) return;
-  const releases = Array.isArray(group?.history) ? group.history.filter(validVmRelease) : [];
+  const releases = Array.isArray(group?.history) ? group.history.filter((release) => validVmRelease(release, schemaVersion)) : [];
   if (!releases.length) {
     const empty = document.createElement('p');
     empty.className = 'empty-state';
@@ -550,7 +565,7 @@ async function loadReleases() {
     const vmValid = validVmReleaseGroup(vmGroup, data.schema_version);
     if (vmValid) {
       renderVmCard(vmGroup.latest);
-      renderVmHistory(vmGroup);
+      renderVmHistory(vmGroup, data.schema_version);
       renderVmHistoryActions(vmGroup.latest);
     } else {
       resetVmUi();
@@ -575,6 +590,457 @@ async function loadReleases() {
     status.classList.add('error');
     status.textContent = '设备或发布索引暂不可用；已禁用下载与构建入口。 / Catalog unavailable; downloads and builds disabled.';
     console.error('Unable to load the allowlisted device/release index:', error);
+  }
+}
+
+
+const COMPONENT_CATALOG_KEYS = [
+  'schema_version', 'catalog_version', 'max_selected_components', 'targets', 'categories', 'components'
+];
+const COMPONENT_TARGET_KEYS = ['id', 'display_name', 'openwrt_target', 'openwrt_subtarget', 'profile'];
+const COMPONENT_CATEGORY_KEYS = ['id', 'title', 'description', 'order'];
+const COMPONENT_KEYS = [
+  'id', 'name', 'description', 'category', 'packages', 'depends', 'conflicts',
+  'supported_targets', 'default_for'
+];
+const SAFE_COMPONENT_ID = /^[a-z0-9][a-z0-9_-]{0,63}$/;
+const SAFE_OPENWRT_TOKEN = /^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$/;
+const SAFE_CATALOG_VERSION = /^\d{4}\.\d{2}\.\d{2}(?:\.\d+)?$/;
+const REQUIRED_COMPONENT_TARGETS = new Set(['x86_64', 'xiaomi_ax9000']);
+const MAX_CATALOG_ITEMS = 256;
+const CUSTOM_BUILD_FLAVORS = {
+  official: { id: 'official', label: 'Official · 官方' },
+  nss: { id: 'nss', label: 'NSS · 实验性' }
+};
+let componentCatalog = null;
+let requestedComponentIds = new Set();
+let resolvedComponentIds = new Set();
+let componentRequestSequence = 0;
+
+function validCatalogText(value, maxLength) {
+  return typeof value === 'string' && value.length > 0 && value === value.trim() &&
+    value.length <= maxLength && !/[\u0000-\u001f\u007f]/.test(value);
+}
+
+function validComponentId(value) {
+  return typeof value === 'string' && SAFE_COMPONENT_ID.test(value);
+}
+
+function uniqueStrings(values, validator, maxItems = 64, allowEmpty = true) {
+  return Array.isArray(values) && (allowEmpty || values.length > 0) && values.length <= maxItems &&
+    values.every((value) => validator(value)) && new Set(values).size === values.length;
+}
+
+function hasDependencyCycle(componentsById) {
+  const visiting = new Set();
+  const visited = new Set();
+  function visit(id) {
+    if (visiting.has(id)) return true;
+    if (visited.has(id)) return false;
+    visiting.add(id);
+    for (const dependency of componentsById.get(id).depends) {
+      if (visit(dependency)) return true;
+    }
+    visiting.delete(id);
+    visited.add(id);
+    return false;
+  }
+  return [...componentsById.keys()].some(visit);
+}
+
+function validateComponentCatalog(catalog) {
+  if (!exactKeys(catalog, COMPONENT_CATALOG_KEYS) || catalog.schema_version !== 1 ||
+      !SAFE_CATALOG_VERSION.test(catalog.catalog_version) ||
+      !Number.isInteger(catalog.max_selected_components) || catalog.max_selected_components < 1 ||
+      catalog.max_selected_components > 64 ||
+      !Array.isArray(catalog.targets) || catalog.targets.length < 1 || catalog.targets.length > 32 ||
+      !Array.isArray(catalog.categories) || catalog.categories.length < 1 || catalog.categories.length > 64 ||
+      !Array.isArray(catalog.components) || catalog.components.length < 1 ||
+      catalog.components.length > MAX_CATALOG_ITEMS) return false;
+
+  const targetIds = new Set();
+  for (const target of catalog.targets) {
+    if (!exactKeys(target, COMPONENT_TARGET_KEYS) || !validComponentId(target.id) ||
+        !validCatalogText(target.display_name, 80) || !SAFE_OPENWRT_TOKEN.test(target.openwrt_target) ||
+        !SAFE_OPENWRT_TOKEN.test(target.openwrt_subtarget) || !SAFE_OPENWRT_TOKEN.test(target.profile) ||
+        targetIds.has(target.id)) return false;
+    targetIds.add(target.id);
+  }
+  if (![...REQUIRED_COMPONENT_TARGETS].every((id) => targetIds.has(id))) return false;
+
+  const categoryIds = new Set();
+  const categoryOrders = new Set();
+  for (const category of catalog.categories) {
+    if (!exactKeys(category, COMPONENT_CATEGORY_KEYS) || !validComponentId(category.id) ||
+        !validCatalogText(category.title, 80) || !validCatalogText(category.description, 240) ||
+        !Number.isInteger(category.order) || category.order < 0 || category.order > 10000 ||
+        categoryIds.has(category.id) || categoryOrders.has(category.order)) return false;
+    categoryIds.add(category.id);
+    categoryOrders.add(category.order);
+  }
+
+  const componentsById = new Map();
+  for (const component of catalog.components) {
+    if (!exactKeys(component, COMPONENT_KEYS) || !validComponentId(component.id) ||
+        !validCatalogText(component.name, 80) || !validCatalogText(component.description, 240) ||
+        !categoryIds.has(component.category) ||
+        !uniqueStrings(component.packages, (value) => typeof value === 'string' && SAFE_OPENWRT_TOKEN.test(value), 128, false) ||
+        !uniqueStrings(component.depends, validComponentId) ||
+        !uniqueStrings(component.conflicts, validComponentId) ||
+        !uniqueStrings(component.supported_targets, validComponentId, 32, false) ||
+        !uniqueStrings(component.default_for, validComponentId, 32) ||
+        !component.supported_targets.every((id) => targetIds.has(id)) ||
+        !component.default_for.every((id) => component.supported_targets.includes(id)) ||
+        component.depends.includes(component.id) || component.conflicts.includes(component.id) ||
+        componentsById.has(component.id)) return false;
+    componentsById.set(component.id, component);
+  }
+  for (const component of catalog.components) {
+    if (![...component.depends, ...component.conflicts].every((id) => componentsById.has(id))) return false;
+    if (!component.conflicts.every((id) => componentsById.get(id).conflicts.includes(component.id))) return false;
+  }
+  return !hasDependencyCycle(componentsById);
+}
+
+function flavorsForTarget(targetId) {
+  return targetId === 'xiaomi_ax9000'
+    ? [CUSTOM_BUILD_FLAVORS.official, CUSTOM_BUILD_FLAVORS.nss]
+    : [CUSTOM_BUILD_FLAVORS.official];
+}
+
+function componentAvailable(component, targetId) {
+  return component.supported_targets.includes(targetId);
+}
+
+function resolveComponentSelection(catalog, targetId, requestedIds) {
+  const target = catalog.targets.find((item) => item.id === targetId);
+  if (!target) return { ok: false, error: '无效的构建目标。' };
+  const requested = [...requestedIds];
+  if (requested.length > catalog.max_selected_components) {
+    return { ok: false, error: `最多可显式选择 ${catalog.max_selected_components} 个组件。` };
+  }
+  if (new Set(requested).size !== requested.length) return { ok: false, error: '组件选择包含重复项。' };
+
+  const componentsById = new Map(catalog.components.map((item) => [item.id, item]));
+  if (requested.some((id) => !componentsById.has(id))) return { ok: false, error: '选择中包含目录外组件。' };
+  const defaults = catalog.components.filter((item) => item.default_for.includes(targetId)).map((item) => item.id).sort();
+  const selected = new Set([...requested, ...defaults]);
+  const queue = [...selected];
+  while (queue.length) {
+    const id = queue.shift();
+    const component = componentsById.get(id);
+    for (const dependency of component.depends) {
+      if (!selected.has(dependency)) {
+        selected.add(dependency);
+        queue.push(dependency);
+      }
+    }
+  }
+  if (selected.size > catalog.max_selected_components) {
+    return { ok: false, error: `依赖解析后超过 ${catalog.max_selected_components} 个组件上限。` };
+  }
+  const unsupported = [...selected].filter((id) => !componentAvailable(componentsById.get(id), targetId)).sort();
+  if (unsupported.length) return { ok: false, error: `组件不支持当前目标：${unsupported.join(', ')}` };
+
+  const resolved = [...selected].sort();
+  for (const id of resolved) {
+    const component = componentsById.get(id);
+    const conflict = component.conflicts.find((other) => selected.has(other));
+    if (conflict) {
+      return { ok: false, error: `组件冲突：${component.name} 与 ${componentsById.get(conflict).name} 不能同时选择。` };
+    }
+  }
+  const packages = [...new Set(resolved.flatMap((id) => componentsById.get(id).packages))].sort();
+  return {
+    ok: true,
+    error: '',
+    requested_components: [...requested].sort(),
+    default_components: defaults,
+    resolved_components: resolved,
+    packages,
+    target: {
+      id: target.id,
+      openwrt_target: target.openwrt_target,
+      openwrt_subtarget: target.openwrt_subtarget,
+      profile: target.profile
+    }
+  };
+}
+
+function componentHashPayload(catalog, targetId, flavorId, resolved) {
+  return {
+    catalog_version: catalog.catalog_version,
+    components: [...resolved.resolved_components],
+    flavor: flavorId,
+    packages: [...resolved.packages],
+    schema_version: 1,
+    target: targetId
+  };
+}
+
+function canonicalJson(value) {
+  return JSON.stringify(value);
+}
+
+async function sha256Hex(value) {
+  const bytes = new TextEncoder().encode(value);
+  const digest = await globalThis.crypto.subtle.digest('SHA-256', bytes);
+  return [...new Uint8Array(digest)].map((byte) => byte.toString(16).padStart(2, '0')).join('');
+}
+
+function normalizedBuildRequest(catalog, flavorId, resolved, requestHash) {
+  return {
+    schema_version: 1,
+    catalog_version: catalog.catalog_version,
+    target: resolved.target,
+    flavor: flavorId,
+    requested_components: resolved.requested_components,
+    default_components: resolved.default_components,
+    resolved_components: resolved.resolved_components,
+    packages: resolved.packages,
+    request_hash: requestHash
+  };
+}
+
+function actionsInputs(request) {
+  return [
+    `target=${request.target.id}`,
+    `flavor=${request.flavor}`,
+    `components=${request.requested_components.join(',')}`,
+    `catalog_version=${request.catalog_version}`,
+    `request_hash=${request.request_hash}`
+  ].join('\n');
+}
+
+function setComponentMessage(message, isError = false) {
+  const output = document.querySelector('#component-error');
+  output.textContent = message;
+  output.hidden = !message;
+  output.classList.remove('error');
+  if (isError) output.classList.add('error');
+}
+
+function setBuildRequestUnavailable(message) {
+  componentRequestSequence += 1;
+  document.querySelector('#component-packages').textContent = '—';
+  document.querySelector('#component-normalized').textContent = '{}';
+  document.querySelector('#component-request-hash').textContent = '—';
+  document.querySelector('#component-actions-inputs').textContent = '# 等待有效选择 / Waiting for a valid selection';
+  document.querySelector('#copy-actions-inputs').disabled = true;
+  const workflowLink = document.querySelector('#custom-build-workflow-link');
+  workflowLink.hidden = true;
+  workflowLink.removeAttribute('href');
+  if (message) setComponentMessage(message, true);
+}
+
+function populateSelect(select, items, selectedId) {
+  const options = items.map((item) => {
+    const option = document.createElement('option');
+    option.value = item.id;
+    option.textContent = item.label || item.display_name || item.title;
+    option.selected = item.id === selectedId;
+    return option;
+  });
+  select.replaceChildren(...options);
+  select.value = items.some((item) => item.id === selectedId) ? selectedId : (items[0]?.id || '');
+}
+
+function selectedTargetAndFlavor() {
+  return {
+    targetId: document.querySelector('#component-target').value,
+    flavorId: document.querySelector('#component-flavor').value
+  };
+}
+
+function currentResolvedSelection() {
+  const { targetId } = selectedTargetAndFlavor();
+  return resolveComponentSelection(componentCatalog, targetId, [...requestedComponentIds]);
+}
+
+function renderComponentChoices() {
+  const list = document.querySelector('#component-list');
+  const { targetId } = selectedTargetAndFlavor();
+  const query = document.querySelector('#component-search').value.trim().toLocaleLowerCase('zh-CN');
+  const categoryFilter = document.querySelector('#component-category').value;
+  const componentsByCategory = new Map(componentCatalog.categories.map((category) => [category.id, []]));
+  for (const component of componentCatalog.components) {
+    if (!componentAvailable(component, targetId) ||
+        (categoryFilter && categoryFilter !== component.category) ||
+        (query && !`${component.name} ${component.description} ${component.id} ${component.packages.join(' ')}`.toLocaleLowerCase('zh-CN').includes(query))) continue;
+    componentsByCategory.get(component.category).push(component);
+  }
+
+  const fragment = document.createDocumentFragment();
+  let visibleCount = 0;
+  const categories = [...componentCatalog.categories].sort((left, right) => left.order - right.order);
+  for (const category of categories) {
+    const components = componentsByCategory.get(category.id);
+    if (!components.length) continue;
+    const group = document.createElement('section');
+    group.className = 'component-category-group';
+    const heading = document.createElement('h3');
+    heading.textContent = category.title;
+    const description = document.createElement('p');
+    description.className = 'component-category-description';
+    description.textContent = category.description;
+    group.append(heading, description);
+    for (const component of components.sort((left, right) => left.name.localeCompare(right.name))) {
+      const label = document.createElement('label');
+      label.className = 'component-option';
+      const checkbox = document.createElement('input');
+      checkbox.type = 'checkbox';
+      checkbox.value = component.id;
+      checkbox.checked = resolvedComponentIds.has(component.id);
+      checkbox.setAttribute('data-component-id', component.id);
+      const copy = document.createElement('span');
+      copy.className = 'component-option-copy';
+      const name = document.createElement('strong');
+      name.textContent = component.name;
+      const detail = document.createElement('small');
+      detail.textContent = `${component.description} · ${component.packages.join(', ')}`;
+      copy.append(name, detail);
+      label.append(checkbox, copy);
+      checkbox.addEventListener('change', () => changeComponentSelection(component.id, checkbox.checked));
+      group.append(label);
+      visibleCount += 1;
+    }
+    fragment.append(group);
+  }
+  if (!visibleCount) {
+    const empty = document.createElement('p');
+    empty.className = 'empty-state';
+    empty.textContent = '没有匹配当前筛选条件的组件。 / No matching components.';
+    fragment.append(empty);
+  }
+  list.replaceChildren(fragment);
+}
+
+async function updateBuildRequest(preserveMessage = false) {
+  const sequence = ++componentRequestSequence;
+  const { targetId, flavorId } = selectedTargetAndFlavor();
+  const resolved = resolveComponentSelection(componentCatalog, targetId, [...requestedComponentIds]);
+  if (!resolved.ok) {
+    setBuildRequestUnavailable(resolved.error);
+    return;
+  }
+  resolvedComponentIds = new Set(resolved.resolved_components);
+  try {
+    const hash = await sha256Hex(canonicalJson(componentHashPayload(componentCatalog, targetId, flavorId, resolved)));
+    if (sequence !== componentRequestSequence) return;
+    const request = normalizedBuildRequest(componentCatalog, flavorId, resolved, hash);
+    document.querySelector('#component-packages').textContent = request.packages.join('\n');
+    document.querySelector('#component-normalized').textContent = JSON.stringify(request, null, 2);
+    document.querySelector('#component-request-hash').textContent = `sha256:${hash}`;
+    document.querySelector('#component-actions-inputs').textContent = actionsInputs(request);
+    document.querySelector('#copy-actions-inputs').disabled = false;
+    const workflowLink = document.querySelector('#custom-build-workflow-link');
+    workflowLink.href = CUSTOM_BUILD_WORKFLOW_URL;
+    workflowLink.hidden = false;
+    if (!preserveMessage) setComponentMessage('');
+  } catch (error) {
+    if (sequence !== componentRequestSequence) return;
+    setBuildRequestUnavailable('浏览器无法计算请求哈希，已禁用构建入口。');
+    console.error('Unable to hash normalized component request:', error);
+  }
+}
+
+function changeComponentSelection(componentId, enabled) {
+  const previous = new Set(requestedComponentIds);
+  let preserveMessage = false;
+  if (enabled) requestedComponentIds.add(componentId);
+  else requestedComponentIds.delete(componentId);
+  const resolved = currentResolvedSelection();
+  if (!resolved.ok) {
+    requestedComponentIds = previous;
+    preserveMessage = true;
+    setComponentMessage(resolved.error, true);
+  } else {
+    resolvedComponentIds = new Set(resolved.resolved_components);
+    if (!enabled && resolvedComponentIds.has(componentId)) {
+      preserveMessage = true;
+      setComponentMessage(`组件 ${componentId} 是默认组件或仍被其他组件依赖，不能移除。`, true);
+    } else {
+      setComponentMessage('');
+    }
+  }
+  renderComponentChoices();
+  updateBuildRequest(preserveMessage);
+}
+
+function resetComponentsForTarget() {
+  const { targetId } = selectedTargetAndFlavor();
+  const compatible = new Set(componentCatalog.components
+    .filter((component) => componentAvailable(component, targetId))
+    .map((component) => component.id));
+  requestedComponentIds = new Set([...requestedComponentIds].filter((id) => compatible.has(id)));
+  const resolved = currentResolvedSelection();
+  if (!resolved.ok) {
+    requestedComponentIds.clear();
+    setBuildRequestUnavailable(resolved.error);
+    resolvedComponentIds.clear();
+  } else {
+    resolvedComponentIds = new Set(resolved.resolved_components);
+    setComponentMessage('');
+  }
+  renderComponentChoices();
+  updateBuildRequest();
+}
+
+function setupComponentBuilder(catalog) {
+  componentCatalog = catalog;
+  requestedComponentIds.clear();
+  resolvedComponentIds.clear();
+  const targetSelect = document.querySelector('#component-target');
+  const flavorSelect = document.querySelector('#component-flavor');
+  const categorySelect = document.querySelector('#component-category');
+  targetSelect.disabled = false;
+  flavorSelect.disabled = false;
+  categorySelect.disabled = false;
+  populateSelect(targetSelect, catalog.targets, catalog.targets[0].id);
+  populateSelect(categorySelect, [{ id: '', title: '全部分类 / All categories' }, ...catalog.categories], '');
+
+  function updateFlavors() {
+    const available = flavorsForTarget(targetSelect.value);
+    populateSelect(flavorSelect, available, available[0].id);
+    resetComponentsForTarget();
+  }
+  targetSelect.addEventListener('change', updateFlavors);
+  flavorSelect.addEventListener('change', () => updateBuildRequest());
+  categorySelect.addEventListener('change', renderComponentChoices);
+  document.querySelector('#component-search').addEventListener('input', renderComponentChoices);
+  updateFlavors();
+}
+
+async function loadComponentCatalog() {
+  const status = document.querySelector('#component-status');
+  try {
+    const response = await fetch(COMPONENT_CATALOG_URL, { cache: 'no-store', credentials: 'same-origin' });
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    const catalog = await response.json();
+    if (!validateComponentCatalog(catalog)) throw new Error('unexpected component catalog schema');
+    setupComponentBuilder(catalog);
+    status.classList.remove('error');
+    status.textContent = `组件目录 ${catalog.catalog_version} 已验证 / Catalog verified`;
+  } catch (error) {
+    componentCatalog = null;
+    requestedComponentIds.clear();
+    resolvedComponentIds.clear();
+    status.classList.add('error');
+    status.textContent = '组件目录暂不可用；已禁用自定义构建入口。 / Catalog unavailable; custom builds disabled.';
+    document.querySelector('#component-list').replaceChildren();
+    setBuildRequestUnavailable('无法验证组件目录。');
+    console.error('Unable to load the allowlisted component catalog:', error);
+  }
+}
+
+async function copyActionsInputs() {
+  const button = document.querySelector('#copy-actions-inputs');
+  try {
+    await navigator.clipboard.writeText(document.querySelector('#component-actions-inputs').textContent);
+    button.textContent = '已复制 / Copied';
+    window.setTimeout(() => { button.textContent = '复制 Inputs / Copy inputs'; }, 1800);
+  } catch {
+    button.textContent = '请手动复制 / Select manually';
   }
 }
 
@@ -694,4 +1160,6 @@ configForm.addEventListener('submit', generateSnippet);
 configForm.addEventListener('input', () => invalidateConfigSnippet(configForm));
 configForm.addEventListener('change', () => invalidateConfigSnippet(configForm));
 document.querySelector('#copy-snippet').addEventListener('click', copySnippet);
+document.querySelector('#copy-actions-inputs').addEventListener('click', copyActionsInputs);
 loadReleases();
+loadComponentCatalog();

@@ -33,6 +33,7 @@
         <div class="nav-links">
           <a href="#releases">AX9000</a>
           <a href="#vm-releases">x86_64 VM</a>
+          <a href="#custom-build">组件 / Components</a>
           <a href="#configure">配置 / Configure</a>
           <a href="https://github.com/tifycloud/NexaWrt" target="_blank" rel="noopener noreferrer">GitHub ↗</a>
         </div>
@@ -173,6 +174,63 @@
         <div id="vm-history" class="history-list">
           <p class="empty-state">正在加载虚拟机版本… / Loading VM releases…</p>
         </div>
+      </div>
+    </section>
+
+    <section id="custom-build" class="section component-builder-section" aria-labelledby="custom-build-title">
+      <div class="section-heading">
+        <div>
+          <p class="eyebrow">CUSTOM IMAGE · 自定义云编译</p>
+          <h2 id="custom-build-title">选择目标、分支与组件</h2>
+        </div>
+        <p id="component-status" class="data-status" role="status">正在读取组件目录… / Loading component catalog…</p>
+      </div>
+
+      <div class="component-security-note">
+        <strong>静态 Pages 不保存 GitHub token，也不会代替你提交构建。</strong>
+        <p>页面只在本地浏览器中规范化选择并计算请求哈希。请先登录 GitHub，打开 Actions 页面，再点击 <b>Run workflow</b> 并粘贴生成的 inputs；目前不支持匿名一键构建。</p>
+      </div>
+
+      <div class="component-builder-grid">
+        <div class="component-controls" aria-label="自定义构建选择器 / Custom build selector">
+          <div class="field-grid">
+            <label>目标 / Target
+              <select id="component-target" disabled aria-describedby="component-error"></select>
+            </label>
+            <label>分支 / Flavor
+              <select id="component-flavor" disabled aria-describedby="component-error"></select>
+            </label>
+          </div>
+          <div class="field-grid">
+            <label>搜索 / Search
+              <input id="component-search" type="search" maxlength="80" autocomplete="off" placeholder="名称、说明、包名">
+            </label>
+            <label>分类 / Category
+              <select id="component-category" disabled></select>
+            </label>
+          </div>
+          <p id="component-error" class="component-message" role="alert" hidden></p>
+          <div id="component-list" class="component-list" aria-live="polite"></div>
+        </div>
+
+        <aside class="component-summary" aria-labelledby="component-summary-title">
+          <p class="eyebrow">NORMALIZED REQUEST · 规范化请求</p>
+          <h3 id="component-summary-title">构建预览</h3>
+          <dl class="component-summary-list">
+            <div><dt>预计包清单 / Packages</dt><dd><pre id="component-packages">—</pre></dd></div>
+            <div><dt>Request hash</dt><dd><code id="component-request-hash">—</code></dd></div>
+          </dl>
+          <details>
+            <summary>查看规范化选择 / Normalized selection</summary>
+            <pre><code id="component-normalized">{}</code></pre>
+          </details>
+          <div class="actions-inputs-panel">
+            <div class="snippet-toolbar"><span>GitHub Actions inputs</span><button id="copy-actions-inputs" type="button" disabled>复制 Inputs / Copy inputs</button></div>
+            <pre><code id="component-actions-inputs"># 等待有效选择 / Waiting for a valid selection</code></pre>
+          </div>
+          <a id="custom-build-workflow-link" class="button button-primary component-workflow-link" hidden target="_blank" rel="noopener noreferrer">打开 custom-build.yml Actions ↗</a>
+          <p class="component-run-help">GitHub 登录后，在工作流页面点击 <b>Run workflow</b>，逐项粘贴上方 inputs。打开页面本身不会自动触发构建。</p>
+        </aside>
       </div>
     </section>
 

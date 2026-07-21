@@ -289,3 +289,132 @@ footer p { margin: 0; text-align: center; }
   .vm-card .download-actions { grid-template-columns: 1fr; }
   .vm-safety-label { white-space: nowrap; }
 }
+
+/* Catalog-driven custom builds. Static Pages only prepares authenticated Actions inputs. */
+.component-builder-section {
+  border-top: 1px solid var(--line);
+}
+.component-security-note {
+  margin: -8px 0 26px;
+  padding: 18px 20px;
+  border-left: 3px solid var(--lime);
+  background: var(--lime-soft);
+  color: var(--muted);
+}
+.component-security-note strong { color: var(--text); }
+.component-security-note p { margin: 4px 0 0; }
+.component-builder-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 1.35fr) minmax(320px, .65fr);
+  gap: 24px;
+  align-items: start;
+}
+.component-controls,
+.component-summary {
+  min-width: 0;
+  padding: 24px;
+  border: 1px solid var(--line);
+  background: var(--surface);
+}
+.component-controls > .field-grid + .field-grid { margin-top: 14px; }
+.component-controls label {
+  display: grid;
+  gap: 7px;
+  color: var(--muted);
+  font-size: .78rem;
+}
+.component-controls input,
+.component-controls select {
+  width: 100%;
+  min-height: 44px;
+  padding: 9px 11px;
+  border: 1px solid #3d474f;
+  border-radius: 2px;
+  color: var(--text);
+  background: #0c1013;
+}
+.component-controls input:disabled,
+.component-controls select:disabled { color: #667078; cursor: not-allowed; }
+.component-message {
+  margin: 16px 0 0;
+  padding: 10px 12px;
+  border-left: 2px solid var(--lime);
+  color: #d9f4a0;
+  background: rgba(201, 255, 61, .06);
+  font-size: .8rem;
+}
+.component-message.error {
+  border-left-color: var(--danger);
+  color: #ffaaa4;
+  background: rgba(255, 77, 67, .08);
+}
+.component-list {
+  display: grid;
+  gap: 18px;
+  max-height: 720px;
+  margin-top: 20px;
+  padding-right: 6px;
+  overflow: auto;
+}
+.component-category-group {
+  display: grid;
+  gap: 8px;
+  padding-top: 16px;
+  border-top: 1px solid var(--line);
+}
+.component-category-group:first-child { padding-top: 0; border-top: 0; }
+.component-category-group h3 { margin: 0; font-size: 1rem; }
+.component-category-description { margin: -4px 0 5px; color: var(--muted); font-size: .76rem; }
+.component-option {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: 12px;
+  align-items: start;
+  padding: 13px;
+  border: 1px solid #303940;
+  background: #0c1013;
+  cursor: pointer;
+}
+.component-option:hover { border-color: #56616b; }
+.component-option:has(input:checked) { border-color: rgba(201, 255, 61, .55); background: rgba(201, 255, 61, .055); }
+.component-option input { width: 18px; min-height: 18px; margin: 3px 0 0; accent-color: var(--lime); }
+.component-option-copy { display: grid; gap: 3px; min-width: 0; }
+.component-option-copy strong { color: var(--text); font-size: .9rem; }
+.component-option-copy small { color: var(--muted); line-height: 1.5; overflow-wrap: anywhere; }
+.component-summary { position: sticky; top: 18px; }
+.component-summary h3 { margin: 0 0 18px; font-size: 1.5rem; }
+.component-summary-list { display: grid; gap: 14px; margin: 0; }
+.component-summary-list div { padding: 13px 0; border-top: 1px solid var(--line); }
+.component-summary-list dt { color: var(--muted); font-size: .72rem; }
+.component-summary-list dd { margin: 7px 0 0; }
+.component-summary-list pre,
+.component-summary details pre,
+.actions-inputs-panel pre {
+  max-height: 210px;
+  margin: 0;
+  padding: 14px;
+  overflow: auto;
+  color: #d8e0e4;
+  background: #07090a;
+  font-size: .73rem;
+  line-height: 1.65;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+.component-summary details { margin: 16px 0; border: 1px solid var(--line); }
+.component-summary details summary { padding: 12px 14px; cursor: pointer; color: var(--muted); font-size: .78rem; }
+.actions-inputs-panel { margin-top: 16px; border: 1px solid var(--line); }
+.actions-inputs-panel .snippet-toolbar button { font-size: .68rem; }
+.component-workflow-link { width: 100%; margin-top: 16px; text-align: center; }
+.component-run-help { margin: 12px 0 0; color: var(--muted); font-size: .75rem; }
+
+@media (max-width: 850px) {
+  .component-builder-grid { grid-template-columns: 1fr; }
+  .component-summary { position: static; }
+}
+
+@media (max-width: 600px) {
+  .component-controls,
+  .component-summary { padding: 18px; }
+  .component-option { padding: 11px; }
+}

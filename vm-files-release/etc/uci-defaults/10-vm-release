@@ -1,39 +1,106 @@
 #!/bin/sh
 set -eu
 
-uci -q batch <<'UCI'
+LAN_DEVICE='eth0'
+WAN_DEVICE='eth1'
+LAN_ADDRESS='192.168.8.1'
+RELEASE_METADATA='/etc/nexawrt-vm-release'
+
+# A production VM always keeps NIC 1 as a predictable, isolated management LAN.
+# NIC 2 is an optional DHCP WAN. With one NIC the image deliberately remains in
+# management-only mode instead of attaching its administration plane to an
+# unknown upstream network.
+uci -q batch <<UCI
 set system.@system[0].hostname='nexawrt-vm'
+set system.@system[0].zonename='UTC'
+set system.@system[0].timezone='UTC0'
+set system.ntp.enabled='1'
 delete network.lan
 set network.lan='interface'
-set network.lan.device='eth0'
-set network.lan.proto='dhcp'
-set uhttpd.main.redirect_https='0'
+set network.lan.device='$LAN_DEVICE'
+set network.lan.proto='static'
+set network.lan.ipaddr='$LAN_ADDRESS'
+set network.lan.netmask='255.255.255.0'
+delete network.wan
+delete network.wan6
+set dhcp.lan.interface='lan'
+set dhcp.lan.start='100'
+set dhcp.lan.limit='150'
+set dhcp.lan.leasetime='12h'
+set dhcp.lan.ignore='0'
+set uhttpd.main.redirect_https='1'
 set dropbear.@dropbear[0].PasswordAuth='off'
 set dropbear.@dropbear[0].RootPasswordAuth='off'
 commit system
 commit network
+commit dhcp
 commit uhttpd
 commit dropbear
 UCI
 
+if [ -e "/sys/class/net/$WAN_DEVICE" ]; then
+  uci -q batch <<UCI
+set network.wan='interface'
+set network.wan.device='$WAN_DEVICE'
+set network.wan.proto='dhcp'
+set network.wan6='interface'
+set network.wan6.device='$WAN_DEVICE'
+set network.wan6.proto='dhcpv6'
+commit network
+UCI
+  VM_NETWORK_MODE='router'
+else
+  VM_NETWORK_MODE='management-only'
+fi
+
+# Bind firewall zones to logical interfaces explicitly. OpenWrt's generated
+# defaults normally already do this; repeating it here prevents an image-layout
+# change from accidentally exposing LuCI on WAN or rejecting the management LAN.
+for zone in $(uci -q show firewall | sed -n "s/^\(firewall\.[^.]*\)\.name='lan'$/\1/p"); do
+  uci -q delete "$zone.network"
+  uci -q add_list "$zone.network=lan"
+done
+for zone in $(uci -q show firewall | sed -n "s/^\(firewall\.[^.]*\)\.name='wan'$/\1/p"); do
+  uci -q delete "$zone.network"
+  if [ "$VM_NETWORK_MODE" = router ]; then
+    uci -q add_list "$zone.network=wan"
+    uci -q add_list "$zone.network=wan6"
+  fi
+done
+uci -q commit firewall
+
+# Never ship a universal public-image password. Generate one per writable first
+# boot and print it only to the hypervisor console. Users should replace it after
+# signing in. ISO live boots receive a new password every boot by design.
+INITIAL_PASSWORD="$(hexdump -n 12 -e '12/1 "%02x"' /dev/urandom)"
+[ "${#INITIAL_PASSWORD}" -eq 24 ] || exit 1
+printf '%s\n%s\n' "$INITIAL_PASSWORD" "$INITIAL_PASSWORD" | passwd root >/dev/null 2>&1 || exit 1
+INSTALL_ID_FILE='/etc/nexawrt-install-id'
+if [ ! -s "$INSTALL_ID_FILE" ]; then
+  hexdump -n 16 -e '16/1 "%02x"' /dev/urandom >"$INSTALL_ID_FILE"
+  printf '\n' >>"$INSTALL_ID_FILE"
+  chmod 0600 "$INSTALL_ID_FILE"
+fi
+INSTALL_ID="$(cat "$INSTALL_ID_FILE")"
+[ "${#INSTALL_ID}" -eq 32 ] || exit 1
+
 # Stop first so a later disable failure cannot leave a remotely reachable daemon.
-# Both commands are intentionally fail-closed: a failure prevents this uci-default
-# from being removed and prevents creation of successful runtime evidence.
 /etc/init.d/dropbear stop >/dev/null 2>&1
 /etc/init.d/dropbear disable >/dev/null 2>&1
+/etc/init.d/firewall enable >/dev/null 2>&1
+/etc/init.d/uhttpd enable >/dev/null 2>&1
+/etc/init.d/sysntpd enable >/dev/null 2>&1
+/etc/init.d/nexawrt-runtime-gate enable >/dev/null 2>&1
 
 EVIDENCE_DIR='/tmp/nexawrt-vm-release'
-EVIDENCE_TMP="$EVIDENCE_DIR/ssh-runtime.evidence.tmp"
-EVIDENCE_FILE="$EVIDENCE_DIR/ssh-runtime.evidence"
+EVIDENCE_TMP="$EVIDENCE_DIR/runtime.evidence.tmp"
+EVIDENCE_FILE="$EVIDENCE_DIR/runtime.evidence"
 AUTHORIZED_KEYS='/etc/dropbear/authorized_keys'
-RELEASE_METADATA='/etc/nexawrt-vm-release'
 
 umask 077
 mkdir -p "$EVIDENCE_DIR"
 rm -f "$EVIDENCE_TMP" "$EVIDENCE_FILE"
 
-# These are runtime checks, not labels. Do not emit a PASS evidence block unless
-# every assertion is true in the exact booted release image.
 if /etc/init.d/dropbear enabled >/dev/null 2>&1; then
   printf '%s\n' 'NEXAWRT_VM_SSH_RUNTIME_CHECK_FAILED=dropbear_enabled' >/dev/console
   exit 1
@@ -51,18 +118,40 @@ if [ ! -f "$RELEASE_METADATA" ] || [ -L "$RELEASE_METADATA" ]; then
   exit 1
 fi
 
-# Emit machine-readable VM-only identity without requiring an interactive console login.
 cat "$RELEASE_METADATA" >/dev/console
-
-cat >"$EVIDENCE_TMP" <<'EVIDENCE'
-NEXAWRT_VM_SSH_RUNTIME_EVIDENCE_V1_BEGIN
+cat >"$EVIDENCE_TMP" <<EOF_EVIDENCE
+NEXAWRT_VM_RUNTIME_EVIDENCE_V2_BEGIN
+installation_id=$INSTALL_ID
+network_mode=$VM_NETWORK_MODE
+lan_device=$LAN_DEVICE
+lan_address=$LAN_ADDRESS
+wan_device=$([ "$VM_NETWORK_MODE" = router ] && printf '%s' "$WAN_DEVICE" || printf '%s' 'absent')
+https_redirect=ENABLED
+firewall=ENABLED
 ssh=DISABLED_BY_DEFAULT
 authorized_keys=ABSENT
 dropbear_enabled=NO
 dropbear_running=NO
-NEXAWRT_VM_SSH_RUNTIME_EVIDENCE_V1_END
-EVIDENCE
+NEXAWRT_VM_RUNTIME_EVIDENCE_V2_END
+EOF_EVIDENCE
 mv "$EVIDENCE_TMP" "$EVIDENCE_FILE"
 cat "$EVIDENCE_FILE" >/dev/console
+
+# uci-defaults runs before late init services. Start the production gate in the
+# background so the first boot is checked after firewall and HTTPS are ready; the
+# enabled rc.d entry repeats the same check on every later boot.
+( /etc/init.d/nexawrt-runtime-gate start ) >/dev/null 2>&1 &
+
+cat >/dev/console <<EOF_CONSOLE
+
+NexaWrt first boot is ready.
+Mode: $VM_NETWORK_MODE
+LAN: https://$LAN_ADDRESS/
+Username: root
+Temporary password: $INITIAL_PASSWORD
+Change this password immediately in LuCI. NIC 1 is LAN; NIC 2 is WAN DHCP.
+HTTP is redirected to HTTPS. SSH is disabled by default.
+
+EOF_CONSOLE
 
 exit 0

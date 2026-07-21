@@ -18,6 +18,7 @@ Usage:
   build-vm-image.sh <x86-64|armsr-armv8>
   build-vm-image.sh x86-64 release <vm-x86_64-vX.Y.Z-rc.N>
   build-vm-image.sh x86-64 <vm-x86_64-vX.Y.Z-rc.N>
+  build-vm-image.sh x86-64 custom
 
 Build VM-only OpenWrt artifacts from a SHA256-pinned ImageBuilder.
 
@@ -27,6 +28,9 @@ The one-argument form is the existing smoke mode. It remains compatible with
 Release mode is x86-64 only. The v2 contract builds exactly five publishable
 ext4 variants: raw BIOS, BIOS/EFI Live ISO, and BIOS/EFI VMDK. It never injects
 CI SSH authorized_keys and never claims ESXi validation.
+
+Custom mode is x86-64 only and accepts component IDs only through the validated
+NEXAWRT_COMPONENTS environment set by scripts/custom-build.sh.
 USAGE
 }
 
@@ -126,6 +130,8 @@ case "$#" in
     if [[ "$2" == release ]]; then
       MODE="release"
       RELEASE_TAG="${VM_RELEASE_TAG:-}"
+    elif [[ "$2" == custom ]]; then
+      MODE="custom"
     elif [[ "$2" =~ $RELEASE_TAG_PATTERN ]]; then
       MODE="release"
       RELEASE_TAG="$2"
@@ -160,7 +166,7 @@ case "$TARGET" in
     UPSTREAM_IMAGE="openwrt-${VM_OPENWRT_VERSION}-x86-64-generic-ext4-combined.img.gz"
     ;;
   armsr-armv8)
-    [[ "$MODE" == smoke ]] || fail "release mode supports x86-64 only, not $TARGET"
+    [[ "$MODE" == smoke ]] || fail "$MODE mode supports x86-64 only, not $TARGET"
     TARGET_PATH="armsr/armv8"
     PROFILE="generic"
     IMAGEBUILDER_URL="$VM_ARMSR_ARMV8_IMAGEBUILDER_URL"
@@ -172,6 +178,85 @@ case "$TARGET" in
     fail "unsupported target: $TARGET"
     ;;
 esac
+
+CUSTOM_REQUEST_HASH=""
+CUSTOM_CATALOG_VERSION=""
+CUSTOM_FLAVOR=""
+CUSTOM_COMPONENTS=""
+CUSTOM_RESOLVED_COMPONENTS=""
+CUSTOM_PACKAGES=()
+if [[ "$MODE" == custom ]]; then
+  [[ "$TARGET" == x86-64 ]] || fail "custom mode supports x86-64 only"
+  CUSTOM_COMPONENTS="${NEXAWRT_COMPONENTS:-}"
+  CUSTOM_FLAVOR="${NEXAWRT_COMPONENT_FLAVOR:-}"
+  CUSTOM_CATALOG_VERSION="${NEXAWRT_COMPONENT_CATALOG_VERSION:-}"
+  CUSTOM_REQUEST_HASH="${NEXAWRT_COMPONENT_REQUEST_HASH:-}"
+  [[ ${#CUSTOM_COMPONENTS} -le 1024 ]] ||
+    fail "custom mode component input exceeds the bounded length"
+  if [[ -n "$CUSTOM_COMPONENTS" ]]; then
+    [[ "$CUSTOM_COMPONENTS" =~ ^[a-z0-9][a-z0-9_-]{0,63}(,[a-z0-9][a-z0-9_-]{0,63})*$ ]] ||
+      fail "non-empty custom components must be comma-separated catalog component IDs"
+  fi
+  [[ "$CUSTOM_FLAVOR" == official ]] ||
+    fail "custom x86 mode requires NEXAWRT_COMPONENT_FLAVOR=official"
+  [[ "$CUSTOM_CATALOG_VERSION" =~ ^[0-9]{4}\.[0-9]{2}\.[0-9]{2}(\.[0-9]+)?$ ]] ||
+    fail "custom mode requires a valid NEXAWRT_COMPONENT_CATALOG_VERSION"
+  [[ "$CUSTOM_REQUEST_HASH" =~ ^[0-9a-f]{64}$ ]] ||
+    fail "custom mode requires a full lowercase NEXAWRT_COMPONENT_REQUEST_HASH"
+  custom_resolver_args=(--target x86_64 --flavor "$CUSTOM_FLAVOR")
+  if [[ -n "$CUSTOM_COMPONENTS" ]]; then
+    IFS=',' read -r -a custom_component_ids <<< "$CUSTOM_COMPONENTS"
+    for component_id in "${custom_component_ids[@]}"; do
+      custom_resolver_args+=(--component "$component_id")
+    done
+  fi
+  custom_resolution="$(python3 "$ROOT_DIR/scripts/resolve-components.py" "${custom_resolver_args[@]}")" ||
+    fail "custom component selection was rejected"
+  custom_fields_output="$(python3 -c '
+import json, re, sys
+request = json.load(sys.stdin)
+if request.get("target", {}).get("id") != "x86_64":
+    raise SystemExit("unexpected resolver target")
+request_hash = request.get("request_hash", "")
+catalog_version = request.get("catalog_version", "")
+flavor = request.get("flavor", "")
+packages = request.get("packages")
+components = request.get("resolved_components")
+if not re.fullmatch(r"[0-9a-f]{64}", request_hash):
+    raise SystemExit("invalid resolver request hash")
+if not re.fullmatch(r"[0-9]{4}\.[0-9]{2}\.[0-9]{2}(?:\.[0-9]+)?", catalog_version):
+    raise SystemExit("invalid resolver catalog version")
+if flavor != "official":
+    raise SystemExit("invalid resolver flavor")
+if not isinstance(components, list) or not components:
+    raise SystemExit("resolver returned no components")
+if any(not isinstance(component, str) or not re.fullmatch(r"[a-z0-9][a-z0-9_-]{0,63}", component) for component in components):
+    raise SystemExit("invalid resolver component")
+if not isinstance(packages, list) or not packages:
+    raise SystemExit("resolver returned no packages")
+print(request_hash)
+print(catalog_version)
+print(flavor)
+print(",".join(components))
+for package in packages:
+    if not isinstance(package, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9+_.-]{0,127}", package):
+        raise SystemExit("invalid resolver package")
+    print(package)
+' <<< "$custom_resolution")" || fail "custom resolver output failed validation"
+  custom_resolution_fields=()
+  while IFS= read -r custom_field; do
+    custom_resolution_fields+=("$custom_field")
+  done <<< "$custom_fields_output"
+  ((${#custom_resolution_fields[@]} >= 5)) || fail "custom resolver output is incomplete"
+  [[ "${custom_resolution_fields[0]}" == "$CUSTOM_REQUEST_HASH" ]] ||
+    fail "custom request hash does not match the resolved catalog request"
+  [[ "${custom_resolution_fields[1]}" == "$CUSTOM_CATALOG_VERSION" ]] ||
+    fail "custom catalog version does not match the resolved catalog request"
+  [[ "${custom_resolution_fields[2]}" == "$CUSTOM_FLAVOR" ]] ||
+    fail "custom flavor does not match the resolved catalog request"
+  CUSTOM_RESOLVED_COMPONENTS="${custom_resolution_fields[3]}"
+  CUSTOM_PACKAGES=("${custom_resolution_fields[@]:4}")
+fi
 
 case "$MODE" in
   smoke)
@@ -189,6 +274,9 @@ case "$MODE" in
     ARTIFACT_CLASS="VM_DISTRIBUTION_SET"
     VALIDATION_SCOPE_VALUE="QEMU_RUNTIME_ALL_VARIANTS"
     RELEASE_VERSION="${RELEASE_TAG#vm-x86_64-}"
+    RELEASE_CHANNEL="rc"
+    PROJECT_COMMIT="${NEXAWRT_PROJECT_COMMIT:-$(git -C "$ROOT_DIR" rev-parse --verify 'HEAD^{commit}')}"
+    [[ "$PROJECT_COMMIT" =~ ^[0-9a-f]{40}$ ]] || fail "project commit must be a full lowercase Git object ID"
     ARTIFACT_BASENAME="NexaWrt-x86_64-${RELEASE_VERSION}-generic-ext4-combined.img.gz"
     RAW_BIOS_BASENAME="$ARTIFACT_BASENAME"
     ISO_BIOS_BASENAME="NexaWrt-x86_64-${RELEASE_VERSION}-generic-image.iso"
@@ -197,13 +285,23 @@ case "$MODE" in
     VMDK_EFI_BASENAME="NexaWrt-x86_64-${RELEASE_VERSION}-generic-ext4-combined-efi.vmdk"
     RELEASE_MANIFEST_BASENAME="NexaWrt-x86_64-${RELEASE_VERSION}-generic.manifest"
     ;;
+  custom)
+    [[ "$TARGET" == x86-64 ]] || fail "custom mode supports x86-64 only"
+    OVERLAY_DIR="$RELEASE_OVERLAY_DIR"
+    ARTIFACT_CLASS="VM_CUSTOM_COMPONENT_IMAGE"
+    VALIDATION_SCOPE_VALUE="UNVALIDATED_CUSTOM_BUILD"
+    RELEASE_VERSION=""
+    PROJECT_COMMIT="${NEXAWRT_PROJECT_COMMIT:-$(git -C "$ROOT_DIR" rev-parse --verify 'HEAD^{commit}')}"
+    [[ "$PROJECT_COMMIT" =~ ^[0-9a-f]{40}$ ]] || fail "project commit must be a full lowercase Git object ID"
+    ARTIFACT_BASENAME="NexaWrt-custom-x86_64-${CUSTOM_REQUEST_HASH:0:12}-generic-ext4-combined.img.gz"
+    ;;
   *)
     fail "internal error: unsupported mode $MODE"
     ;;
 esac
 
 [[ -d "$OVERLAY_DIR" ]] || fail "missing VM overlay: $OVERLAY_DIR"
-for command_name in curl sha256sum tar make find install cp tee wc grep sort sed gzip python3; do
+for command_name in curl sha256sum tar make find install cp tee wc grep sort sed gzip python3 git; do
   command -v "$command_name" >/dev/null 2>&1 || fail "required command is missing: $command_name"
 done
 if [[ "$MODE" == release ]]; then
@@ -220,8 +318,10 @@ if [[ "$MODE" == smoke ]]; then
   [[ "$(wc -l < "$AUTHORIZED_KEY_FILE" | tr -d ' ')" == 1 ]] || fail "authorized key must contain exactly one line"
   grep -Eq '^(ssh-(ed25519|rsa)|ecdsa-sha2-nistp(256|384|521))[[:space:]]+[A-Za-z0-9+/=]+' "$AUTHORIZED_KEY_FILE" ||
     fail "authorized key is not a supported OpenSSH public key"
-elif [[ -n "$AUTHORIZED_KEY_FILE" ]]; then
+elif [[ "$MODE" == release && -n "$AUTHORIZED_KEY_FILE" ]]; then
   fail "VM_SMOKE_AUTHORIZED_KEY_FILE must not be set in release mode"
+elif [[ "$MODE" == custom && -n "$AUTHORIZED_KEY_FILE" ]]; then
+  fail "VM_SMOKE_AUTHORIZED_KEY_FILE must not be set in custom mode"
 fi
 
 case "$(printf '%s' "$ARTIFACT_BASENAME" | tr '[:upper:]' '[:lower:]')" in
@@ -263,13 +363,17 @@ cp -a "$OVERLAY_DIR/." "$OVERLAY_WORK/"
 if [[ "$MODE" == smoke ]]; then
   mkdir -p "$OVERLAY_WORK/etc/dropbear"
   install -m 0600 "$AUTHORIZED_KEY_FILE" "$OVERLAY_WORK/etc/dropbear/authorized_keys"
-else
+elif [[ "$MODE" == release ]]; then
   if find "$OVERLAY_WORK" -type f -path '*/authorized_keys' -print -quit | grep -q .; then
     fail "release overlay must not contain SSH authorized_keys"
   fi
   cat > "$OVERLAY_WORK/etc/nexawrt-vm-release" <<EOF_METADATA
 NEXAWRT_VM_RELEASE_METADATA_V2_BEGIN
 RELEASE_CONTRACT=$RELEASE_CONTRACT
+RELEASE_TAG=$RELEASE_TAG
+RELEASE_VERSION=$RELEASE_VERSION
+RELEASE_CHANNEL=$RELEASE_CHANNEL
+PROJECT_COMMIT=$PROJECT_COMMIT
 ARTIFACT_CLASS=$ARTIFACT_CLASS
 PUBLISHED_VARIANTS=$PUBLISHED_VARIANTS
 ESXI_VALIDATION=not-tested
@@ -285,6 +389,10 @@ EOF_METADATA
   cat > "$OVERLAY_WORK/etc/banner" <<EOF_BANNER
 NexaWrt x86_64 VM distribution set ${RELEASE_VERSION}
 RELEASE_CONTRACT=$RELEASE_CONTRACT
+RELEASE_TAG=$RELEASE_TAG
+RELEASE_VERSION=$RELEASE_VERSION
+RELEASE_CHANNEL=$RELEASE_CHANNEL
+PROJECT_COMMIT=$PROJECT_COMMIT
 ARTIFACT_CLASS=$ARTIFACT_CLASS
 PUBLISHED_VARIANTS=$PUBLISHED_VARIANTS
 ESXI_VALIDATION=not-tested
@@ -298,13 +406,58 @@ SSH_AUTHORIZED_KEYS=absent
 
 VM-only images. NOT Xiaomi AX9000 firmware. Do not use router flash tools.
 QEMU runtime validation is not VMware ESXi validation.
-Remote SSH is disabled by default; use the serial console to set a password first.
+NIC 1 is the static management LAN at 192.168.8.1; NIC 2 is optional DHCP WAN.
+HTTPS is mandatory. A unique temporary password is printed on first boot console.
+Remote SSH is disabled by default.
+EOF_BANNER
+else
+  if find "$OVERLAY_WORK" -type f -path '*/authorized_keys' -print -quit | grep -q .; then
+    fail "custom overlay must not contain SSH authorized_keys"
+  fi
+  cat > "$OVERLAY_WORK/etc/nexawrt-vm-release" <<EOF_METADATA
+NEXAWRT_VM_CUSTOM_METADATA_V1_BEGIN
+PROJECT_COMMIT=$PROJECT_COMMIT
+REQUEST_HASH=$CUSTOM_REQUEST_HASH
+CATALOG_VERSION=$CUSTOM_CATALOG_VERSION
+FLAVOR=$CUSTOM_FLAVOR
+RESOLVED_COMPONENTS=$CUSTOM_RESOLVED_COMPONENTS
+ARTIFACT_CLASS=$ARTIFACT_CLASS
+VM_ONLY=1
+NOT_AX9000_FIRMWARE=1
+HARDWARE_VALIDATION=0
+NSS_VALIDATION=0
+VALIDATION_SCOPE=$VALIDATION_SCOPE_VALUE
+SSH_DEFAULT=disabled
+SSH_AUTHORIZED_KEYS=absent
+NEXAWRT_VM_CUSTOM_METADATA_V1_END
+EOF_METADATA
+  cat > "$OVERLAY_WORK/etc/banner" <<EOF_BANNER
+NexaWrt x86_64 custom component image
+PROJECT_COMMIT=$PROJECT_COMMIT
+REQUEST_HASH=$CUSTOM_REQUEST_HASH
+CATALOG_VERSION=$CUSTOM_CATALOG_VERSION
+FLAVOR=$CUSTOM_FLAVOR
+RESOLVED_COMPONENTS=$CUSTOM_RESOLVED_COMPONENTS
+ARTIFACT_CLASS=$ARTIFACT_CLASS
+VM_ONLY=1
+NOT_AX9000_FIRMWARE=1
+HARDWARE_VALIDATION=0
+NSS_VALIDATION=0
+VALIDATION_SCOPE=$VALIDATION_SCOPE_VALUE
+SSH_DEFAULT=disabled
+SSH_AUTHORIZED_KEYS=absent
+
+VM-only custom image. NOT Xiaomi AX9000 firmware. Do not use router flash tools.
+This build contains the repository VM runtime baseline plus catalog-resolved packages.
+Remote SSH is disabled by default.
 EOF_BANNER
 fi
 
-# Keep this package set identical for both VM architectures. It intentionally
-# contains LuCI, Dropbear SSH, and the utility baseline shared by release flavors.
-VM_PACKAGES=(
+# Preserve the release runtime baseline for custom images because the production
+# overlay configures LuCI, uhttpd, firewall, DHCP, and Dropbear on first boot.
+# Dropbear is installed so its init/UCI entries exist, but the overlay stops and
+# disables it before completing first boot.
+VM_BASELINE_PACKAGES=(
   luci
   luci-ssl
   dropbear
@@ -316,7 +469,22 @@ VM_PACKAGES=(
   nano
   tcpdump-mini
 )
-printf -v PACKAGE_LIST ' %q' "${VM_PACKAGES[@]}"
+VM_PACKAGES=("${VM_BASELINE_PACKAGES[@]}")
+if [[ "$MODE" == custom ]]; then
+  for custom_package in "${CUSTOM_PACKAGES[@]}"; do
+    package_present=0
+    for existing_package in "${VM_PACKAGES[@]}"; do
+      if [[ "$existing_package" == "$custom_package" ]]; then
+        package_present=1
+        break
+      fi
+    done
+    ((package_present == 1)) || VM_PACKAGES+=("$custom_package")
+  done
+  printf -v PACKAGE_LIST ' %s' "${VM_PACKAGES[@]}"
+else
+  printf -v PACKAGE_LIST ' %q' "${VM_PACKAGES[@]}"
+fi
 PACKAGE_LIST="${PACKAGE_LIST# }"
 
 rm -rf "$BUILDER_DIR/bin/targets/$TARGET_PATH"
@@ -422,6 +590,24 @@ else
   fi
 fi
 
+if [[ "$MODE" == custom ]]; then
+  CUSTOM_PACKAGES_PATH="$OUTPUT_DIR/custom-imagebuilder-packages.json"
+  python3 - "$CUSTOM_PACKAGES_PATH" "${VM_PACKAGES[@]}" <<'PY_PACKAGES'
+import json
+import os
+import pathlib
+import sys
+
+path = pathlib.Path(sys.argv[1])
+packages = sys.argv[2:]
+if not packages or len(packages) != len(set(packages)):
+    raise SystemExit("custom ImageBuilder package set must be non-empty and unique")
+temporary = path.with_suffix(".json.tmp")
+temporary.write_text(json.dumps(packages, indent=2, sort_keys=False) + "\n", encoding="utf-8")
+os.replace(temporary, path)
+PY_PACKAGES
+fi
+
 LABELS_PATH="$OUTPUT_DIR/artifact-labels.env"
 cat > "$LABELS_PATH" <<EOF_LABELS
 ARTIFACT_CLASS="$ARTIFACT_CLASS"
@@ -441,8 +627,18 @@ if [[ "$MODE" == release ]]; then
     printf 'RELEASE_CONTRACT="%s"\n' "$RELEASE_CONTRACT"
     printf 'RELEASE_TAG="%s"\n' "$RELEASE_TAG"
     printf 'RELEASE_VERSION="%s"\n' "$RELEASE_VERSION"
+    printf 'RELEASE_CHANNEL="%s"\n' "$RELEASE_CHANNEL"
+    printf 'PROJECT_COMMIT="%s"\n' "$PROJECT_COMMIT"
     printf 'PUBLISHED_VARIANTS="%s"\n' "$PUBLISHED_VARIANTS"
     printf 'ESXI_VALIDATION="not-tested"\n'
+    printf 'SSH_DEFAULT="disabled"\n'
+    printf 'SSH_AUTHORIZED_KEYS="absent"\n'
+  } >> "$LABELS_PATH"
+elif [[ "$MODE" == custom ]]; then
+  {
+    printf 'PROJECT_COMMIT="%s"\n' "$PROJECT_COMMIT"
+    printf 'REQUEST_HASH="%s"\n' "$CUSTOM_REQUEST_HASH"
+    printf 'RESOLVED_COMPONENTS="%s"\n' "$CUSTOM_RESOLVED_COMPONENTS"
     printf 'SSH_DEFAULT="disabled"\n'
     printf 'SSH_AUTHORIZED_KEYS="absent"\n'
   } >> "$LABELS_PATH"
@@ -459,6 +655,8 @@ WARNING / 警告
 - QEMU SeaBIOS/OVMF runtime PASS is not VMware ESXi validation.
 - ESXI_VALIDATION=not-tested. Do not describe these VMDKs as ESXi-tested.
 - SSH is disabled by default and no authorized_keys are embedded.
+- NIC 1 is LAN (192.168.8.1/24, DHCP server); NIC 2 is WAN (DHCP).
+- HTTP redirects to HTTPS. The first-boot console prints a unique temporary root password.
 
 Published variants
 - ${RAW_BIOS_BASENAME}: raw BIOS disk for QEMU/PVE and conversion workflows.
@@ -469,7 +667,8 @@ Published variants
 
 After upload, import/convert each streamOptimized VMDK into an ESXi datastore-backed writable disk; do not run it as a directly writable base.
 Verify every downloaded image with its adjacent .sha256 file or SHA256SUMS.
-Use the serial console to set a root password before explicitly enabling Dropbear.
+Change the console-printed temporary root password immediately after first login.
+Do not connect NIC 1 to an existing DHCP-enabled LAN; use an isolated LAN port group.
 Dangerous router-write commands are intentionally guarded inside these VM images.
 EOF_README
 fi

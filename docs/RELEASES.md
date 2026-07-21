@@ -175,4 +175,8 @@ The Pages verifier accepts a VM release only when all of the following hold:
 
 If any VM condition fails, the site hides that VM candidate. This VM fail-closed path is isolated from a separately valid AX9000 catalog, and the reverse is also true. A VM PASS is evidence only for the exact x86_64 virtual-machine image and release pipeline; it is not permission to flash AX9000 and is not an AX9000 production-readiness claim.
 
+A promoted VM stable release uses tag `vm-x86_64-vX.Y.Z`, is non-draft, non-prerelease, and immutable. Pages accepts it only when the promotion notes bind exactly one source RC tag, the stable and RC tags resolve to the same trusted `main`-ancestor commit, the source RC has independently passed the normal VM release verifier, all 21 stable assets retain the RC filenames and match the source proof byte-for-byte while using distinct GitHub asset IDs, and the committed ESXi evidence binds that RC commit/version/contract plus the exact asset set with an all-PASS check set. The proof manifest records the source RC Release ID/tag and evidence path/commit. Any missing source proof, changed body binding, changed asset, replayed ID, untrusted evidence commit, or non-PASS evidence excludes the stable release.
+
+The Pages workflow refreshes after both the VM RC workflow and `Promote ESXi-accepted VM RC`, so a successfully verified stable release can appear without another source push. Stable filenames intentionally keep the RC suffix because promotion copies the accepted bytes and never rebuilds them.
+
 Do not move a VM release tag, replace assets, or manually repair a published immutable release. Merge the correction and use the next RC tag. See [`docs/VM-X86_64.md`](VM-X86_64.md) for download and QEMU instructions.

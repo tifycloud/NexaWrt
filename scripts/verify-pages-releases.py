@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import gzip
 import hashlib
+import importlib.util
 import json
 import os
 import re
@@ -40,6 +41,7 @@ MAX_SBOM_BYTES = 32 * 1024 * 1024
 CHANNEL = "ram-test"
 SIGNER_WORKFLOW = f"{REPOSITORY}/.github/workflows/release.yml"
 VM_SIGNER_WORKFLOW = f"{REPOSITORY}/.github/workflows/vm-release.yml"
+VM_PROMOTION_WORKFLOW = f"{REPOSITORY}/.github/workflows/vm-promote.yml"
 VM_TAG_PREFIX = "vm-x86_64-"
 VM_PLATFORM = "x86_64"
 MAX_VM_IMAGE_BYTES = 1024 * 1024 * 1024
@@ -101,6 +103,8 @@ VM_PUBLISHED_VARIANTS = ",".join(VM_VARIANTS)
 VM_RESULT_ROOT = PurePosixPath("/home/runner/work/NexaWrt/NexaWrt/vm-release-results/x86-64")
 TRUSTED_REF = "refs/heads/main"
 VERSION_RE = re.compile(r"^v(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)-rc\.(?:0|[1-9][0-9]*)$")
+VM_STABLE_VERSION_RE = re.compile(r"^v(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)$")
+VM_EVIDENCE_PATH_RE = re.compile(r"^evidence/vm-esxi/[A-Za-z0-9][A-Za-z0-9._/-]{0,180}\.json$")
 HEX_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 HEX_SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 FIRMWARE = "openwrt-qualcommax-ipq807x-xiaomi_ax9000_single_ubi-initramfs-uImage.itb"
@@ -225,10 +229,51 @@ def expected_names(metadata: dict[str, Any], flavor: str, version: str) -> dict[
 
 
 def vm_identity(tag: Any) -> str | None:
-    if not isinstance(tag, str) or not tag.startswith(VM_TAG_PREFIX):
+    if not isinstance(tag, str) or len(tag) > 100 or not tag.startswith(VM_TAG_PREFIX):
         return None
     version = tag[len(VM_TAG_PREFIX):]
-    return version if VERSION_RE.fullmatch(version) else None
+    return version if VERSION_RE.fullmatch(version) or VM_STABLE_VERSION_RE.fullmatch(version) else None
+
+
+def vm_is_stable(version: str) -> bool:
+    return VM_STABLE_VERSION_RE.fullmatch(version) is not None
+
+
+def parse_vm_stable_promotion(raw: dict[str, Any], stable_version: str) -> dict[str, str] | None:
+    tag = raw.get("tag_name")
+    body = raw.get("body")
+    name = raw.get("name")
+    if name != f"NexaWrt x86_64 VM {stable_version}" or not isinstance(body, str) or len(body) > 20000:
+        return None
+    patterns = {
+        "source_rc_tag": r"^- Source RC tag: `(?P<value>vm-x86_64-v(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)-rc\.(?:0|[1-9][0-9]*))`$",
+        "source_digest": r"^- Source commit: `(?P<value>[0-9a-f]{40})` \(both tags point to this exact commit\)$",
+        "evidence": r"^- Evidence path: `(?P<path>evidence/vm-esxi/[A-Za-z0-9][A-Za-z0-9._/-]{0,180}\.json)` at repository commit `(?P<commit>[0-9a-f]{40})`$",
+    }
+    matches: dict[str, re.Match[str]] = {}
+    for key, pattern in patterns.items():
+        found = list(re.finditer(pattern, body, re.MULTILINE))
+        if len(found) != 1:
+            return None
+        matches[key] = found[0]
+    source_tag = matches["source_rc_tag"].group("value")
+    source_version = source_tag[len(VM_TAG_PREFIX):]
+    if not VERSION_RE.fullmatch(source_version) or source_version.split("-rc.", 1)[0] != stable_version:
+        return None
+    source_digest = matches["source_digest"].group("value")
+    evidence_path = matches["evidence"].group("path")
+    evidence_commit = matches["evidence"].group("commit")
+    if not VM_EVIDENCE_PATH_RE.fullmatch(evidence_path):
+        return None
+    if raw.get("target_commitish") != source_digest or tag != f"{VM_TAG_PREFIX}{stable_version}":
+        return None
+    return {
+        "source_rc_tag": source_tag,
+        "source_rc_version": source_version,
+        "source_digest": source_digest,
+        "evidence_path": evidence_path,
+        "evidence_commit": evidence_commit,
+    }
 
 
 def vm_expected_names(version: str, contract_version: int = VM_CONTRACT_V1) -> dict[str, str]:
@@ -275,20 +320,28 @@ def vm_asset_limit(key: str, contract_version: int) -> int:
     return MAX_VM_TEXT_BYTES
 
 
-def vm_candidate_assets(raw: Any) -> tuple[int, str, str, str, int, dict[str, dict[str, Any]]] | None:
-    if not isinstance(raw, dict) or raw.get("draft") is not False or raw.get("prerelease") is not True or raw.get("immutable") is not True:
+def vm_candidate_assets(raw: Any) -> tuple[int, str, str, str, int, dict[str, dict[str, Any]], dict[str, str] | None] | None:
+    if not isinstance(raw, dict) or raw.get("draft") is not False or raw.get("immutable") is not True:
         return None
     release_id, tag = raw.get("id"), raw.get("tag_name")
     version = vm_identity(tag)
     published_at = normalized_timestamp(raw.get("published_at"))
     if isinstance(release_id, bool) or not isinstance(release_id, int) or release_id <= 0 or version is None or published_at is None:
         return None
+    stable = vm_is_stable(version)
+    if raw.get("prerelease") is not (not stable):
+        return None
+    promotion = parse_vm_stable_promotion(raw, version) if stable else None
+    if stable and promotion is None:
+        return None
+    asset_version = promotion["source_rc_version"] if promotion else version
     assets = raw.get("assets")
     if not isinstance(assets, list):
         return None
+    contracts = (VM_CONTRACT_V2,) if stable else (VM_CONTRACT_V1, VM_CONTRACT_V2)
     matches: list[tuple[int, dict[str, dict[str, Any]]]] = []
-    for contract_version in (VM_CONTRACT_V1, VM_CONTRACT_V2):
-        expected = vm_expected_names(version, contract_version)
+    for contract_version in contracts:
+        expected = vm_expected_names(asset_version, contract_version)
         if len(assets) != len(expected):
             continue
         by_name: dict[str, dict[str, Any]] = {}
@@ -301,10 +354,12 @@ def vm_candidate_assets(raw: Any) -> tuple[int, str, str, str, int, dict[str, di
                 break
             name, asset_id, size = asset.get("name"), asset.get("id"), asset.get("size")
             key = expected_by_name.get(name)
+            digest = asset.get("digest")
             if (key is None or name in by_name or asset.get("state") != "uploaded" or
                     isinstance(asset_id, bool) or not isinstance(asset_id, int) or asset_id <= 0 or asset_id in seen_ids or
                     isinstance(size, bool) or not isinstance(size, int) or size <= 0 or
-                    size > vm_asset_limit(key, contract_version)):
+                    size > vm_asset_limit(key, contract_version) or
+                    (stable and (not isinstance(digest, str) or re.fullmatch(r"sha256:[0-9a-f]{64}", digest) is None))):
                 valid = False
                 break
             seen_ids.add(asset_id)
@@ -314,7 +369,7 @@ def vm_candidate_assets(raw: Any) -> tuple[int, str, str, str, int, dict[str, di
     if len(matches) != 1:
         return None
     contract_version, by_name = matches[0]
-    return release_id, tag, version, published_at, contract_version, by_name
+    return release_id, tag, version, published_at, contract_version, by_name, promotion
 
 def normalized_timestamp(value: Any) -> str | None:
     if not isinstance(value, str) or len(value) > 40:
@@ -329,10 +384,11 @@ def normalized_timestamp(value: Any) -> str | None:
 
 
 def version_order(version: str) -> tuple[int, int, int, int]:
-    match = re.fullmatch(r"v([0-9]+)\.([0-9]+)\.([0-9]+)-rc\.([0-9]+)", version)
+    match = re.fullmatch(r"v([0-9]+)\.([0-9]+)\.([0-9]+)(?:-rc\.([0-9]+))?", version)
     if match is None:
         raise ValueError(f"invalid release version: {version}")
-    return tuple(int(part) for part in match.groups())
+    major, minor, patch, rc = match.groups()
+    return int(major), int(minor), int(patch), (1_000_000_000 if rc is None else int(rc))
 
 
 def candidate_assets(raw: Any, metadata: dict[str, Any]) -> tuple[int, str, str, str, str, dict[str, dict[str, Any]]] | None:
@@ -703,9 +759,11 @@ def verify_vm_attestation(gh: Path, subject: Path, bundle: Path, tag: str, sourc
     raise VerificationError("VM attestation source-ref did not match tag or main: " + "; ".join(errors))
 
 
-def verify_vm_candidate(gh: Path, candidate: tuple[int, str, str, str, int, dict[str, dict[str, Any]]],
+def verify_vm_candidate(gh: Path, candidate: tuple[int, str, str, str, int, dict[str, dict[str, Any]], dict[str, str] | None],
                         trusted_main: str, budget: DownloadBudget) -> tuple[str, dict[str, Any]]:
-    release_id, tag, version, _published_at, contract_version, assets = candidate
+    release_id, tag, version, _published_at, contract_version, assets, promotion = candidate
+    if promotion is not None:
+        raise VerificationError("stable VM release must use promotion verification")
     names = vm_expected_names(version, contract_version)
     source_digest = resolve_tag_commit(gh, tag)
     require_main_ancestor(source_digest, trusted_main)
@@ -838,14 +896,115 @@ def verify_vm_candidate(gh: Path, candidate: tuple[int, str, str, str, int, dict
         }
     return tag, proof
 
-def select_vm_candidates(raw: list[Any]) -> list[tuple[int, str, str, str, int, dict[str, dict[str, Any]]]]:
+
+def verify_vm_stable_evidence(promotion: dict[str, str], trusted_main: str, release_dir: Path,
+                              source_published_at: str) -> None:
+    evidence_commit = promotion["evidence_commit"]
+    require_main_ancestor(evidence_commit, trusted_main)
+    try:
+        payload = git_output("show", f"{evidence_commit}:{promotion['evidence_path']}")
+        evidence = json.loads(payload, object_pairs_hook=lambda pairs: reject_duplicate_json_keys(pairs))
+        schema_path = Path("schemas/vm-esxi-evidence.schema.json")
+        verifier_path = Path("scripts/verify-vm-esxi-evidence.py")
+        if any(path.is_symlink() or not path.is_file() or path.stat().st_nlink != 1 for path in (schema_path, verifier_path)):
+            raise VerificationError("stable VM evidence verifier inputs are not regular files")
+        schema = json.loads(schema_path.read_text(encoding="utf-8"), object_pairs_hook=lambda pairs: reject_duplicate_json_keys(pairs))
+        spec = importlib.util.spec_from_file_location("nexawrt_vm_esxi_evidence", verifier_path)
+        if spec is None or spec.loader is None:
+            raise VerificationError("stable VM evidence verifier could not be loaded")
+        verifier = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(verifier)
+        verifier.validate_schema(evidence, schema, schema)
+        names = verifier.expected_assets(promotion["source_rc_version"])
+        release_files = verifier.require_exact_release_dir(release_dir, names)
+        verifier.semantic_validation(
+            evidence, promotion["source_rc_tag"], promotion["source_digest"],
+            source_published_at, release_files, names, promotion["source_rc_version"],
+        )
+    except VerificationError:
+        raise
+    except Exception as exc:
+        raise VerificationError("stable VM evidence failed strict schema or semantic validation") from exc
+
+
+def reject_duplicate_json_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in result:
+            raise VerificationError(f"duplicate JSON key in stable VM evidence: {key}")
+        result[key] = value
+    return result
+
+def verify_vm_stable_candidate(
+    gh: Path,
+    candidate: tuple[int, str, str, str, int, dict[str, dict[str, Any]], dict[str, str] | None],
+    source_candidate: tuple[int, str, str, str, int, dict[str, dict[str, Any]], dict[str, str] | None],
+    source_proof: dict[str, Any],
+    trusted_main: str,
+    budget: DownloadBudget,
+) -> tuple[str, dict[str, Any]]:
+    release_id, tag, _version, _published_at, contract_version, assets, promotion = candidate
+    if promotion is None or contract_version != VM_CONTRACT_V2:
+        raise VerificationError("stable VM release lacks a valid v2 promotion identity")
+    source_release_id, source_tag, _source_version, source_published_at, source_contract, _source_assets, source_promotion = source_candidate
+    if source_promotion is not None or source_tag != promotion["source_rc_tag"] or source_contract != VM_CONTRACT_V2:
+        raise VerificationError("stable VM source RC candidate is invalid")
+    if source_proof.get("release_id") != source_release_id or source_proof.get("source_digest") != promotion["source_digest"]:
+        raise VerificationError("stable VM source proof does not match the declared RC")
+    source_digest = resolve_tag_commit(gh, source_tag)
+    stable_digest = resolve_tag_commit(gh, tag)
+    if source_digest != stable_digest or stable_digest != promotion["source_digest"]:
+        raise VerificationError("stable and RC tags do not resolve to the exact same commit")
+    require_main_ancestor(stable_digest, trusted_main)
+    names = vm_expected_names(promotion["source_rc_version"], VM_CONTRACT_V2)
+    with tempfile.TemporaryDirectory(prefix="nexawrt-pages-vm-stable-proof-") as temporary:
+        work = Path(temporary)
+        downloaded: dict[str, Path] = {}
+        proof_assets: dict[str, dict[str, Any]] = {}
+        for key, name in names.items():
+            destination = work / name
+            download_asset(gh, assets[name], destination, budget)
+            downloaded[key] = destination
+            source_identity = source_proof["assets"][key]
+            digest = sha256(destination)
+            if (assets[name]["id"] == source_identity["id"] or assets[name]["size"] != source_identity["size"] or
+                    digest != source_identity["sha256"] or assets[name].get("digest") != f"sha256:{digest}"):
+                raise VerificationError("stable VM assets are not an exact byte-for-byte RC promotion")
+            proof_assets[key] = {"id": assets[name]["id"], "name": name, "size": assets[name]["size"], "sha256": digest}
+        for variant in VM_VARIANTS:
+            verify_external_checksum(downloaded[f"{variant}_checksum"], downloaded[variant])
+        checksum_subject_keys = [key for variant in VM_VARIANTS for key in (variant, f"{variant}_checksum")] + [
+            "manifest", "artifact_labels", "readme", "smoke_report",
+        ]
+        verify_sha256sums(downloaded["checksums"], {key: downloaded[key] for key in checksum_subject_keys})
+        verify_vm_stable_evidence(promotion, trusted_main, work, source_published_at)
+    return tag, {
+        "release_id": release_id,
+        "source_digest": stable_digest,
+        "contract_version": VM_CONTRACT_V2,
+        "assets": proof_assets,
+        "verified_subjects": VM_VERIFIED_SUBJECTS[VM_CONTRACT_V2],
+        "validation": {"qemu": dict(source_proof["validation"]["qemu"]), "esxi": "validated"},
+        "source_rc_tag": source_tag,
+        "source_rc_release_id": source_release_id,
+        "evidence_path": promotion["evidence_path"],
+        "evidence_commit": promotion["evidence_commit"],
+    }
+
+def select_vm_candidates(raw: list[Any]) -> list[tuple[int, str, str, str, int, dict[str, dict[str, Any]], dict[str, str] | None]]:
     candidates = [candidate for item in raw if (candidate := vm_candidate_assets(item)) is not None]
-    tags = [candidate[1] for candidate in candidates]
-    if len(tags) != len(set(tags)):
+    by_tag = {candidate[1]: candidate for candidate in candidates}
+    if len(by_tag) != len(candidates):
         raise ValueError("duplicate VM candidate release tag")
     candidates.sort(key=lambda item: (item[3], version_order(item[2])), reverse=True)
-    return candidates[:MAX_VM_CANDIDATES]
-
+    selected = candidates[:MAX_VM_CANDIDATES]
+    for candidate in list(selected):
+        promotion = candidate[6]
+        if promotion is not None and promotion["source_rc_tag"] in by_tag:
+            source = by_tag[promotion["source_rc_tag"]]
+            if source not in selected:
+                selected.append(source)
+    return selected
 
 def select_candidates(raw: list[Any], metadata: dict[str, Any]) -> list[tuple[int, str, str, str, str, dict[str, dict[str, Any]]]]:
     grouped: dict[str, list[tuple[int, str, str, str, str, dict[str, dict[str, Any]]]]] = {
@@ -907,7 +1066,11 @@ def main() -> int:
                 print(f"verify-pages-releases: excluded {tag}: {exc}", file=sys.stderr)
                 continue
             proofs[verified_tag] = proof
-        for candidate in select_vm_candidates(raw):
+        vm_candidates = select_vm_candidates(raw)
+        vm_candidates_by_tag = {candidate[1]: candidate for candidate in vm_candidates}
+        for candidate in vm_candidates:
+            if candidate[6] is not None:
+                continue
             tag = candidate[1]
             try:
                 verified_tag, proof = verify_vm_candidate(gh, candidate, main_digest, vm_budget)
@@ -915,12 +1078,34 @@ def main() -> int:
                 print(f"verify-pages-releases: excluded {tag}: {exc}", file=sys.stderr)
                 continue
             vm_proofs[verified_tag] = proof
+        for candidate in vm_candidates:
+            promotion = candidate[6]
+            if promotion is None:
+                continue
+            tag = candidate[1]
+            source_candidate = vm_candidates_by_tag.get(promotion["source_rc_tag"])
+            source_proof = vm_proofs.get(promotion["source_rc_tag"])
+            if source_candidate is None or source_proof is None:
+                print(f"verify-pages-releases: excluded {tag}: verified source RC is unavailable", file=sys.stderr)
+                continue
+            try:
+                verified_tag, proof = verify_vm_stable_candidate(
+                    gh, candidate, source_candidate, source_proof, main_digest, vm_budget,
+                )
+            except VerificationError as exc:
+                print(f"verify-pages-releases: excluded {tag}: {exc}", file=sys.stderr)
+                continue
+            vm_proofs[verified_tag] = proof
         write_json(args.output, {
-            "schema_version": 4,
+            "schema_version": 5,
             "repository": REPOSITORY,
             "trusted_ref": TRUSTED_REF,
             "trusted_main_digest": main_digest,
-            "signer_workflows": {"ax9000": SIGNER_WORKFLOW, "vm_x86_64": VM_SIGNER_WORKFLOW},
+            "signer_workflows": {
+                "ax9000": SIGNER_WORKFLOW,
+                "vm_x86_64": VM_SIGNER_WORKFLOW,
+                "vm_x86_64_promotion": VM_PROMOTION_WORKFLOW,
+            },
             "releases": proofs,
             "virtual_images": {"x86_64": vm_proofs},
         })

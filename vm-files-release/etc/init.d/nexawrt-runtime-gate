@@ -1,0 +1,65 @@
+#!/bin/sh /etc/rc.common
+# shellcheck disable=SC2034 # rc.common consumes START and USE_PROCD.
+
+START=99
+USE_PROCD=0
+
+emit_failure() {
+  printf 'NEXAWRT_VM_PRODUCTION_RUNTIME_FAILED=%s\n' "$1" >/dev/console
+  return 1
+}
+
+start() {
+  attempt=0
+  while [ "$attempt" -lt 20 ]; do
+    attempt=$((attempt + 1))
+    if /etc/init.d/firewall enabled >/dev/null 2>&1 &&
+       nft list table inet fw4 >/dev/null 2>&1 &&
+       ip -4 addr show dev eth0 | grep -q 'inet 192\.168\.8\.1/24' &&
+       [ "$(uci -q get uhttpd.main.redirect_https)" = 1 ] &&
+       [ "$(uci -q get network.lan.device)" = eth0 ] &&
+       [ "$(uci -q get network.lan.proto)" = static ] &&
+       [ "$(uci -q get dhcp.lan.ignore || printf 1)" = 0 ] &&
+       ! /etc/init.d/dropbear enabled >/dev/null 2>&1 &&
+       ! pidof dropbear >/dev/null 2>&1 &&
+       grep -Eq '^root:[^!*:]' /etc/shadow; then
+      wan_device='absent'
+      network_mode='management-only'
+      if [ -e /sys/class/net/eth1 ]; then
+        [ "$(uci -q get network.wan.device)" = eth1 ] || {
+          emit_failure wan_binding
+          return 1
+        }
+        [ "$(uci -q get network.wan.proto)" = dhcp ] || {
+          emit_failure wan_protocol
+          return 1
+        }
+        wan_device='eth1'
+        network_mode='router'
+      fi
+      installation_id="$(cat /etc/nexawrt-install-id 2>/dev/null || true)"
+      [ "${#installation_id}" -eq 32 ] || {
+        emit_failure installation_id
+        return 1
+      }
+      cat >/dev/console <<EOF_EVIDENCE
+NEXAWRT_VM_PRODUCTION_RUNTIME_V1_BEGIN
+installation_id=$installation_id
+network_mode=$network_mode
+lan_device=eth0
+lan_address=192.168.8.1
+wan_device=$wan_device
+https_redirect=PASS
+firewall_enabled=PASS
+nftables_fw4=PASS
+lan_dhcp=PASS
+root_password=UNIQUE_FIRST_BOOT_VALUE
+ssh_disabled=PASS
+NEXAWRT_VM_PRODUCTION_RUNTIME_V1_END
+EOF_EVIDENCE
+      return 0
+    fi
+    sleep 1
+  done
+  emit_failure timeout
+}
