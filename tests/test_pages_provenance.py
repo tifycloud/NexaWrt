@@ -196,22 +196,25 @@ def vm_evidence_payloads(version: str = "v0.1.0-rc.1", *,
         "nss_validation": "false",
         "exact_release_image": "true",
         "serial_labels": "PASS",
-        "http": "PASS",
-        "ssh_runtime_evidence": "PASS",
         "ssh_port_probe": "PASS",
         "ssh": "DISABLED_BY_DEFAULT",
         "authorized_keys": "ABSENT",
         "dropbear_enabled": "NO",
         "dropbear_running": "NO",
-        "http_status": "200",
-        "auth_challenge": "false",
-        "http_host_port": "18080",
-        "ssh_host_port": "18022",
         "serial_log": str(result_dir / "serial.log"),
         "ssh_probe_log": str(result_dir / "ssh-port-probe.txt"),
     }
     if contract_version == module.VM_CONTRACT_V1:
-        smoke.update({"image": names["image"], "qemu_boot": "PASS"})
+        smoke.update({
+            "image": names["image"],
+            "qemu_boot": "PASS",
+            "http": "PASS",
+            "ssh_runtime_evidence": "PASS",
+            "http_status": "200",
+            "auth_challenge": "false",
+            "http_host_port": "18080",
+            "ssh_host_port": "18022",
+        })
         image_keys = ["image"]
     else:
         labels.update({
@@ -223,6 +226,18 @@ def vm_evidence_payloads(version: str = "v0.1.0-rc.1", *,
         })
         smoke.update({
             "release_contract": "vm-x86_64/v2",
+            "https": "PASS",
+            "http_redirect": "PASS",
+            "runtime_evidence": "PASS",
+            "production_runtime": "PASS",
+            "raw_bios_persistence": "PASS",
+            "vmdk_import_persistence": "PASS",
+            "http_redirect_status": "307",
+            "https_status": "403",
+            "auth_challenge": "true",
+            "http_host_port": "18080",
+            "https_host_port": "18443",
+            "ssh_host_port": "18022",
             "esxi_validation": "not-tested",
             **{f"{variant}_file": names[variant] for variant in module.VM_VARIANTS},
             **{f"{variant}_qemu": "runtime-pass" for variant in module.VM_VARIANTS},
@@ -688,7 +703,14 @@ def main() -> None:
         ),
         "v2 artifact labels accepted an unknown extra key",
     )
-    for key in ("release_contract", "raw_bios_file", "iso_bios_qemu", "vmdk_efi_file", "esxi_validation"):
+    assert len(module.VM_SMOKE_REPORT_KEYS[module.VM_CONTRACT_V1]) == 23
+    assert len(module.VM_SMOKE_REPORT_KEYS[module.VM_CONTRACT_V2]) == 39
+    for key in (
+        "release_contract", "https", "http_redirect", "runtime_evidence", "production_runtime",
+        "raw_bios_persistence", "vmdk_import_persistence", "http_redirect_status", "https_status",
+        "auth_challenge", "https_host_port", "raw_bios_file", "iso_bios_qemu", "vmdk_efi_file",
+        "esxi_validation",
+    ):
         expect_verification_error(
             lambda key=key: verify_vm_fixture(
                 vm_evidence_payloads(contract_version=2, missing_smoke=key), contract_version=2,
@@ -697,11 +719,52 @@ def main() -> None:
         )
     expect_verification_error(
         lambda: verify_vm_fixture(
+            vm_evidence_payloads(contract_version=2, smoke_updates={"UNSUPPORTED_SMOKE": "PASS"}),
+            contract_version=2,
+        ),
+        "v2 smoke report accepted an unknown extra key",
+    )
+    for field in (
+        "https", "http_redirect", "runtime_evidence", "production_runtime",
+        "raw_bios_persistence", "vmdk_import_persistence",
+    ):
+        expect_verification_error(
+            lambda field=field: verify_vm_fixture(
+                vm_evidence_payloads(contract_version=2, smoke_updates={field: "FAIL"}), contract_version=2,
+            ),
+            f"v2 smoke report accepted failed production evidence: {field}",
+        )
+    expect_verification_error(
+        lambda: verify_vm_fixture(
             vm_evidence_payloads(contract_version=2, smoke_updates={"iso_efi_qemu": "boot-pass"}),
             contract_version=2,
         ),
         "v2 smoke report accepted less than a runtime pass",
     )
+    for updates in (
+        {"http_redirect_status": "200"},
+        {"https_status": "403", "auth_challenge": "false"},
+        {"https_status": "200", "auth_challenge": "true"},
+    ):
+        expect_verification_error(
+            lambda updates=updates: verify_vm_fixture(
+                vm_evidence_payloads(contract_version=2, smoke_updates=updates), contract_version=2,
+            ),
+            f"v2 smoke report accepted invalid HTTPS/redirect/auth evidence: {updates!r}",
+        )
+    for field, value in (
+        ("https_host_port", "443"),
+        ("https_host_port", "65536"),
+        ("https_host_port", "018443"),
+        ("https_host_port", "18080"),
+        ("ssh_host_port", "18443"),
+    ):
+        expect_verification_error(
+            lambda field=field, value=value: verify_vm_fixture(
+                vm_evidence_payloads(contract_version=2, smoke_updates={field: value}), contract_version=2,
+            ),
+            f"v2 smoke report accepted invalid or reused host port: {field}={value}",
+        )
     expect_verification_error(
         lambda: verify_vm_fixture(
             vm_evidence_payloads(contract_version=2, smoke_updates={"vmdk_bios_file": "other.vmdk"}),

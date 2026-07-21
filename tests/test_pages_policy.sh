@@ -101,20 +101,53 @@ if grep -Fq 'href="https://github.com/tifycloud/NexaWrt/actions/workflows/vm-rel
 fi
 grep -Fq 'release.not_ax9000_firmware !== true' "$SITE/app.js"
 grep -Fq 'VM_ARTIFACT_LABEL_KEYS' "$PROOF_VERIFIER"
-grep -Fq 'VM_SMOKE_REPORT_KEYS' "$PROOF_VERIFIER"
 grep -Fq '"SSH_AUTHORIZED_KEYS": "absent"' "$PROOF_VERIFIER"
-grep -Fq '"dropbear_enabled": "NO"' "$PROOF_VERIFIER"
-grep -Fq '"dropbear_running": "NO"' "$PROOF_VERIFIER"
-grep -Fq '"ssh_runtime_evidence": "PASS"' "$PROOF_VERIFIER"
-grep -Fq '"ssh_port_probe": "PASS"' "$PROOF_VERIFIER"
-grep -Fq 'expected_smoke["qemu_boot"] = "PASS"' "$PROOF_VERIFIER"
-grep -Fq '"release_contract": "vm-x86_64/v2"' "$PROOF_VERIFIER"
-grep -Fq '"esxi_validation": "not-tested"' "$PROOF_VERIFIER"
 grep -Fq '"PUBLISHED_VARIANTS": VM_PUBLISHED_VARIANTS' "$PROOF_VERIFIER"
-grep -Fq 'parse_vm_host_port(smoke["http_host_port"]' "$PROOF_VERIFIER"
-grep -Fq 'parse_vm_host_port(smoke["ssh_host_port"]' "$PROOF_VERIFIER"
-grep -Fq 'require_vm_result_path(smoke["serial_log"], "serial.log"' "$PROOF_VERIFIER"
-grep -Fq 'require_vm_result_path(smoke["ssh_probe_log"], "ssh-port-probe.txt"' "$PROOF_VERIFIER"
+
+# Validate the exported VM smoke contracts instead of depending on a particular
+# Python assignment or formatting shape. The provenance test executed above
+# exercises the corresponding strict values, status pairs, ports, and paths.
+python3 - "$ROOT_DIR" <<'PYCONTRACT'
+import importlib.util
+import sys
+from pathlib import Path
+
+root = Path(sys.argv[1])
+scripts = root / "scripts"
+sys.path.insert(0, str(scripts))
+spec = importlib.util.spec_from_file_location("verify_pages_releases", scripts / "verify-pages-releases.py")
+module = importlib.util.module_from_spec(spec)
+if spec.loader is None:
+    raise SystemExit("Pages verifier module loader is unavailable")
+spec.loader.exec_module(module)
+
+expected_v1 = {
+    "status", "target", "image", "vm_only", "not_ax9000_firmware",
+    "hardware_validation", "nss_validation", "exact_release_image", "qemu_boot",
+    "serial_labels", "http", "ssh_runtime_evidence", "ssh_port_probe", "ssh",
+    "authorized_keys", "dropbear_enabled", "dropbear_running", "http_status",
+    "auth_challenge", "http_host_port", "ssh_host_port", "serial_log", "ssh_probe_log",
+}
+expected_v2 = {
+    "status", "target", "release_contract", "vm_only", "not_ax9000_firmware",
+    "hardware_validation", "nss_validation", "exact_release_image", "serial_labels",
+    "https", "http_redirect", "runtime_evidence", "production_runtime",
+    "raw_bios_persistence", "vmdk_import_persistence", "ssh_port_probe", "ssh",
+    "authorized_keys", "dropbear_enabled", "dropbear_running", "http_redirect_status",
+    "https_status", "auth_challenge", "http_host_port", "https_host_port",
+    "ssh_host_port", "serial_log", "ssh_probe_log", "raw_bios_file", "raw_bios_qemu",
+    "iso_bios_file", "iso_bios_qemu", "iso_efi_file", "iso_efi_qemu",
+    "vmdk_bios_file", "vmdk_bios_qemu", "vmdk_efi_file", "vmdk_efi_qemu",
+    "esxi_validation",
+}
+contracts = module.VM_SMOKE_REPORT_KEYS
+if set(contracts) != {module.VM_CONTRACT_V1, module.VM_CONTRACT_V2}:
+    raise SystemExit(f"unexpected VM smoke contract versions: {sorted(contracts)!r}")
+if contracts[module.VM_CONTRACT_V1] != expected_v1:
+    raise SystemExit(f"v1 VM smoke contract changed: {sorted(contracts[module.VM_CONTRACT_V1] ^ expected_v1)!r}")
+if contracts[module.VM_CONTRACT_V2] != expected_v2:
+    raise SystemExit(f"v2 VM smoke contract changed: {sorted(contracts[module.VM_CONTRACT_V2] ^ expected_v2)!r}")
+PYCONTRACT
 grep -Fq 'identity["id"] != asset_id' "$GENERATOR"
 if grep -Eiq '<input[^>]+(password|secret|token|key)' "$SITE/index.html"; then
   echo 'secret-bearing configuration field found in site UI' >&2
