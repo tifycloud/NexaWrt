@@ -480,10 +480,14 @@ function assertSafeEmptyState() {
 
 const componentCatalog = JSON.parse(fs.readFileSync(path.join(root, 'components/catalog.json'), 'utf8'));
 
-async function loadCatalogWith(responseFactory) {
+async function loadCatalogWith(responseFactory, cryptoImpl = webcrypto) {
   context.fetch = responseFactory;
-  await loadComponentCatalog();
-  await new Promise((resolve) => setTimeout(resolve, 20));
+  context.crypto = cryptoImpl;
+  try {
+    await loadComponentCatalog();
+  } finally {
+    context.crypto = webcrypto;
+  }
 }
 
 function flattenChildren(element) {
@@ -522,12 +526,20 @@ function flattenChildren(element) {
   const normalized = normalizedBuildRequest(componentCatalog, 'official', dependencySelection, normalizedHash);
   assert.match(actionsInputs(normalized), /^target=x86_64\nflavor=official\ncomponents=wireguard\ncatalog_version=2026\.07\.20\nrequest_hash=2aeca1c0914e74fa52c7e7748a5e3870e510a91883b1f647312addf678f966cf$/);
 
+  const delayedCrypto = {
+    subtle: {
+      async digest(...args) {
+        await new Promise((resolve) => setTimeout(resolve, 50));
+        return webcrypto.subtle.digest(...args);
+      },
+    },
+  };
   await loadCatalogWith(async (url, options) => {
     assert.equal(url, 'components/catalog.json');
     assert.equal(options.cache, 'no-store');
     assert.equal(options.credentials, 'same-origin');
     return { ok: true, json: async () => clone(componentCatalog) };
-  });
+  }, delayedCrypto);
   assert.equal(document.querySelector('#component-status').classList.contains('error'), false);
   assert.equal(document.querySelector('#component-target').disabled, false);
   assert.equal(document.querySelector('#component-target').value, 'x86_64');
