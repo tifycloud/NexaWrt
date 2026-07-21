@@ -12,6 +12,7 @@ const VM_DOCS_URL = `https://github.com/${REPOSITORY}/blob/main/docs/VM-X86_64.m
 const CUSTOM_BUILD_WORKFLOW_FILE = 'custom-build.yml';
 const CUSTOM_BUILD_WORKFLOW_URL = `https://github.com/${REPOSITORY}/actions/workflows/${CUSTOM_BUILD_WORKFLOW_FILE}`;
 const COMPONENT_CATALOG_URL = 'components/catalog.json';
+const PACKAGE_CATALOG_URL = 'components/package-catalog.json';
 const PROVENANCE_LABELS = {
   provenance_archive: 'Archive bundle',
   provenance_checksums: 'Checksums bundle',
@@ -603,23 +604,52 @@ const COMPONENT_KEYS = [
   'id', 'name', 'description', 'category', 'packages', 'depends', 'conflicts',
   'supported_targets', 'default_for'
 ];
+const PACKAGE_CATALOG_ROOT_KEYS = ['schema_version', 'catalog_version', 'openwrt_version', 'shards'];
+const PACKAGE_CATALOG_SHARD_INDEX_KEYS = [
+  'target', 'flavor', 'path', 'sha256', 'package_count', 'selectable_count', 'sources'
+];
+const PACKAGE_CATALOG_SOURCE_KEYS = ['feed', 'url', 'sha256'];
+const PACKAGE_CATALOG_SHARD_KEYS = ['schema_version', 'catalog_version', 'target', 'flavor', 'packages'];
+const PACKAGE_RECORD_KEYS = [
+  'id', 'package', 'version', 'description', 'feed', 'installed_size', 'category',
+  'arch', 'risk', 'selectable', 'blocked_reason'
+];
 const SAFE_COMPONENT_ID = /^[a-z0-9][a-z0-9_-]{0,63}$/;
 const SAFE_OPENWRT_TOKEN = /^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$/;
 const SAFE_CATALOG_VERSION = /^\d{4}\.\d{2}\.\d{2}(?:\.\d+)?$/;
+const SAFE_OPENWRT_VERSION = /^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$/;
+const SAFE_SHA256 = /^[a-f0-9]{64}$/;
+const SAFE_SHARD_PATH = /^(?:components\/)?packages\/[A-Za-z0-9_.-]+\.json$/;
 const REQUIRED_COMPONENT_TARGETS = new Set(['x86_64', 'xiaomi_ax9000']);
+const PACKAGE_RISKS = new Set(['standard', 'advanced', 'system']);
+const PACKAGE_ARCHITECTURES = {
+  'x86_64/official': new Set(['x86_64', 'noarch']),
+  'xiaomi_ax9000/official': new Set(['aarch64_cortex-a53', 'noarch']),
+  'xiaomi_ax9000/nss': new Set(['noarch'])
+};
 const MAX_CATALOG_ITEMS = 256;
+const MAX_PACKAGE_SHARDS = 32;
+const MAX_PACKAGE_RECORDS = 20000;
+const MAX_PACKAGE_RESULTS = 100;
 const CUSTOM_BUILD_FLAVORS = {
   official: { id: 'official', label: 'Official · 官方' },
   nss: { id: 'nss', label: 'NSS · 实验性' }
 };
 let componentCatalog = null;
+let packageCatalogRoot = null;
+let currentPackageShard = null;
+let currentPackageMap = new Map();
+let currentPackageSearchTerms = new Map();
+const verifiedPackageShardCache = new Map();
 let requestedComponentIds = new Set();
 let resolvedComponentIds = new Set();
 let componentRequestSequence = 0;
+let packageShardRequestSequence = 0;
+let componentSearchTimer = null;
 
-function validCatalogText(value, maxLength) {
-  return typeof value === 'string' && value.length > 0 && value === value.trim() &&
-    value.length <= maxLength && !/[\u0000-\u001f\u007f]/.test(value);
+function validCatalogText(value, maxLength, allowEmpty = false) {
+  return typeof value === 'string' && value === value.trim() && value.length <= maxLength &&
+    (allowEmpty || value.length > 0) && !/[\u0000-\u001f\u007f]/.test(value);
 }
 
 function validComponentId(value) {
@@ -702,6 +732,86 @@ function validateComponentCatalog(catalog) {
   return !hasDependencyCycle(componentsById);
 }
 
+function validOfficialSourceUrl(value) {
+  if (!validCatalogText(value, 500)) return false;
+  try {
+    const url = new URL(value);
+    if (url.protocol !== 'https:' || url.username || url.password || url.port || url.hash) return false;
+    if (url.hostname === 'downloads.openwrt.org' || url.hostname === 'git.openwrt.org') return true;
+    return url.hostname === 'github.com' && url.pathname.startsWith('/openwrt/');
+  } catch {
+    return false;
+  }
+}
+
+function validPackageShardPath(value) {
+  return typeof value === 'string' && value.length <= 240 && SAFE_SHARD_PATH.test(value) &&
+    !value.includes('..') && !value.includes('//');
+}
+
+function packageShardFetchUrl(path) {
+  return path.startsWith('components/') ? path : `components/${path}`;
+}
+
+function validatePackageCatalogRoot(root, catalog) {
+  if (!exactKeys(root, PACKAGE_CATALOG_ROOT_KEYS) || root.schema_version !== 1 ||
+      root.catalog_version !== catalog.catalog_version || !SAFE_CATALOG_VERSION.test(root.catalog_version) ||
+      !SAFE_OPENWRT_VERSION.test(root.openwrt_version) || !Array.isArray(root.shards) ||
+      root.shards.length < 1 || root.shards.length > MAX_PACKAGE_SHARDS) return false;
+  const targetIds = new Set(catalog.targets.map((target) => target.id));
+  const shardKeys = new Set();
+  for (const shard of root.shards) {
+    if (!exactKeys(shard, PACKAGE_CATALOG_SHARD_INDEX_KEYS) || !targetIds.has(shard.target) ||
+        !Object.hasOwn(CUSTOM_BUILD_FLAVORS, shard.flavor) ||
+        !flavorsForTarget(shard.target).some((flavor) => flavor.id === shard.flavor) ||
+        !validPackageShardPath(shard.path) || !SAFE_SHA256.test(shard.sha256) ||
+        !Number.isInteger(shard.package_count) || shard.package_count < 0 || shard.package_count > MAX_PACKAGE_RECORDS ||
+        !Number.isInteger(shard.selectable_count) || shard.selectable_count < 0 ||
+        shard.selectable_count > shard.package_count || !Array.isArray(shard.sources) ||
+        shard.sources.length < 1 || shard.sources.length > 16) return false;
+    const key = `${shard.target}/${shard.flavor}`;
+    if (shardKeys.has(key)) return false;
+    shardKeys.add(key);
+    const sourceFeeds = new Set();
+    for (const source of shard.sources) {
+      if (!exactKeys(source, PACKAGE_CATALOG_SOURCE_KEYS) || !validComponentId(source.feed) ||
+          !validOfficialSourceUrl(source.url) || !SAFE_SHA256.test(source.sha256) || sourceFeeds.has(source.feed)) return false;
+      sourceFeeds.add(source.feed);
+    }
+  }
+  return true;
+}
+
+function validatePackageCatalogShard(shard, descriptor, catalog) {
+  if (!exactKeys(shard, PACKAGE_CATALOG_SHARD_KEYS) || shard.schema_version !== 1 ||
+      shard.catalog_version !== catalog.catalog_version || shard.target !== descriptor.target ||
+      shard.flavor !== descriptor.flavor || !Array.isArray(shard.packages) ||
+      shard.packages.length !== descriptor.package_count || shard.packages.length > MAX_PACKAGE_RECORDS) return false;
+  const categories = new Set(catalog.categories.map((category) => category.id));
+  const bundleIds = new Set(catalog.components.map((component) => component.id));
+  const allowedFeeds = new Set(descriptor.sources.map((source) => source.feed));
+  const allowedArchitectures = PACKAGE_ARCHITECTURES[`${descriptor.target}/${descriptor.flavor}`];
+  if (!allowedArchitectures) return false;
+  const ids = new Set();
+  const packageNames = new Set();
+  let selectableCount = 0;
+  for (const record of shard.packages) {
+    if (!exactKeys(record, PACKAGE_RECORD_KEYS) || !validComponentId(record.id) || bundleIds.has(record.id) ||
+        !SAFE_OPENWRT_TOKEN.test(record.package) || !validCatalogText(record.version, 160) ||
+        !validCatalogText(record.description, 1000, true) || !allowedFeeds.has(record.feed) ||
+        !Number.isSafeInteger(record.installed_size) || record.installed_size < 0 ||
+        !categories.has(record.category) || !SAFE_OPENWRT_TOKEN.test(record.arch) ||
+        !allowedArchitectures.has(record.arch) || !PACKAGE_RISKS.has(record.risk) ||
+        typeof record.selectable !== 'boolean' || !validCatalogText(record.blocked_reason, 240, true) ||
+        (record.selectable && record.blocked_reason !== '') || (!record.selectable && record.blocked_reason === '') ||
+        ids.has(record.id) || packageNames.has(record.package)) return false;
+    ids.add(record.id);
+    packageNames.add(record.package);
+    if (record.selectable) selectableCount += 1;
+  }
+  return selectableCount === descriptor.selectable_count;
+}
+
 function flavorsForTarget(targetId) {
   return targetId === 'xiaomi_ax9000'
     ? [CUSTOM_BUILD_FLAVORS.official, CUSTOM_BUILD_FLAVORS.nss]
@@ -713,6 +823,7 @@ function componentAvailable(component, targetId) {
 }
 
 function resolveComponentSelection(catalog, targetId, requestedIds) {
+  const packageMap = currentPackageMap;
   const target = catalog.targets.find((item) => item.id === targetId);
   if (!target) return { ok: false, error: '无效的构建目标。' };
   const requested = [...requestedIds];
@@ -722,41 +833,49 @@ function resolveComponentSelection(catalog, targetId, requestedIds) {
   if (new Set(requested).size !== requested.length) return { ok: false, error: '组件选择包含重复项。' };
 
   const componentsById = new Map(catalog.components.map((item) => [item.id, item]));
-  if (requested.some((id) => !componentsById.has(id))) return { ok: false, error: '选择中包含目录外组件。' };
+  const requestedBundles = requested.filter((id) => componentsById.has(id));
+  const requestedPackages = requested.filter((id) => packageMap.has(id));
+  if (requestedBundles.length + requestedPackages.length !== requested.length) {
+    return { ok: false, error: '选择中包含目录外组件。' };
+  }
+  const blockedPackage = requestedPackages.map((id) => packageMap.get(id)).find((record) => !record.selectable);
+  if (blockedPackage) return { ok: false, error: `官方包不可选择：${blockedPackage.package}（${blockedPackage.blocked_reason}）` };
+
   const defaults = catalog.components.filter((item) => item.default_for.includes(targetId)).map((item) => item.id).sort();
-  const selected = new Set([...requested, ...defaults]);
-  const queue = [...selected];
+  const selectedBundles = new Set([...requestedBundles, ...defaults]);
+  const queue = [...selectedBundles];
   while (queue.length) {
     const id = queue.shift();
     const component = componentsById.get(id);
     for (const dependency of component.depends) {
-      if (!selected.has(dependency)) {
-        selected.add(dependency);
+      if (!selectedBundles.has(dependency)) {
+        selectedBundles.add(dependency);
         queue.push(dependency);
       }
     }
   }
-  if (selected.size > catalog.max_selected_components) {
-    return { ok: false, error: `依赖解析后超过 ${catalog.max_selected_components} 个组件上限。` };
-  }
-  const unsupported = [...selected].filter((id) => !componentAvailable(componentsById.get(id), targetId)).sort();
+  const unsupported = [...selectedBundles].filter((id) => !componentAvailable(componentsById.get(id), targetId)).sort();
   if (unsupported.length) return { ok: false, error: `组件不支持当前目标：${unsupported.join(', ')}` };
 
-  const resolved = [...selected].sort();
-  for (const id of resolved) {
+  const resolvedBundles = [...selectedBundles].sort();
+  for (const id of resolvedBundles) {
     const component = componentsById.get(id);
-    const conflict = component.conflicts.find((other) => selected.has(other));
+    const conflict = component.conflicts.find((other) => selectedBundles.has(other));
     if (conflict) {
       return { ok: false, error: `组件冲突：${component.name} 与 ${componentsById.get(conflict).name} 不能同时选择。` };
     }
   }
-  const packages = [...new Set(resolved.flatMap((id) => componentsById.get(id).packages))].sort();
+  const resolvedPackages = [...requestedPackages].sort();
+  const packages = [...new Set([
+    ...resolvedBundles.flatMap((id) => componentsById.get(id).packages),
+    ...resolvedPackages.map((id) => packageMap.get(id).package)
+  ])].sort();
   return {
     ok: true,
     error: '',
     requested_components: [...requested].sort(),
     default_components: defaults,
-    resolved_components: resolved,
+    resolved_components: [...resolvedBundles, ...resolvedPackages].sort(),
     packages,
     target: {
       id: target.id,
@@ -770,9 +889,11 @@ function resolveComponentSelection(catalog, targetId, requestedIds) {
 function componentHashPayload(catalog, targetId, flavorId, resolved) {
   return {
     catalog_version: catalog.catalog_version,
-    components: [...resolved.resolved_components],
+    default_components: [...resolved.default_components],
     flavor: flavorId,
     packages: [...resolved.packages],
+    requested_components: [...resolved.requested_components],
+    resolved_components: [...resolved.resolved_components],
     schema_version: 1,
     target: targetId
   };
@@ -857,62 +978,203 @@ function currentResolvedSelection() {
   return resolveComponentSelection(componentCatalog, targetId, [...requestedComponentIds]);
 }
 
+function formatInstalledSize(bytes) {
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(bytes < 10240 ? 1 : 0)} KiB`;
+  return `${(bytes / (1024 * 1024)).toFixed(bytes < 10 * 1024 * 1024 ? 1 : 0)} MiB`;
+}
+
+function makeRiskBadge(risk) {
+  const badge = document.createElement('span');
+  badge.className = `package-risk package-risk-${risk}`;
+  badge.textContent = risk;
+  return badge;
+}
+
+function makeBundleOption(component) {
+  const label = document.createElement('label');
+  label.className = 'component-option component-option-bundle';
+  const checkbox = document.createElement('input');
+  checkbox.type = 'checkbox';
+  checkbox.value = component.id;
+  checkbox.checked = resolvedComponentIds.has(component.id);
+  checkbox.setAttribute('data-component-id', component.id);
+  const copy = document.createElement('span');
+  copy.className = 'component-option-copy';
+  const name = document.createElement('strong');
+  name.textContent = component.name;
+  const source = document.createElement('span');
+  source.className = 'component-source-label';
+  source.textContent = '精选套餐 / Curated bundle';
+  const detail = document.createElement('small');
+  detail.textContent = `${component.description} · ${component.packages.join(', ')}`;
+  copy.append(name, source, detail);
+  label.append(checkbox, copy);
+  checkbox.addEventListener('change', () => changeComponentSelection(component.id, checkbox.checked));
+  return label;
+}
+
+function makePackageOption(record) {
+  const label = document.createElement('label');
+  label.className = `component-option package-option${record.selectable ? '' : ' package-option-blocked'}`;
+  const checkbox = document.createElement('input');
+  checkbox.type = 'checkbox';
+  checkbox.value = record.id;
+  checkbox.checked = requestedComponentIds.has(record.id);
+  checkbox.disabled = !record.selectable;
+  checkbox.setAttribute('data-component-id', record.id);
+  const copy = document.createElement('span');
+  copy.className = 'component-option-copy';
+  const titleRow = document.createElement('span');
+  titleRow.className = 'package-title-row';
+  const name = document.createElement('strong');
+  name.textContent = record.package;
+  titleRow.append(name, makeRiskBadge(record.risk));
+  const meta = document.createElement('span');
+  meta.className = 'package-meta';
+  meta.textContent = `${record.version} · ${record.arch} · ${record.feed} · ${formatInstalledSize(record.installed_size)}`;
+  const detail = document.createElement('small');
+  detail.textContent = record.description || '暂无说明 / No description';
+  copy.append(titleRow, meta, detail);
+  if (!record.selectable) {
+    const blocked = document.createElement('small');
+    blocked.className = 'package-blocked-reason';
+    blocked.textContent = `不可选择 / Blocked: ${record.blocked_reason}`;
+    copy.append(blocked);
+  }
+  label.append(checkbox, copy);
+  if (record.selectable) {
+    checkbox.addEventListener('change', () => changeComponentSelection(record.id, checkbox.checked));
+  }
+  return label;
+}
+
+function renderSelectedOfficialPackages() {
+  const container = document.querySelector('#component-selected-official');
+  const selected = [...requestedComponentIds]
+    .map((id) => currentPackageMap.get(id))
+    .filter(Boolean)
+    .sort((left, right) => left.package.localeCompare(right.package));
+  if (!selected.length) {
+    const empty = document.createElement('p');
+    empty.className = 'empty-state compact';
+    empty.textContent = '尚未选择官方包 / No official packages selected.';
+    container.replaceChildren(empty);
+    return;
+  }
+  const fragment = document.createDocumentFragment();
+  for (const record of selected) {
+    const item = document.createElement('div');
+    item.className = 'selected-package';
+    const copy = document.createElement('span');
+    const name = document.createElement('strong');
+    name.textContent = record.package;
+    const meta = document.createElement('small');
+    meta.textContent = `${record.version} · ${record.arch} · ${record.feed} · ${formatInstalledSize(record.installed_size)}`;
+    copy.append(name, meta);
+    const remove = document.createElement('button');
+    remove.type = 'button';
+    remove.textContent = '移除 / Remove';
+    remove.addEventListener('click', () => changeComponentSelection(record.id, false));
+    item.append(copy, remove);
+    fragment.append(item);
+  }
+  container.replaceChildren(fragment);
+}
+
 function renderComponentChoices() {
   const list = document.querySelector('#component-list');
+  if (!componentCatalog) {
+    list.replaceChildren();
+    return;
+  }
   const { targetId } = selectedTargetAndFlavor();
   const query = document.querySelector('#component-search').value.trim().toLocaleLowerCase('zh-CN');
   const categoryFilter = document.querySelector('#component-category').value;
-  const componentsByCategory = new Map(componentCatalog.categories.map((category) => [category.id, []]));
-  for (const component of componentCatalog.components) {
-    if (!componentAvailable(component, targetId) ||
-        (categoryFilter && categoryFilter !== component.category) ||
-        (query && !`${component.name} ${component.description} ${component.id} ${component.packages.join(' ')}`.toLocaleLowerCase('zh-CN').includes(query))) continue;
-    componentsByCategory.get(component.category).push(component);
+  const sourceFilter = document.querySelector('#component-source').value;
+  const riskFilter = document.querySelector('#component-risk').value;
+  const feedFilter = document.querySelector('#component-feed').value;
+  const fragment = document.createDocumentFragment();
+  let bundleCount = 0;
+
+  if (sourceFilter !== 'official') {
+    const componentsByCategory = new Map(componentCatalog.categories.map((category) => [category.id, []]));
+    for (const component of componentCatalog.components) {
+      if (!componentAvailable(component, targetId) || (categoryFilter && categoryFilter !== component.category) ||
+          (query && !`${component.name} ${component.description} ${component.id} ${component.packages.join(' ')}`.toLocaleLowerCase('zh-CN').includes(query))) continue;
+      componentsByCategory.get(component.category).push(component);
+    }
+    const categories = [...componentCatalog.categories].sort((left, right) => left.order - right.order);
+    for (const category of categories) {
+      const components = componentsByCategory.get(category.id);
+      if (!components.length) continue;
+      const group = document.createElement('section');
+      group.className = 'component-category-group';
+      const heading = document.createElement('h3');
+      heading.textContent = `${category.title} · 精选套餐`;
+      const description = document.createElement('p');
+      description.className = 'component-category-description';
+      description.textContent = category.description;
+      group.append(heading, description);
+      for (const component of components.sort((left, right) => left.name.localeCompare(right.name))) {
+        group.append(makeBundleOption(component));
+        bundleCount += 1;
+      }
+      fragment.append(group);
+    }
   }
 
-  const fragment = document.createDocumentFragment();
-  let visibleCount = 0;
-  const categories = [...componentCatalog.categories].sort((left, right) => left.order - right.order);
-  for (const category of categories) {
-    const components = componentsByCategory.get(category.id);
-    if (!components.length) continue;
-    const group = document.createElement('section');
-    group.className = 'component-category-group';
-    const heading = document.createElement('h3');
-    heading.textContent = category.title;
-    const description = document.createElement('p');
-    description.className = 'component-category-description';
-    description.textContent = category.description;
-    group.append(heading, description);
-    for (const component of components.sort((left, right) => left.name.localeCompare(right.name))) {
-      const label = document.createElement('label');
-      label.className = 'component-option';
-      const checkbox = document.createElement('input');
-      checkbox.type = 'checkbox';
-      checkbox.value = component.id;
-      checkbox.checked = resolvedComponentIds.has(component.id);
-      checkbox.setAttribute('data-component-id', component.id);
-      const copy = document.createElement('span');
-      copy.className = 'component-option-copy';
-      const name = document.createElement('strong');
-      name.textContent = component.name;
-      const detail = document.createElement('small');
-      detail.textContent = `${component.description} · ${component.packages.join(', ')}`;
-      copy.append(name, detail);
-      label.append(checkbox, copy);
-      checkbox.addEventListener('change', () => changeComponentSelection(component.id, checkbox.checked));
-      group.append(label);
-      visibleCount += 1;
+  const packageMatches = [];
+  let packageMatchCount = 0;
+  if (query && sourceFilter !== 'bundles' && currentPackageShard) {
+    for (const record of currentPackageShard.packages) {
+      if ((!categoryFilter || record.category === categoryFilter) &&
+          (!riskFilter || record.risk === riskFilter) &&
+          (!feedFilter || record.feed === feedFilter) &&
+          currentPackageSearchTerms.get(record.id)?.includes(query)) {
+        packageMatchCount += 1;
+        if (packageMatches.length < MAX_PACKAGE_RESULTS) packageMatches.push(record);
+      }
     }
-    fragment.append(group);
+    if (packageMatchCount) {
+      const group = document.createElement('section');
+      group.className = 'component-category-group official-package-results';
+      const heading = document.createElement('h3');
+      heading.textContent = 'Official packages · 官方包';
+      const description = document.createElement('p');
+      description.className = 'component-category-description';
+      description.textContent = packageMatchCount > MAX_PACKAGE_RESULTS
+        ? `命中 ${packageMatchCount} 条，只显示前 ${MAX_PACKAGE_RESULTS} 条。 / ${packageMatchCount} matches; showing first ${MAX_PACKAGE_RESULTS}.`
+        : `命中 ${packageMatchCount} 条官方包。 / ${packageMatchCount} official package matches.`;
+      group.append(heading, description);
+      for (const record of packageMatches) group.append(makePackageOption(record));
+      fragment.append(group);
+    }
   }
-  if (!visibleCount) {
+
+  const resultStatus = document.querySelector('#component-result-status');
+  if (!query && sourceFilter !== 'bundles') {
+    resultStatus.textContent = currentPackageShard
+      ? '输入关键词后搜索官方包；为避免浏览器卡顿，不会一次渲染完整目录。 / Search to browse official packages.'
+      : '官方包目录当前不可用；精选套餐仍可使用。 / Official packages unavailable; curated bundles remain available.';
+  } else if (query && sourceFilter !== 'bundles') {
+    resultStatus.textContent = currentPackageShard
+      ? `官方包命中 ${packageMatchCount} 条${packageMatchCount > MAX_PACKAGE_RESULTS ? `，只显示前 ${MAX_PACKAGE_RESULTS} 条` : ''}。`
+      : '官方包目录当前不可用；仅搜索精选套餐。';
+  } else {
+    resultStatus.textContent = `显示 ${bundleCount} 个精选套餐。 / Showing ${bundleCount} curated bundles.`;
+  }
+
+  if (!fragment.children.length) {
     const empty = document.createElement('p');
     empty.className = 'empty-state';
-    empty.textContent = '没有匹配当前筛选条件的组件。 / No matching components.';
+    empty.textContent = !query && sourceFilter === 'official'
+      ? '输入关键词搜索官方包；完整目录不会一次性渲染。 / Enter a search term for official packages.'
+      : '没有匹配当前筛选条件的组件。 / No matching components.';
     fragment.append(empty);
   }
   list.replaceChildren(fragment);
+  renderSelectedOfficialPackages();
 }
 
 async function updateBuildRequest(preserveMessage = false) {
@@ -964,7 +1226,105 @@ function changeComponentSelection(componentId, enabled) {
     }
   }
   renderComponentChoices();
-  updateBuildRequest(preserveMessage);
+  return updateBuildRequest(preserveMessage);
+}
+
+function clearOfficialPackageSelections() {
+  for (const id of currentPackageMap.keys()) requestedComponentIds.delete(id);
+  currentPackageShard = null;
+  currentPackageMap = new Map();
+  currentPackageSearchTerms = new Map();
+  populateSelect(document.querySelector('#component-feed'), [{ id: '', title: '全部来源 / All feeds' }], '');
+  document.querySelector('#component-feed').disabled = true;
+  document.querySelector('#component-risk').disabled = true;
+}
+
+function packageShardDescriptor(targetId, flavorId) {
+  return packageCatalogRoot?.shards.find((shard) => shard.target === targetId && shard.flavor === flavorId) || null;
+}
+
+function setPackageCatalogStatus(message, isError = false) {
+  const status = document.querySelector('#component-package-status');
+  status.textContent = message;
+  status.classList.remove('error');
+  if (isError) status.classList.add('error');
+}
+
+function packageShardCacheKey(descriptor) {
+  return `${descriptor.target}/${descriptor.flavor}/${descriptor.sha256}`;
+}
+
+function activateVerifiedPackageShard(shard, searchTerms) {
+  currentPackageShard = shard;
+  currentPackageMap = new Map(shard.packages.map((record) => [record.id, record]));
+  currentPackageSearchTerms = searchTerms;
+}
+
+function packageSearchTerms(shard) {
+  return new Map(shard.packages.map((record) => [
+    record.id,
+    `${record.package} ${record.description} ${record.version} ${record.arch} ${record.feed} ${record.category} ${record.id}`
+      .toLocaleLowerCase('zh-CN')
+  ]));
+}
+
+async function loadPackageShardForSelection() {
+  const sequence = ++packageShardRequestSequence;
+  clearOfficialPackageSelections();
+  renderComponentChoices();
+  await updateBuildRequest();
+  const { targetId, flavorId } = selectedTargetAndFlavor();
+  if (!packageCatalogRoot) {
+    setPackageCatalogStatus('官方包索引不可用；精选套餐仍可使用。 / Official package index unavailable.', true);
+    return;
+  }
+  const descriptor = packageShardDescriptor(targetId, flavorId);
+  if (!descriptor) {
+    setPackageCatalogStatus(`OpenWrt ${packageCatalogRoot.openwrt_version} · 当前目标暂无官方包分片；精选套餐仍可使用。`, true);
+    return;
+  }
+  setPackageCatalogStatus(`OpenWrt ${packageCatalogRoot.openwrt_version} · 正在校验 ${targetId}/${flavorId} 官方包…`);
+  try {
+    const cacheKey = packageShardCacheKey(descriptor);
+    let verified = verifiedPackageShardCache.get(cacheKey);
+    if (!verified) {
+      const response = await fetch(packageShardFetchUrl(descriptor.path), { cache: 'no-store', credentials: 'same-origin' });
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+      const raw = await response.text();
+      const digest = await sha256Hex(raw);
+      if (digest !== descriptor.sha256) throw new Error('package shard sha256 mismatch');
+      const shard = JSON.parse(raw);
+      if (!validatePackageCatalogShard(shard, descriptor, componentCatalog)) {
+        throw new Error('unexpected package shard schema');
+      }
+      verified = { shard, searchTerms: packageSearchTerms(shard) };
+      verifiedPackageShardCache.set(cacheKey, verified);
+    }
+    const selected = selectedTargetAndFlavor();
+    if (sequence !== packageShardRequestSequence || selected.targetId !== targetId || selected.flavorId !== flavorId) return;
+    activateVerifiedPackageShard(verified.shard, verified.searchTerms);
+    const feeds = [...new Set(verified.shard.packages.map((record) => record.feed))].sort();
+    populateSelect(document.querySelector('#component-feed'), [
+      { id: '', title: '全部来源 / All feeds' },
+      ...feeds.map((feed) => ({ id: feed, title: feed }))
+    ], '');
+    document.querySelector('#component-feed').disabled = false;
+    document.querySelector('#component-risk').disabled = false;
+    setPackageCatalogStatus(
+      `OpenWrt ${packageCatalogRoot.openwrt_version} · ${descriptor.package_count} 个官方包，${descriptor.selectable_count} 个可选择 / packages verified`
+    );
+    renderComponentChoices();
+    await updateBuildRequest();
+  } catch (error) {
+    if (sequence !== packageShardRequestSequence) return;
+    clearOfficialPackageSelections();
+    setPackageCatalogStatus(
+      `OpenWrt ${packageCatalogRoot.openwrt_version} · 官方包校验失败；精选套餐仍可使用。 / Official packages disabled.`, true
+    );
+    renderComponentChoices();
+    await updateBuildRequest();
+    console.error('Unable to load the verified official package shard:', error);
+  }
 }
 
 function resetComponentsForTarget() {
@@ -988,27 +1348,84 @@ function resetComponentsForTarget() {
 
 function setupComponentBuilder(catalog) {
   componentCatalog = catalog;
+  packageCatalogRoot = null;
+  currentPackageShard = null;
+  currentPackageMap = new Map();
+  currentPackageSearchTerms = new Map();
   requestedComponentIds.clear();
   resolvedComponentIds.clear();
   const targetSelect = document.querySelector('#component-target');
   const flavorSelect = document.querySelector('#component-flavor');
   const categorySelect = document.querySelector('#component-category');
+  const sourceSelect = document.querySelector('#component-source');
+  const riskSelect = document.querySelector('#component-risk');
+  const feedSelect = document.querySelector('#component-feed');
   targetSelect.disabled = false;
   flavorSelect.disabled = false;
   categorySelect.disabled = false;
+  sourceSelect.disabled = false;
   populateSelect(targetSelect, catalog.targets, catalog.targets[0].id);
   populateSelect(categorySelect, [{ id: '', title: '全部分类 / All categories' }, ...catalog.categories], '');
+  populateSelect(sourceSelect, [
+    { id: 'all', title: '全部来源 / All sources' },
+    { id: 'bundles', title: '精选套餐 / Curated bundles' },
+    { id: 'official', title: 'Official packages / 官方包' }
+  ], 'all');
+  populateSelect(riskSelect, [
+    { id: '', title: '全部风险 / All risks' },
+    { id: 'standard', title: 'standard · 标准' },
+    { id: 'advanced', title: 'advanced · 高级' },
+    { id: 'system', title: 'system · 系统级' }
+  ], '');
+  populateSelect(feedSelect, [{ id: '', title: '全部来源 / All feeds' }], '');
+  document.querySelector('#component-search').value = '';
+  riskSelect.disabled = true;
+  feedSelect.disabled = true;
 
-  function updateFlavors() {
+  async function updateFlavors() {
+    packageShardRequestSequence += 1;
     const available = flavorsForTarget(targetSelect.value);
     populateSelect(flavorSelect, available, available[0].id);
-    return resetComponentsForTarget();
+    await resetComponentsForTarget();
+    return loadPackageShardForSelection();
+  }
+  async function updateFlavorSelection() {
+    packageShardRequestSequence += 1;
+    await resetComponentsForTarget();
+    return loadPackageShardForSelection();
   }
   targetSelect.addEventListener('change', updateFlavors);
-  flavorSelect.addEventListener('change', () => updateBuildRequest());
-  categorySelect.addEventListener('change', renderComponentChoices);
-  document.querySelector('#component-search').addEventListener('input', renderComponentChoices);
+  flavorSelect.addEventListener('change', updateFlavorSelection);
+  for (const select of [categorySelect, sourceSelect, riskSelect, feedSelect]) {
+    select.addEventListener('change', renderComponentChoices);
+  }
+  document.querySelector('#component-search').addEventListener('input', () => {
+    if (componentSearchTimer !== null) clearTimeout(componentSearchTimer);
+    componentSearchTimer = setTimeout(() => {
+      componentSearchTimer = null;
+      renderComponentChoices();
+    }, 120);
+  });
   return updateFlavors();
+}
+
+async function loadPackageCatalogRoot(catalog) {
+  try {
+    const response = await fetch(PACKAGE_CATALOG_URL, { cache: 'no-store', credentials: 'same-origin' });
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    const root = await response.json();
+    if (!validatePackageCatalogRoot(root, catalog)) throw new Error('unexpected package catalog root schema');
+    packageCatalogRoot = root;
+    setPackageCatalogStatus(`OpenWrt ${root.openwrt_version} · 官方包根索引已验证 / Package index verified`);
+    return loadPackageShardForSelection();
+  } catch (error) {
+    packageCatalogRoot = null;
+    clearOfficialPackageSelections();
+    setPackageCatalogStatus('官方包索引不可用；精选套餐仍可使用。 / Official packages disabled.', true);
+    renderComponentChoices();
+    await updateBuildRequest();
+    console.error('Unable to load the official package catalog root:', error);
+  }
 }
 
 async function loadComponentCatalog() {
@@ -1020,15 +1437,21 @@ async function loadComponentCatalog() {
     if (!validateComponentCatalog(catalog)) throw new Error('unexpected component catalog schema');
     await setupComponentBuilder(catalog);
     status.classList.remove('error');
-    status.textContent = `组件目录 ${catalog.catalog_version} 已验证 / Catalog verified`;
+    status.textContent = `精选套餐目录 ${catalog.catalog_version} 已验证 / Curated bundles verified`;
+    await loadPackageCatalogRoot(catalog);
   } catch (error) {
     componentCatalog = null;
+    packageCatalogRoot = null;
+    currentPackageShard = null;
+    currentPackageMap = new Map();
     requestedComponentIds.clear();
     resolvedComponentIds.clear();
     status.classList.add('error');
-    status.textContent = '组件目录暂不可用；已禁用自定义构建入口。 / Catalog unavailable; custom builds disabled.';
+    status.textContent = '精选套餐目录暂不可用；已禁用自定义构建入口。 / Catalog unavailable; custom builds disabled.';
+    setPackageCatalogStatus('等待有效精选套餐目录。 / Waiting for curated catalog.', true);
     document.querySelector('#component-list').replaceChildren();
-    setBuildRequestUnavailable('无法验证组件目录。');
+    document.querySelector('#component-selected-official').replaceChildren();
+    setBuildRequestUnavailable('无法验证精选套餐目录。');
     console.error('Unable to load the allowlisted component catalog:', error);
   }
 }

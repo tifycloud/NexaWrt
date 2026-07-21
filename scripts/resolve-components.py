@@ -11,17 +11,38 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 import re
 import stat
 import sys
+import urllib.parse
 from pathlib import Path
 from typing import Any, Iterable
 
+SCRIPT_DIR = Path(__file__).resolve().parent
+if str(SCRIPT_DIR) not in sys.path:
+    sys.path.insert(0, str(SCRIPT_DIR))
+
+from component_package_policy import (
+    allowed_architectures_for,
+    blocked_reason_for,
+    risk_for,
+)
+
 ROOT = Path(__file__).resolve().parent.parent
 CATALOG_PATH = ROOT / "components" / "catalog.json"
+PACKAGE_CATALOG_PATH = ROOT / "components" / "package-catalog.json"
+PACKAGE_SHARD_ROOT = ROOT / "components" / "packages"
+OPENWRT_VERSION = "25.12.5"
 REQUEST_SCHEMA_VERSION = 1
 REQUIRED_TARGETS = {"x86_64", "xiaomi_ax9000"}
 ALLOWED_FLAVORS = {"official", "nss"}
+MAX_COMPONENT_CATALOG_BYTES = 2 * 1024 * 1024
+MAX_PACKAGE_CATALOG_BYTES = 2 * 1024 * 1024
+MAX_PACKAGE_SHARD_BYTES = 16 * 1024 * 1024
+IO_CHUNK_SIZE = 1024 * 1024
+NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
+DIRECTORY = getattr(os, "O_DIRECTORY", 0)
 
 TOP_LEVEL_KEYS = {
     "schema_version",
@@ -54,6 +75,35 @@ COMPONENT_KEYS = {
 ID_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
 OPENWRT_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")
 CATALOG_VERSION_RE = re.compile(r"^[0-9]{4}\.[0-9]{2}\.[0-9]{2}(?:\.[0-9]+)?$")
+SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+PACKAGE_ID_RE = re.compile(r"^pkg-[0-9a-f]{16}$")
+PACKAGE_SHARD_PATH_RE = re.compile(r"^components/packages/[a-z0-9][a-z0-9_-]{0,63}\.json$")
+PACKAGE_CATALOG_KEYS = {"schema_version", "catalog_version", "openwrt_version", "shards"}
+PACKAGE_DESCRIPTOR_KEYS = {
+    "target", "flavor", "path", "sha256", "package_count", "selectable_count", "sources"
+}
+PACKAGE_SOURCE_KEYS = {"feed", "url", "sha256"}
+PACKAGE_SHARD_KEYS = {"schema_version", "catalog_version", "target", "flavor", "packages"}
+PACKAGE_RECORD_KEYS = {
+    "id", "package", "version", "description", "feed", "installed_size", "category",
+    "arch", "risk", "selectable", "blocked_reason"
+}
+PACKAGE_FEEDS = {"target", "base", "kmods", "luci", "packages", "routing", "telephony", "video"}
+PACKAGE_FEED_CATEGORIES = {
+    "target": "official-target",
+    "base": "official-base",
+    "kmods": "official-kernel",
+    "luci": "official-luci",
+    "packages": "official-packages",
+    "routing": "official-routing",
+    "telephony": "official-telephony",
+    "video": "official-video",
+}
+EXPECTED_PACKAGE_SHARDS = {
+    ("x86_64", "official"): "components/packages/x86_64-official.json",
+    ("xiaomi_ax9000", "official"): "components/packages/xiaomi_ax9000-official.json",
+    ("xiaomi_ax9000", "nss"): "components/packages/xiaomi_ax9000-nss.json",
+}
 
 
 class CatalogError(ValueError):
@@ -322,21 +372,341 @@ def validate_catalog(payload: Any) -> dict[str, Any]:
 
 def load_catalog() -> dict[str, Any]:
     """Load only the repository-owned catalog; alternate paths are forbidden."""
-    expected_parent = (ROOT / "components").resolve(strict=True)
-    if CATALOG_PATH.parent.resolve(strict=True) != expected_parent:
-        raise CatalogError("catalog parent is outside the components allow-list")
-    file_stat = CATALOG_PATH.lstat()
-    if stat.S_ISLNK(file_stat.st_mode) or not stat.S_ISREG(file_stat.st_mode):
-        raise CatalogError("catalog must be a regular, non-symlink file")
-    if file_stat.st_nlink != 1:
-        raise CatalogError("catalog must not be hard-linked")
-    try:
-        with CATALOG_PATH.open("r", encoding="utf-8") as handle:
-            payload = json.load(handle, object_pairs_hook=_reject_duplicate_keys)
-    except (OSError, UnicodeError, json.JSONDecodeError) as error:
-        raise CatalogError(f"unable to load component catalog: {error}") from error
+    payload, _digest = _load_repository_json(
+        CATALOG_PATH,
+        ROOT / "components",
+        "component catalog",
+        MAX_COMPONENT_CATALOG_BYTES,
+    )
     return validate_catalog(payload)
 
+
+def _optional_text(value: Any, context: str, maximum: int) -> str:
+    if not isinstance(value, str) or value != value.strip():
+        raise CatalogError(f"{context} must be a trimmed string")
+    if len(value) > maximum or any(ord(character) < 32 for character in value):
+        raise CatalogError(f"{context} contains invalid text")
+    return value
+
+
+def _load_repository_json(
+    path: Path, expected_parent: Path, context: str, maximum_bytes: int
+) -> tuple[Any, str]:
+    """Open, validate, bound, hash, and parse one repository file via one fd."""
+    if path.parent != expected_parent or path.name in {"", ".", ".."}:
+        raise CatalogError(f"{context} is outside its repository allow-list")
+    parent_fd: int | None = None
+    descriptor: int | None = None
+    try:
+        parent_fd = os.open(expected_parent, os.O_RDONLY | DIRECTORY | NOFOLLOW)
+        parent_info = os.fstat(parent_fd)
+        if not stat.S_ISDIR(parent_info.st_mode):
+            raise CatalogError(f"{context} parent must be a real directory")
+        descriptor = os.open(path.name, os.O_RDONLY | NOFOLLOW, dir_fd=parent_fd)
+        info = os.fstat(descriptor)
+        if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+            raise CatalogError(f"{context} must be a regular, single-link file")
+        if info.st_size > maximum_bytes:
+            raise CatalogError(f"{context} exceeds the {maximum_bytes}-byte limit")
+        digest = hashlib.sha256()
+        chunks: list[bytes] = []
+        total = 0
+        while True:
+            chunk = os.read(descriptor, min(IO_CHUNK_SIZE, maximum_bytes - total + 1))
+            if not chunk:
+                break
+            total += len(chunk)
+            if total > maximum_bytes:
+                raise CatalogError(f"{context} exceeds the {maximum_bytes}-byte limit")
+            digest.update(chunk)
+            chunks.append(chunk)
+        raw = b"".join(chunks)
+        payload = json.loads(
+            raw.decode("utf-8"), object_pairs_hook=_reject_duplicate_keys
+        )
+        return payload, digest.hexdigest()
+    except CatalogError:
+        raise
+    except (OSError, UnicodeError, json.JSONDecodeError) as error:
+        raise CatalogError(f"unable to load {context}: {error}") from error
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+        if parent_fd is not None:
+            os.close(parent_fd)
+
+
+def _official_packages_url(value: Any, context: str) -> str:
+    value = _nonempty_text(value, context, 500)
+    parsed = urllib.parse.urlsplit(value)
+    prefix = f"/releases/{OPENWRT_VERSION}/"
+    if (
+        parsed.scheme != "https"
+        or parsed.hostname != "downloads.openwrt.org"
+        or parsed.port is not None
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.query
+        or parsed.fragment
+        or not parsed.path.startswith(prefix)
+        or not parsed.path.endswith("/packages.adb")
+        or "//" in parsed.path
+        or any(part in {"", ".", ".."} for part in parsed.path.split("/")[1:])
+    ):
+        raise CatalogError(f"{context} is outside the OpenWrt packages allow-list")
+    return urllib.parse.urlunsplit(parsed)
+
+
+def validate_package_catalog_index(payload: Any, catalog: dict[str, Any]) -> dict[str, Any]:
+    """Validate the exact package-catalog root index."""
+    if not isinstance(payload, dict):
+        raise CatalogError("package catalog root must be an object")
+    _exact_keys(payload, PACKAGE_CATALOG_KEYS, "package catalog")
+    if type(payload["schema_version"]) is not int or payload["schema_version"] != 1:
+        raise CatalogError("package catalog schema_version must be integer 1")
+    if payload["catalog_version"] != catalog["catalog_version"]:
+        raise CatalogError("package catalog version differs from component catalog")
+    if payload["openwrt_version"] != OPENWRT_VERSION:
+        raise CatalogError(f"package catalog openwrt_version must be {OPENWRT_VERSION}")
+
+    raw_shards = payload["shards"]
+    if not isinstance(raw_shards, list) or len(raw_shards) != len(EXPECTED_PACKAGE_SHARDS):
+        raise CatalogError("package catalog must contain exactly three target/flavor shards")
+    target_ids = {target["id"] for target in catalog["targets"]}
+    descriptors: list[dict[str, Any]] = []
+    seen_pairs: set[tuple[str, str]] = set()
+    seen_paths: set[str] = set()
+    for position, raw in enumerate(raw_shards):
+        context = f"package catalog shards[{position}]"
+        if not isinstance(raw, dict):
+            raise CatalogError(f"{context} must be an object")
+        _exact_keys(raw, PACKAGE_DESCRIPTOR_KEYS, context)
+        target = _identifier(raw["target"], f"{context}.target")
+        flavor = _identifier(raw["flavor"], f"{context}.flavor")
+        pair = (target, flavor)
+        if target not in target_ids or flavor not in ALLOWED_FLAVORS:
+            raise CatalogError(f"{context} has unsupported target/flavor")
+        if pair not in EXPECTED_PACKAGE_SHARDS:
+            raise CatalogError(f"{context} has unsupported target/flavor pair: {pair}")
+        path = _nonempty_text(raw["path"], f"{context}.path", 160)
+        if not PACKAGE_SHARD_PATH_RE.fullmatch(path) or path != EXPECTED_PACKAGE_SHARDS[pair]:
+            raise CatalogError(f"{context}.path is outside the package shard allow-list")
+        digest = _nonempty_text(raw["sha256"], f"{context}.sha256", 64)
+        if not SHA256_RE.fullmatch(digest):
+            raise CatalogError(f"{context}.sha256 is invalid")
+        package_count = raw["package_count"]
+        selectable_count = raw["selectable_count"]
+        if type(package_count) is not int or not 1 <= package_count <= 50000:
+            raise CatalogError(f"{context}.package_count must be an integer from 1 to 50000")
+        if type(selectable_count) is not int or not 0 <= selectable_count <= package_count:
+            raise CatalogError(f"{context}.selectable_count is invalid")
+        raw_sources = raw["sources"]
+        if not isinstance(raw_sources, list) or not 1 <= len(raw_sources) <= 16:
+            raise CatalogError(f"{context}.sources must contain 1 to 16 entries")
+        sources: list[dict[str, str]] = []
+        source_feeds: set[str] = set()
+        source_urls: set[str] = set()
+        for source_position, source in enumerate(raw_sources):
+            source_context = f"{context}.sources[{source_position}]"
+            if not isinstance(source, dict):
+                raise CatalogError(f"{source_context} must be an object")
+            _exact_keys(source, PACKAGE_SOURCE_KEYS, source_context)
+            feed = _identifier(source["feed"], f"{source_context}.feed")
+            if feed not in PACKAGE_FEEDS or feed in source_feeds:
+                raise CatalogError(f"{source_context}.feed is invalid or duplicated")
+            url = _official_packages_url(source["url"], f"{source_context}.url")
+            if url in source_urls:
+                raise CatalogError(f"duplicate package source URL: {url}")
+            source_digest = _nonempty_text(source["sha256"], f"{source_context}.sha256", 64)
+            if not SHA256_RE.fullmatch(source_digest):
+                raise CatalogError(f"{source_context}.sha256 is invalid")
+            source_feeds.add(feed)
+            source_urls.add(url)
+            sources.append({"feed": feed, "url": url, "sha256": source_digest})
+        expected_feeds = (
+            {"base", "luci", "packages", "routing", "telephony", "video"}
+            if flavor == "nss"
+            else PACKAGE_FEEDS
+        )
+        if source_feeds != expected_feeds:
+            raise CatalogError(f"{context}.sources feeds differ from the target/flavor contract")
+        if pair in seen_pairs or path in seen_paths:
+            raise CatalogError(f"duplicate package shard descriptor: {pair}")
+        seen_pairs.add(pair)
+        seen_paths.add(path)
+        descriptors.append(
+            {
+                "target": target,
+                "flavor": flavor,
+                "path": path,
+                "sha256": digest,
+                "package_count": package_count,
+                "selectable_count": selectable_count,
+                "sources": sources,
+            }
+        )
+    if seen_pairs != set(EXPECTED_PACKAGE_SHARDS):
+        raise CatalogError("package catalog is missing required target/flavor shards")
+    return {
+        "schema_version": 1,
+        "catalog_version": payload["catalog_version"],
+        "openwrt_version": payload["openwrt_version"],
+        "shards": descriptors,
+    }
+
+
+def load_package_catalog_index(catalog: dict[str, Any]) -> dict[str, Any]:
+    payload, _digest = _load_repository_json(
+        PACKAGE_CATALOG_PATH,
+        ROOT / "components",
+        "package catalog",
+        MAX_PACKAGE_CATALOG_BYTES,
+    )
+    return validate_package_catalog_index(payload, catalog)
+
+
+def validate_package_shard(
+    payload: Any, descriptor: dict[str, Any], catalog: dict[str, Any]
+) -> dict[str, Any]:
+    """Validate one exact target/flavor package shard."""
+    if not isinstance(payload, dict):
+        raise CatalogError("package shard root must be an object")
+    _exact_keys(payload, PACKAGE_SHARD_KEYS, "package shard")
+    if type(payload["schema_version"]) is not int or payload["schema_version"] != 1:
+        raise CatalogError("package shard schema_version must be integer 1")
+    if payload["catalog_version"] != catalog["catalog_version"]:
+        raise CatalogError("package shard version differs from component catalog")
+    if payload["target"] != descriptor["target"] or payload["flavor"] != descriptor["flavor"]:
+        raise CatalogError("package shard target/flavor differs from root index")
+    raw_packages = payload["packages"]
+    if not isinstance(raw_packages, list) or len(raw_packages) != descriptor["package_count"]:
+        raise CatalogError("package shard package_count differs from root index")
+    if len(raw_packages) > 50000:
+        raise CatalogError("package shard exceeds 50000 records")
+
+    category_ids = {category["id"] for category in catalog["categories"]}
+    bundle_ids = {component["id"] for component in catalog["components"]}
+    allowed_feeds = {source["feed"] for source in descriptor["sources"]}
+    allowed_arches = allowed_architectures_for(
+        descriptor["target"], descriptor["flavor"]
+    )
+    records: list[dict[str, Any]] = []
+    seen_ids: set[str] = set()
+    seen_packages: set[str] = set()
+    selectable_count = 0
+    for position, raw in enumerate(raw_packages):
+        context = f"package shard packages[{position}]"
+        if not isinstance(raw, dict):
+            raise CatalogError(f"{context} must be an object")
+        _exact_keys(raw, PACKAGE_RECORD_KEYS, context)
+        package_id = _nonempty_text(raw["id"], f"{context}.id", 20)
+        if not PACKAGE_ID_RE.fullmatch(package_id) or package_id in bundle_ids:
+            raise CatalogError(f"{context}.id is invalid")
+        package = _openwrt_name(raw["package"], f"{context}.package")
+        expected_id = "pkg-" + hashlib.sha256(package.encode("utf-8")).hexdigest()[:16]
+        if package_id != expected_id:
+            raise CatalogError(f"{context}.id does not match its package name")
+        version = _nonempty_text(raw["version"], f"{context}.version", 160)
+        description = _nonempty_text(raw["description"], f"{context}.description", 1000)
+        feed = _identifier(raw["feed"], f"{context}.feed")
+        if feed not in allowed_feeds:
+            raise CatalogError(f"{context}.feed is not declared by the shard")
+        installed_size = raw["installed_size"]
+        if type(installed_size) is not int or not 0 <= installed_size <= 2**63 - 1:
+            raise CatalogError(f"{context}.installed_size is invalid")
+        category = _identifier(raw["category"], f"{context}.category")
+        if category not in category_ids or category != PACKAGE_FEED_CATEGORIES[feed]:
+            raise CatalogError(f"{context}.category does not match its feed")
+        arch = _openwrt_name(raw["arch"], f"{context}.arch")
+        if arch not in allowed_arches:
+            raise CatalogError(
+                f"{context}.arch violates the {descriptor['target']}/{descriptor['flavor']} policy"
+            )
+        risk = _nonempty_text(raw["risk"], f"{context}.risk", 16)
+        selectable = raw["selectable"]
+        if type(selectable) is not bool:
+            raise CatalogError(f"{context}.selectable must be boolean")
+        blocked_reason = _optional_text(
+            raw["blocked_reason"], f"{context}.blocked_reason", 240
+        )
+        expected_reason = blocked_reason_for(package)
+        expected_selectable = not expected_reason
+        expected_risk = risk_for(package, feed)
+        if blocked_reason != expected_reason:
+            raise CatalogError(f"{context}.blocked_reason differs from the shared policy")
+        if selectable != expected_selectable:
+            raise CatalogError(f"{context}.selectable differs from the shared policy")
+        if risk != expected_risk:
+            raise CatalogError(f"{context}.risk differs from the shared policy")
+        if package.startswith("kmod-") and descriptor["flavor"] != "official":
+            raise CatalogError(f"{context} violates the official-only kmod policy")
+        if descriptor["flavor"] == "nss" and (
+            arch != "noarch" or feed in {"target", "kmods"}
+        ):
+            raise CatalogError(f"{context} violates the NSS userspace-only policy")
+        if package_id in seen_ids or package in seen_packages:
+            raise CatalogError(f"duplicate package record: {package}")
+        seen_ids.add(package_id)
+        seen_packages.add(package)
+        selectable_count += int(selectable)
+        records.append(
+            {
+                "id": package_id,
+                "package": package,
+                "version": version,
+                "description": description,
+                "feed": feed,
+                "installed_size": installed_size,
+                "category": category,
+                "arch": arch,
+                "risk": risk,
+                "selectable": selectable,
+                "blocked_reason": blocked_reason,
+            }
+        )
+    expected_order = sorted(records, key=lambda item: (item["package"], item["version"], item["id"]))
+    if records != expected_order:
+        raise CatalogError("package shard is not deterministically sorted")
+    if selectable_count != descriptor["selectable_count"]:
+        raise CatalogError("package shard selectable_count differs from root index")
+    return {
+        "schema_version": 1,
+        "catalog_version": payload["catalog_version"],
+        "target": payload["target"],
+        "flavor": payload["flavor"],
+        "packages": records,
+    }
+
+
+def load_package_shard(
+    index: dict[str, Any], catalog: dict[str, Any], target_id: str, flavor_id: str
+) -> dict[str, Any]:
+    descriptor = next(
+        (
+            item
+            for item in index["shards"]
+            if item["target"] == target_id and item["flavor"] == flavor_id
+        ),
+        None,
+    )
+    if descriptor is None:
+        raise RequestError(f"no package shard for {target_id}/{flavor_id}")
+    relative_path = descriptor["path"]
+    if not PACKAGE_SHARD_PATH_RE.fullmatch(relative_path):
+        raise CatalogError("package shard path is outside the repository allow-list")
+    shard_path = ROOT / relative_path
+    payload, actual_digest = _load_repository_json(
+        shard_path,
+        PACKAGE_SHARD_ROOT,
+        f"package shard {target_id}/{flavor_id}",
+        MAX_PACKAGE_SHARD_BYTES,
+    )
+    if actual_digest != descriptor["sha256"]:
+        raise CatalogError(
+            f"package shard SHA256 mismatch for {target_id}/{flavor_id}: "
+            f"expected {descriptor['sha256']}, got {actual_digest}"
+        )
+    return validate_package_shard(payload, descriptor, catalog)
 
 def _component_closure(
     component_index: dict[str, dict[str, Any]], selected: Iterable[str]
@@ -376,7 +746,7 @@ def resolve_components(
     *,
     include_defaults: bool = True,
 ) -> dict[str, Any]:
-    """Resolve a component selection without accepting package or shell input."""
+    """Resolve allow-listed bundle and official package IDs into build inputs."""
     target_index = {target["id"]: target for target in catalog["targets"]}
     component_index = {component["id"]: component for component in catalog["components"]}
 
@@ -398,45 +768,64 @@ def resolve_components(
         )
     if len(set(requested)) != len(requested):
         raise RequestError("duplicate component selection")
-    unknown = sorted(set(requested) - set(component_index))
+
+    package_catalog = load_package_catalog_index(catalog)
+    package_shard = load_package_shard(
+        package_catalog, catalog, target_id, flavor_id
+    )
+    package_index = {item["id"]: item for item in package_shard["packages"]}
+    overlap = sorted(set(component_index) & set(package_index))
+    if overlap:
+        raise CatalogError(f"bundle and package IDs overlap: {overlap}")
+
+    known_ids = set(component_index) | set(package_index)
+    unknown = sorted(set(requested) - known_ids)
     if unknown:
         raise RequestError(f"unknown component selection: {unknown}")
+    requested_bundles = sorted(item for item in requested if item in component_index)
+    requested_packages = sorted(item for item in requested if item in package_index)
+    blocked = [package_index[item] for item in requested_packages if not package_index[item]["selectable"]]
+    if blocked:
+        details = [f"{item['package']}: {item['blocked_reason']}" for item in blocked]
+        raise RequestError(f"official package selection is blocked: {details}")
 
     defaults = sorted(
         component["id"]
         for component in catalog["components"]
         if include_defaults and target_id in component["default_for"]
     )
-    initial = set(requested) | set(defaults)
-    resolved = _component_closure(component_index, initial)
-    if len(resolved) > maximum:
-        raise RequestError(
-            f"selection resolves to {len(resolved)} components; maximum is {maximum}"
-        )
+    resolved_bundles = _component_closure(
+        component_index, set(requested_bundles) | set(defaults)
+    )
+    resolved = resolved_bundles | set(requested_packages)
 
     unsupported = sorted(
         component_id
-        for component_id in resolved
+        for component_id in resolved_bundles
         if target_id not in component_index[component_id]["supported_targets"]
     )
     if unsupported:
         raise RequestError(f"components are unsupported on {target_id}: {unsupported}")
 
     conflicts: set[tuple[str, str]] = set()
-    for component_id in resolved:
+    for component_id in resolved_bundles:
         for conflict_id in component_index[component_id]["conflicts"]:
-            if conflict_id in resolved:
+            if conflict_id in resolved_bundles:
                 conflicts.add(tuple(sorted((component_id, conflict_id))))
     if conflicts:
         pairs = [f"{left}<->{right}" for left, right in sorted(conflicts)]
         raise RequestError(f"conflicting component selection: {pairs}")
 
+    requested_ids = sorted(requested)
     resolved_ids = sorted(resolved)
     packages = sorted(
         {
-            package
-            for component_id in resolved_ids
-            for package in component_index[component_id]["packages"]
+            *(
+                package
+                for component_id in resolved_bundles
+                for package in component_index[component_id]["packages"]
+            ),
+            *(package_index[package_id]["package"] for package_id in requested_packages),
         }
     )
     target = target_index[target_id]
@@ -444,8 +833,10 @@ def resolve_components(
         "schema_version": REQUEST_SCHEMA_VERSION,
         "catalog_version": catalog["catalog_version"],
         "target": target_id,
-        "components": resolved_ids,
         "flavor": flavor_id,
+        "requested_components": requested_ids,
+        "default_components": defaults,
+        "resolved_components": resolved_ids,
         "packages": packages,
     }
     canonical = json.dumps(
@@ -463,7 +854,7 @@ def resolve_components(
             "profile": target["profile"],
         },
         "flavor": flavor_id,
-        "requested_components": sorted(requested),
+        "requested_components": requested_ids,
         "default_components": defaults,
         "resolved_components": resolved_ids,
         "packages": packages,

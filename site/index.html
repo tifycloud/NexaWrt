@@ -189,6 +189,7 @@
       <div class="component-security-note">
         <strong>静态 Pages 不保存 GitHub token，也不会代替你提交构建。</strong>
         <p>页面只在本地浏览器中规范化选择并计算请求哈希。请先登录 GitHub，打开 Actions 页面，再点击 <b>Run workflow</b> 并粘贴生成的 inputs；目前不支持匿名一键构建。</p>
+        <p><strong>供应链边界：</strong>Official packages 只同步经过锁定和摘要校验的 OpenWrt 官方源，不接受任意第三方 URL；官方包目录失败时，精选套餐仍可独立使用。</p>
       </div>
 
       <div class="component-builder-grid">
@@ -203,13 +204,33 @@
           </div>
           <div class="field-grid">
             <label>搜索 / Search
-              <input id="component-search" type="search" maxlength="80" autocomplete="off" placeholder="名称、说明、包名">
+              <input id="component-search" type="search" maxlength="80" autocomplete="off" placeholder="套餐、包名、说明、版本">
             </label>
+            <label>来源 / Source
+              <select id="component-source" disabled></select>
+            </label>
+          </div>
+          <div class="package-filter-grid">
             <label>分类 / Category
               <select id="component-category" disabled></select>
             </label>
+            <label>风险 / Risk
+              <select id="component-risk" disabled></select>
+            </label>
+            <label>官方 Feed
+              <select id="component-feed" disabled></select>
+            </label>
           </div>
+          <p id="component-package-status" class="component-message package-catalog-status" role="status">正在读取官方包索引… / Loading official package index…</p>
+          <p id="component-result-status" class="component-result-status" aria-live="polite">输入关键词后搜索官方包；精选套餐会直接显示。</p>
           <p id="component-error" class="component-message" role="alert" hidden></p>
+          <div class="selected-packages-panel" aria-labelledby="selected-packages-title">
+            <div class="selected-packages-heading">
+              <h3 id="selected-packages-title">已选 Official packages</h3>
+              <small>即使不在当前搜索结果中也会保留</small>
+            </div>
+            <div id="component-selected-official" class="selected-packages-list" aria-live="polite"></div>
+          </div>
           <div id="component-list" class="component-list" aria-live="polite"></div>
         </div>
 

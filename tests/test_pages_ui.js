@@ -7,6 +7,7 @@ const path = require('node:path');
 const vm = require('node:vm');
 const { webcrypto } = require('node:crypto');
 const { TextEncoder } = require('node:util');
+const { execFileSync } = require('node:child_process');
 
 class FakeClassList {
   constructor() { this.values = new Set(); }
@@ -105,13 +106,16 @@ function makeDom() {
   selectors.set('[data-vm-platform="x86_64"]', makeVmCard());
   selectors.set('#data-status', new FakeElement('p'));
   selectors.set('#component-status', new FakeElement('p'));
-  for (const selector of ['#component-target', '#component-flavor', '#component-category']) {
+  for (const selector of ['#component-target', '#component-flavor', '#component-category', '#component-source', '#component-risk', '#component-feed']) {
     selectors.set(selector, new FakeElement('select'));
     selectors.get(selector).disabled = true;
   }
   selectors.set('#component-search', new FakeElement('input'));
+  selectors.set('#component-package-status', new FakeElement('p'));
+  selectors.set('#component-result-status', new FakeElement('p'));
   selectors.set('#component-error', new FakeElement('p'));
   selectors.get('#component-error').hidden = true;
+  selectors.set('#component-selected-official', new FakeElement('div'));
   selectors.set('#component-list', new FakeElement('div'));
   selectors.set('#component-packages', new FakeElement('pre'));
   selectors.set('#component-normalized', new FakeElement('code'));
@@ -152,17 +156,17 @@ function makeDom() {
 const root = path.resolve(__dirname, '..');
 const source = fs.readFileSync(path.join(root, 'site/app.js'), 'utf8');
 const testedSource = source.replace(/\nloadReleases\(\);\nloadComponentCatalog\(\);\s*$/, '\n') +
-  '\nglobalThis.hooks = { validDevice, validRelease, validReleaseGroup, validVmRelease, validVmReleaseGroup, validUtcTimestamp, compareVersions, loadReleases, generateSnippet, validateComponentCatalog, resolveComponentSelection, componentHashPayload, canonicalJson, sha256Hex, normalizedBuildRequest, actionsInputs, loadComponentCatalog, changeComponentSelection, renderComponentChoices, getRequestedComponentIds: () => [...requestedComponentIds], getResolvedComponentIds: () => [...resolvedComponentIds] };\n';
+  '\nglobalThis.hooks = { validDevice, validRelease, validReleaseGroup, validVmRelease, validVmReleaseGroup, validUtcTimestamp, compareVersions, loadReleases, generateSnippet, validateComponentCatalog, validatePackageCatalogRoot, validatePackageCatalogShard, resolveComponentSelection, componentHashPayload, canonicalJson, sha256Hex, normalizedBuildRequest, actionsInputs, loadComponentCatalog, loadPackageShardForSelection, changeComponentSelection, renderComponentChoices, setCurrentPackageRecords: (records) => { currentPackageShard = { packages: records }; currentPackageMap = new Map(records.map((record) => [record.id, record])); currentPackageSearchTerms = packageSearchTerms(currentPackageShard); }, clearVerifiedPackageShardCache: () => verifiedPackageShardCache.clear(), getCurrentPackageRecords: () => [...currentPackageMap.values()], getRequestedComponentIds: () => [...requestedComponentIds], getResolvedComponentIds: () => [...resolvedComponentIds] };\n';
 const document = makeDom();
 const loggedErrors = [];
 const context = vm.createContext({
-  URL, Date, Set, Map, JSON, Number, Intl, Uint8Array, TextEncoder, crypto: webcrypto,
+  URL, Date, Set, Map, JSON, Number, Intl, Uint8Array, TextEncoder, setTimeout, clearTimeout, crypto: webcrypto,
   document,
   fetch: async () => { throw new Error('fetch stub not configured'); },
   console: { error: (...args) => loggedErrors.push(args) },
 });
 vm.runInContext(testedSource, context, { filename: 'site/app.js' });
-const { validDevice, validRelease, validReleaseGroup, validVmRelease, validVmReleaseGroup, validUtcTimestamp, compareVersions, loadReleases, generateSnippet, validateComponentCatalog, resolveComponentSelection, componentHashPayload, canonicalJson, sha256Hex, normalizedBuildRequest, actionsInputs, loadComponentCatalog, changeComponentSelection, renderComponentChoices, getRequestedComponentIds, getResolvedComponentIds } = context.hooks;
+const { validDevice, validRelease, validReleaseGroup, validVmRelease, validVmReleaseGroup, validUtcTimestamp, compareVersions, loadReleases, generateSnippet, validateComponentCatalog, validatePackageCatalogRoot, validatePackageCatalogShard, resolveComponentSelection, componentHashPayload, canonicalJson, sha256Hex, normalizedBuildRequest, actionsInputs, loadComponentCatalog, loadPackageShardForSelection, changeComponentSelection, renderComponentChoices, setCurrentPackageRecords, clearVerifiedPackageShardCache, getCurrentPackageRecords, getRequestedComponentIds, getResolvedComponentIds } = context.hooks;
 const clone = (value) => JSON.parse(JSON.stringify(value));
 
 const index = JSON.parse(fs.readFileSync(path.join(root, 'site/releases.json'), 'utf8'));
@@ -479,6 +483,125 @@ function assertSafeEmptyState() {
 
 
 const componentCatalog = JSON.parse(fs.readFileSync(path.join(root, 'components/catalog.json'), 'utf8'));
+componentCatalog.catalog_version = '2026.07.21';
+
+function packageRecord(id, packageName, overrides = {}) {
+  return {
+    id,
+    package: packageName,
+    version: '1.0.0-r1',
+    description: 'Official package fixture',
+    feed: 'luci',
+    installed_size: 4096,
+    category: 'network',
+    arch: 'x86_64',
+    risk: 'standard',
+    selectable: true,
+    blocked_reason: '',
+    ...overrides,
+  };
+}
+
+function makePackageShard(target, flavor, packages) {
+  return {
+    schema_version: 1,
+    catalog_version: componentCatalog.catalog_version,
+    target,
+    flavor,
+    packages,
+  };
+}
+
+async function digestText(value) {
+  const digest = await webcrypto.subtle.digest('SHA-256', new TextEncoder().encode(value));
+  return Buffer.from(digest).toString('hex');
+}
+
+function shardSources(feeds) {
+  return feeds.map((feed) => ({
+    feed,
+    url: feed === 'base'
+      ? 'https://github.com/openwrt/openwrt'
+      : `https://github.com/openwrt/${feed}`,
+    sha256: 'a'.repeat(64),
+  }));
+}
+
+async function makePackageCatalogFixtures() {
+  const x86Packages = [
+    packageRecord('pkg-firewall-plus', 'luci-app-firewall-plus', {
+      description: 'filter-probe <img src=x onerror=alert(1)>',
+      installed_size: 1536,
+    }),
+    packageRecord('pkg-storage-extra', 'block-mount-extra', {
+      description: 'filter-probe storage helper',
+      feed: 'packages',
+      installed_size: 2 * 1024 * 1024,
+      category: 'storage',
+      risk: 'advanced',
+    }),
+    packageRecord('pkg-system-core', 'kernel-system-core', {
+      description: 'filter-probe protected system package',
+      feed: 'base',
+      installed_size: 8192,
+      category: 'system',
+      risk: 'system',
+      selectable: false,
+      blocked_reason: '由基础镜像固定 / Pinned by base image',
+    }),
+  ];
+  for (let index = 0; index < 147; index += 1) {
+    const serial = String(index).padStart(3, '0');
+    x86Packages.push(packageRecord(`pkg-demo-${serial}`, `luci-app-demo-${serial}`, {
+      description: `demo-search package ${serial}`,
+      feed: index % 2 ? 'packages' : 'luci',
+      category: index % 3 ? 'services' : 'network',
+      risk: index % 5 ? 'standard' : 'advanced',
+      installed_size: 1024 + index,
+    }));
+  }
+  const shards = [
+    makePackageShard('x86_64', 'official', x86Packages),
+    makePackageShard('xiaomi_ax9000', 'official', [
+      packageRecord('pkg-ax-mesh', 'mesh11sd', { description: 'AX official mesh', feed: 'packages', arch: 'aarch64_cortex-a53' }),
+    ]),
+    makePackageShard('xiaomi_ax9000', 'nss', [
+      packageRecord('pkg-ax-nss-monitor', 'luci-app-nss-monitor', { description: 'AX NSS monitor', arch: 'noarch' }),
+    ]),
+  ];
+  const paths = [
+    'packages/x86_64-official.json',
+    'packages/xiaomi_ax9000-official.json',
+    'packages/xiaomi_ax9000-nss.json',
+  ];
+  const rawByPath = new Map();
+  const descriptors = [];
+  for (let index = 0; index < shards.length; index += 1) {
+    const shard = shards[index];
+    const raw = JSON.stringify(shard);
+    rawByPath.set(`components/${paths[index]}`, raw);
+    const feeds = [...new Set(shard.packages.map((record) => record.feed))].sort();
+    descriptors.push({
+      target: shard.target,
+      flavor: shard.flavor,
+      path: paths[index],
+      sha256: await digestText(raw),
+      package_count: shard.packages.length,
+      selectable_count: shard.packages.filter((record) => record.selectable).length,
+      sources: shardSources(feeds),
+    });
+  }
+  return {
+    root: {
+      schema_version: 1,
+      catalog_version: componentCatalog.catalog_version,
+      openwrt_version: '25.12.5',
+      shards: descriptors,
+    },
+    shards,
+    rawByPath,
+  };
+}
 
 async function loadCatalogWith(responseFactory, cryptoImpl = webcrypto) {
   context.fetch = responseFactory;
@@ -490,14 +613,79 @@ async function loadCatalogWith(responseFactory, cryptoImpl = webcrypto) {
   }
 }
 
+function fixtureFetch(fixtures, calls, rawOverride = new Map()) {
+  return async (url, options) => {
+    calls.push(url);
+    assert.equal(options.cache, 'no-store');
+    assert.equal(options.credentials, 'same-origin');
+    if (url === 'components/catalog.json') return { ok: true, json: async () => clone(componentCatalog) };
+    if (url === 'components/package-catalog.json') return { ok: true, json: async () => clone(fixtures.root) };
+    if (fixtures.rawByPath.has(url)) {
+      return { ok: true, text: async () => rawOverride.has(url) ? rawOverride.get(url) : fixtures.rawByPath.get(url) };
+    }
+    throw new Error(`unexpected fetch: ${url}`);
+  };
+}
+
 function flattenChildren(element) {
   const output = [];
   for (const child of element.children) output.push(child, ...flattenChildren(child));
   return output;
 }
 
+function flattenedText(selector) {
+  return flattenChildren(document.querySelector(selector)).map((item) => item.textContent).join(' ');
+}
+
+function packageOptions() {
+  return flattenChildren(document.querySelector('#component-list'))
+    .filter((item) => item.className.split(' ').includes('package-option'));
+}
+
+function backendResolution(target, flavor, requestedIds) {
+  const args = [path.join(root, 'scripts/resolve-components.py'), '--target', target, '--flavor', flavor];
+  for (const id of requestedIds) args.push('--component', id);
+  return JSON.parse(execFileSync('python3', args, { cwd: root, encoding: 'utf8' }));
+}
+
+async function assertFrontendBackendHashContract(target, flavor, requestedIds, packageRecords) {
+  setCurrentPackageRecords(packageRecords);
+  const frontend = resolveComponentSelection(componentCatalog, target, requestedIds);
+  assert.equal(frontend.ok, true, frontend.error);
+  const backend = backendResolution(target, flavor, requestedIds);
+  assert.deepEqual([...frontend.requested_components], backend.requested_components);
+  assert.deepEqual([...frontend.default_components], backend.default_components);
+  assert.deepEqual([...frontend.resolved_components], backend.resolved_components);
+  assert.deepEqual([...frontend.packages], backend.packages);
+  const frontendHash = await sha256Hex(canonicalJson(componentHashPayload(componentCatalog, target, flavor, frontend)));
+  assert.equal(frontendHash, backend.request_hash, `${target}/${flavor}: ${requestedIds.join(',') || '<defaults>'}`);
+}
+
 (async () => {
+  const packageFixtures = await makePackageCatalogFixtures();
   assert.equal(validateComponentCatalog(componentCatalog), true);
+  assert.equal(validatePackageCatalogRoot(packageFixtures.root, componentCatalog), true);
+  assert.equal(validatePackageCatalogShard(packageFixtures.shards[0], packageFixtures.root.shards[0], componentCatalog), true);
+  const invalidRoot = clone(packageFixtures.root);
+  invalidRoot.extra = true;
+  assert.equal(validatePackageCatalogRoot(invalidRoot, componentCatalog), false);
+  const invalidShard = clone(packageFixtures.shards[0]);
+  invalidShard.packages[0].unexpected = 'field';
+  assert.equal(validatePackageCatalogShard(invalidShard, packageFixtures.root.shards[0], componentCatalog), false);
+
+  const realPackageShards = {
+    'x86_64/official': JSON.parse(fs.readFileSync(path.join(root, 'components/packages/x86_64-official.json'), 'utf8')).packages,
+    'xiaomi_ax9000/official': JSON.parse(fs.readFileSync(path.join(root, 'components/packages/xiaomi_ax9000-official.json'), 'utf8')).packages,
+    'xiaomi_ax9000/nss': JSON.parse(fs.readFileSync(path.join(root, 'components/packages/xiaomi_ax9000-nss.json'), 'utf8')).packages,
+  };
+  const sqmPackageId = realPackageShards['x86_64/official'].find((record) => record.package === 'luci-app-sqm').id;
+  await assertFrontendBackendHashContract('x86_64', 'official', [], realPackageShards['x86_64/official']);
+  await assertFrontendBackendHashContract('x86_64', 'official', ['wireguard'], realPackageShards['x86_64/official']);
+  await assertFrontendBackendHashContract('x86_64', 'official', [sqmPackageId], realPackageShards['x86_64/official']);
+  await assertFrontendBackendHashContract('x86_64', 'official', ['wireguard', sqmPackageId], realPackageShards['x86_64/official']);
+  await assertFrontendBackendHashContract('xiaomi_ax9000', 'official', [sqmPackageId], realPackageShards['xiaomi_ax9000/official']);
+  await assertFrontendBackendHashContract('xiaomi_ax9000', 'nss', [sqmPackageId], realPackageShards['xiaomi_ax9000/nss']);
+
   const invalidCatalog = clone(componentCatalog);
   invalidCatalog.components.find((item) => item.id === 'wireguard').depends = ['missing-component'];
   assert.equal(validateComponentCatalog(invalidCatalog), false);
@@ -520,58 +708,155 @@ function flattenChildren(element) {
   assert.equal(resolveComponentSelection(componentCatalog, 'xiaomi_ax9000', ['pppoe-server']).ok, false);
 
   const hashPayload = componentHashPayload(componentCatalog, 'x86_64', 'official', dependencySelection);
-  assert.equal(canonicalJson(hashPayload), '{"catalog_version":"2026.07.20","components":["diagnostic-tools","web-ui","wireguard"],"flavor":"official","packages":["ca-bundle","curl","ethtool","iperf3","kmod-wireguard","luci-app-firewall","luci-base","luci-proto-wireguard","luci-ssl","tcpdump","wireguard-tools"],"schema_version":1,"target":"x86_64"}');
+  assert.equal(canonicalJson(hashPayload), '{"catalog_version":"2026.07.21","default_components":["diagnostic-tools","web-ui"],"flavor":"official","packages":["ca-bundle","curl","ethtool","iperf3","kmod-wireguard","luci-app-firewall","luci-base","luci-proto-wireguard","luci-ssl","tcpdump","wireguard-tools"],"requested_components":["wireguard"],"resolved_components":["diagnostic-tools","web-ui","wireguard"],"schema_version":1,"target":"x86_64"}');
   const normalizedHash = await sha256Hex(canonicalJson(hashPayload));
-  assert.equal(normalizedHash, '2aeca1c0914e74fa52c7e7748a5e3870e510a91883b1f647312addf678f966cf');
+  assert.equal(normalizedHash, 'f970820f02af793d85983ce99376ac9d3df0e74c293a0a3810d6927d607746fb');
   const normalized = normalizedBuildRequest(componentCatalog, 'official', dependencySelection, normalizedHash);
-  assert.match(actionsInputs(normalized), /^target=x86_64\nflavor=official\ncomponents=wireguard\ncatalog_version=2026\.07\.20\nrequest_hash=2aeca1c0914e74fa52c7e7748a5e3870e510a91883b1f647312addf678f966cf$/);
+  assert.match(actionsInputs(normalized), /^target=x86_64\nflavor=official\ncomponents=wireguard\ncatalog_version=2026\.07\.21\nrequest_hash=f970820f02af793d85983ce99376ac9d3df0e74c293a0a3810d6927d607746fb$/);
 
   const delayedCrypto = {
     subtle: {
       async digest(...args) {
-        await new Promise((resolve) => setTimeout(resolve, 50));
+        await new Promise((resolve) => setTimeout(resolve, 5));
         return webcrypto.subtle.digest(...args);
       },
     },
   };
-  await loadCatalogWith(async (url, options) => {
-    assert.equal(url, 'components/catalog.json');
-    assert.equal(options.cache, 'no-store');
-    assert.equal(options.credentials, 'same-origin');
-    return { ok: true, json: async () => clone(componentCatalog) };
-  }, delayedCrypto);
+  const initialCalls = [];
+  await loadCatalogWith(fixtureFetch(packageFixtures, initialCalls), delayedCrypto);
+  assert.deepEqual(initialCalls, [
+    'components/catalog.json',
+    'components/package-catalog.json',
+    'components/packages/x86_64-official.json',
+  ]);
   assert.equal(document.querySelector('#component-status').classList.contains('error'), false);
+  assert.equal(document.querySelector('#component-package-status').classList.contains('error'), false);
+  assert.match(document.querySelector('#component-package-status').textContent, /OpenWrt 25\.12\.5/);
+  assert.match(document.querySelector('#component-package-status').textContent, /150 个官方包，149 个可选择/);
   assert.equal(document.querySelector('#component-target').disabled, false);
   assert.equal(document.querySelector('#component-target').value, 'x86_64');
   assert.equal(document.querySelector('#component-flavor').value, 'official');
+  assert.equal(getCurrentPackageRecords().length, 150);
+  const selectableOfficialPackages = getCurrentPackageRecords().filter((record) => record.selectable);
+  const maximumOfficialPackages = selectableOfficialPackages.slice(0, componentCatalog.max_selected_components).map((record) => record.id);
+  assert.equal(resolveComponentSelection(componentCatalog, 'x86_64', maximumOfficialPackages).ok, true);
+  const tooManyOfficialPackages = selectableOfficialPackages.slice(0, componentCatalog.max_selected_components + 1).map((record) => record.id);
+  assert.equal(resolveComponentSelection(componentCatalog, 'x86_64', tooManyOfficialPackages).ok, false);
+  assert.match(resolveComponentSelection(componentCatalog, 'x86_64', tooManyOfficialPackages).error, new RegExp(`最多可显式选择 ${componentCatalog.max_selected_components} 个组件`));
   assert.deepEqual([...getRequestedComponentIds()], []);
   assert.deepEqual([...getResolvedComponentIds()].sort(), ['diagnostic-tools', 'web-ui']);
   assert.match(document.querySelector('#component-request-hash').textContent, /^sha256:[a-f0-9]{64}$/);
   assert.equal(document.querySelector('#custom-build-workflow-link').href, 'https://github.com/tifycloud/NexaWrt/actions/workflows/custom-build.yml');
   assert.equal(document.querySelector('#custom-build-workflow-link').hidden, false);
   assert.match(document.querySelector('#component-actions-inputs').textContent, /components=\n/);
+  assert.equal(packageOptions().length, 0);
+  assert.match(document.querySelector('#component-result-status').textContent, /输入关键词后搜索官方包/);
+  assert.match(flattenedText('#component-list'), /精选套餐/);
 
-  changeComponentSelection('sqm', true);
-  await new Promise((resolve) => setTimeout(resolve, 20));
-  assert.equal(getRequestedComponentIds().includes('sqm'), true);
-  changeComponentSelection('qosify', true);
-  await new Promise((resolve) => setTimeout(resolve, 20));
-  assert.equal(getRequestedComponentIds().includes('qosify'), false);
+  document.querySelector('#component-search').value = 'demo-search';
+  renderComponentChoices();
+  assert.equal(packageOptions().length, 100);
+  assert.match(document.querySelector('#component-result-status').textContent, /命中 147 条，只显示前 100 条/);
+  assert.match(flattenedText('#component-list'), /只显示前 100 条/);
+
+  document.querySelector('#component-source').value = 'official';
+  document.querySelector('#component-search').value = 'filter-probe';
+  document.querySelector('#component-category').value = 'network';
+  document.querySelector('#component-risk').value = 'standard';
+  document.querySelector('#component-feed').value = 'luci';
+  renderComponentChoices();
+  const filteredText = flattenedText('#component-list');
+  assert.match(filteredText, /luci-app-firewall-plus/);
+  assert.doesNotMatch(filteredText, /block-mount-extra/);
+  assert.doesNotMatch(filteredText, /kernel-system-core/);
+  assert.match(filteredText, /1\.5 KiB/);
+  assert.match(filteredText, /standard/);
+  assert.match(filteredText, /<img src=x onerror=alert\(1\)>/);
+  assert.equal(flattenChildren(document.querySelector('#component-list')).some((item) => item.tagName === 'img'), false);
+
+  document.querySelector('#component-category').value = '';
+  document.querySelector('#component-risk').value = 'system';
+  document.querySelector('#component-feed').value = 'base';
+  renderComponentChoices();
+  const blockedOption = packageOptions()[0];
+  assert.equal(blockedOption.children[0].disabled, true);
+  assert.match(flattenedText('#component-list'), /由基础镜像固定/);
+
+  document.querySelector('#component-risk').value = 'standard';
+  document.querySelector('#component-feed').value = 'luci';
+  await changeComponentSelection('pkg-firewall-plus', true);
+  assert.equal(getRequestedComponentIds().includes('pkg-firewall-plus'), true);
+  assert.match(document.querySelector('#component-packages').textContent, /luci-app-firewall-plus/);
+  assert.match(document.querySelector('#component-normalized').textContent, /"pkg-firewall-plus"/);
+  assert.match(document.querySelector('#component-actions-inputs').textContent, /components=pkg-firewall-plus/);
+  assert.match(flattenedText('#component-selected-official'), /luci-app-firewall-plus/);
+
+  const conflictPrevious = [...getRequestedComponentIds()];
+  await changeComponentSelection('sqm', true);
+  await changeComponentSelection('qosify', true);
+  assert.deepEqual([...getRequestedComponentIds()].sort(), [...conflictPrevious, 'sqm'].sort());
   assert.equal(document.querySelector('#component-error').classList.contains('error'), true);
   assert.match(document.querySelector('#component-error').textContent, /组件冲突/);
 
-  document.querySelector('#component-search').value = 'p910nd';
-  renderComponentChoices();
-  const visibleText = flattenChildren(document.querySelector('#component-list')).map((item) => item.textContent).join(' ');
-  assert.match(visibleText, /USB 打印服务/);
-  assert.doesNotMatch(visibleText, /SQM 智能队列/);
-  document.querySelector('#component-search').value = '';
+  document.querySelector('#component-target').value = 'xiaomi_ax9000';
+  document.querySelector('#component-target').dispatchEvent({ type: 'change' });
+  await new Promise((resolve) => setTimeout(resolve, 30));
+  assert.equal(getRequestedComponentIds().includes('pkg-firewall-plus'), false);
+  assert.deepEqual([...getCurrentPackageRecords()].map((record) => record.id), ['pkg-ax-mesh']);
+  assert.equal(initialCalls.includes('components/packages/xiaomi_ax9000-official.json'), true);
+  document.querySelector('#component-flavor').value = 'nss';
+  document.querySelector('#component-flavor').dispatchEvent({ type: 'change' });
+  await new Promise((resolve) => setTimeout(resolve, 30));
+  assert.deepEqual([...getCurrentPackageRecords()].map((record) => record.id), ['pkg-ax-nss-monitor']);
+  assert.equal(initialCalls.includes('components/packages/xiaomi_ax9000-nss.json'), true);
+  document.querySelector('#component-target').value = 'x86_64';
+  document.querySelector('#component-target').dispatchEvent({ type: 'change' });
+  await new Promise((resolve) => setTimeout(resolve, 30));
+  assert.equal(getCurrentPackageRecords().length, 150);
+  assert.equal(initialCalls.filter((url) => url === 'components/packages/x86_64-official.json').length, 1);
+
+  clearVerifiedPackageShardCache();
+  context.crypto = delayedCrypto;
+  document.querySelector('#component-target').value = 'xiaomi_ax9000';
+  document.querySelector('#component-target').dispatchEvent({ type: 'change' });
+  document.querySelector('#component-target').value = 'x86_64';
+  document.querySelector('#component-target').dispatchEvent({ type: 'change' });
+  await new Promise((resolve) => setTimeout(resolve, 80));
+  context.crypto = webcrypto;
+  assert.equal(document.querySelector('#component-target').value, 'x86_64');
+  assert.equal(getCurrentPackageRecords().length, 150);
+  assert.match(document.querySelector('#component-package-status').textContent, /10947|150/);
+
+  clearVerifiedPackageShardCache();
+  const mismatchCalls = [];
+  const tampered = new Map([[
+    'components/packages/x86_64-official.json',
+    `${packageFixtures.rawByPath.get('components/packages/x86_64-official.json')} `,
+  ]]);
+  await loadCatalogWith(fixtureFetch(packageFixtures, mismatchCalls, tampered));
+  assert.equal(document.querySelector('#component-package-status').classList.contains('error'), true);
+  assert.match(document.querySelector('#component-package-status').textContent, /官方包校验失败/);
+  assert.equal(getCurrentPackageRecords().length, 0);
+  assert.equal(document.querySelector('#custom-build-workflow-link').hidden, false);
+  assert.deepEqual([...getResolvedComponentIds()].sort(), ['diagnostic-tools', 'web-ui']);
+
+  await loadCatalogWith(async (url, options) => {
+    assert.equal(options.cache, 'no-store');
+    assert.equal(options.credentials, 'same-origin');
+    if (url === 'components/catalog.json') return { ok: true, json: async () => clone(componentCatalog) };
+    if (url === 'components/package-catalog.json') return { ok: false, status: 503, json: async () => ({}) };
+    throw new Error(`unexpected fetch: ${url}`);
+  });
+  assert.equal(document.querySelector('#component-package-status').classList.contains('error'), true);
+  assert.equal(document.querySelector('#custom-build-workflow-link').hidden, false);
+  assert.match(flattenedText('#component-list'), /精选套餐/);
 
   await loadCatalogWith(async () => ({ ok: true, json: async () => ({ schema_version: 999 }) }));
   assert.equal(document.querySelector('#component-status').classList.contains('error'), true);
   assert.equal(document.querySelector('#custom-build-workflow-link').hidden, true);
   assert.equal(document.querySelector('#custom-build-workflow-link').href, undefined);
   assert.equal(document.querySelector('#copy-actions-inputs').disabled, true);
+
 
   const configForm = document.querySelector('#config-form');
   const configOutput = document.querySelector('#config-output');
