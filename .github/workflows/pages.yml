@@ -8,9 +8,13 @@ on:
       - 'components/**'
       - 'tests/test_pages_ui.js'
       - 'tests/test_pages_policy.sh'
+      - 'tests/test_component_catalog_staging.py'
       - 'devices/**'
       - 'scripts/device_metadata.py'
       - 'scripts/generate-pages-data.py'
+      - 'scripts/component_package_policy.py'
+      - 'scripts/resolve-components.py'
+      - 'scripts/validate-component-catalogs.py'
       - 'scripts/verify-pages-releases.py'
       - 'scripts/verify-vm-esxi-evidence.py'
       - 'schemas/vm-esxi-evidence.schema.json'
@@ -76,19 +80,21 @@ jobs:
             echo 'The Pages artifact must not contain symbolic or hard links.' >&2
             exit 1
           fi
-      - name: Stage component catalog for Pages
+      - name: Validate and stage component catalogs for Pages
         run: |
           set -euo pipefail
-          test -f components/catalog.json
-          test ! -L components/catalog.json
-          mkdir -p site/components
-          cp components/catalog.json site/components/catalog.json
-          python3 -m json.tool site/components/catalog.json >/dev/null
-          test ! -L site/components/catalog.json
+          python3 scripts/validate-component-catalogs.py \
+            --components-root components \
+            --site-root site/components
+          if find site/components \( -type l -o -type f -links +1 \) -print -quit | grep -q .; then
+            echo 'The staged component catalogs must not contain symbolic or hard links.' >&2
+            exit 1
+          fi
       - name: Test Pages UI and policy
         run: |
           set -euo pipefail
           node tests/test_pages_ui.js
+          python3 tests/test_component_catalog_staging.py
           bash tests/test_pages_policy.sh
       - name: Configure GitHub Pages
         uses: actions/configure-pages@45bfe0192ca1faeb007ade9deae92b16b8254a0d # v6.0.0

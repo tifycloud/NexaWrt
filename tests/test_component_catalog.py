@@ -47,8 +47,8 @@ def expect_request_rejected(
 
 catalog = resolver.load_catalog()
 assert catalog["schema_version"] == 1
-assert catalog["catalog_version"] == "2026.07.20"
-assert catalog["max_selected_components"] == 8
+assert catalog["catalog_version"] == "2026.07.21"
+assert catalog["max_selected_components"] == 32
 assert {target["id"] for target in catalog["targets"]} >= {
     "x86_64",
     "xiaomi_ax9000",
@@ -75,8 +75,14 @@ assert "CONFIG_TARGET_x86_64_DEVICE_generic=y\n" in x86["kconfig_fragment"]
 assert "CONFIG_PACKAGE_kmod-wireguard=y\n" in x86["kconfig_fragment"]
 assert len(x86["request_hash"]) == 64
 assert set(x86["request_hash"]) <= set("0123456789abcdef")
-assert x86["request_hash"] == "2aeca1c0914e74fa52c7e7748a5e3870e510a91883b1f647312addf678f966cf"
+assert x86["request_hash"] == "f970820f02af793d85983ce99376ac9d3df0e74c293a0a3810d6927d607746fb"
 assert json.loads(json.dumps(x86, ensure_ascii=False, sort_keys=True)) == x86
+explicit_default = resolver.resolve_components(
+    catalog, "x86_64", "official", ["wireguard", "web-ui"]
+)
+assert explicit_default["resolved_components"] == x86["resolved_components"]
+assert explicit_default["packages"] == x86["packages"]
+assert explicit_default["request_hash"] != x86["request_hash"]
 
 ax9000 = resolver.resolve_components(catalog, "xiaomi_ax9000", "official", [])
 assert ax9000["default_components"] == ["web-ui"]
@@ -114,36 +120,25 @@ expect_request_rejected(catalog, "x86_64", ["not-in-catalog"], "unknown-componen
 expect_request_rejected(catalog, "x86_64", ["wireguard", "wireguard"], "duplicate")
 expect_request_rejected(catalog, "x86_64", ["sqm", "qosify"], "conflict")
 expect_request_rejected(catalog, "xiaomi_ax9000", ["pppoe-server"], "unsupported-target")
+package_catalog = resolver.load_package_catalog_index(catalog)
+x86_package_shard = resolver.load_package_shard(
+    package_catalog, catalog, "x86_64", "official"
+)
+selectable_package_ids = [
+    item["id"] for item in x86_package_shard["packages"] if item["selectable"]
+]
+assert len(selectable_package_ids) > 33
 expect_request_rejected(
     catalog,
     "x86_64",
-    [
-        "web-ui",
-        "diagnostic-tools",
-        "wireguard",
-        "sqm",
-        "adblock",
-        "usb-storage",
-        "ksmbd",
-        "pppoe-server",
-        "usb-printer",
-    ],
-    "too-many-explicit-selections",
+    selectable_package_ids[:33],
+    "too-many-explicit-bundle-and-package-selections",
 )
-expect_request_rejected(
-    catalog,
-    "x86_64",
-    [
-        "wireguard",
-        "sqm",
-        "adblock",
-        "usb-storage",
-        "ksmbd",
-        "pppoe-server",
-        "usb-printer",
-    ],
-    "too-many-after-defaults-and-dependencies",
+accepted_maximum = resolver.resolve_components(
+    catalog, "x86_64", "official", selectable_package_ids[:32]
 )
+assert len(accepted_maximum["requested_components"]) == 32
+
 expect_request_rejected(catalog, "x86_64", ["curl;touch-/tmp/pwned"], "shell-like-input")
 try:
     resolver.resolve_components(catalog, "x86_64", "official", "wireguard")

@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
-  "catalog_version": "2026.07.20",
-  "max_selected_components": 8,
+  "catalog_version": "2026.07.21",
+  "max_selected_components": 32,
   "targets": [
     {
       "id": "x86_64",
@@ -48,6 +48,54 @@
       "title": "存储支持",
       "description": "USB 存储、文件系统和磁盘工具。",
       "order": 50
+    },
+    {
+      "id": "official-target",
+      "title": "目标专用包",
+      "description": "OpenWrt 官方目标仓库中的设备与平台专用包。",
+      "order": 110
+    },
+    {
+      "id": "official-base",
+      "title": "官方基础包",
+      "description": "OpenWrt 官方 base 仓库中的基础系统与网络包。",
+      "order": 120
+    },
+    {
+      "id": "official-kernel",
+      "title": "官方内核模块",
+      "description": "与目标内核 ABI 匹配的 OpenWrt 官方 kmod 包。",
+      "order": 130
+    },
+    {
+      "id": "official-luci",
+      "title": "LuCI 应用",
+      "description": "OpenWrt 官方 LuCI Web 管理应用与协议支持。",
+      "order": 140
+    },
+    {
+      "id": "official-packages",
+      "title": "官方应用包",
+      "description": "OpenWrt 官方 packages feed 中的用户空间应用。",
+      "order": 150
+    },
+    {
+      "id": "official-routing",
+      "title": "路由协议",
+      "description": "OpenWrt 官方 routing feed 中的路由协议与工具。",
+      "order": 160
+    },
+    {
+      "id": "official-telephony",
+      "title": "通信与语音",
+      "description": "OpenWrt 官方 telephony feed 中的通信组件。",
+      "order": 170
+    },
+    {
+      "id": "official-video",
+      "title": "视频与媒体",
+      "description": "OpenWrt 官方 video feed 中的视频和媒体组件。",
+      "order": 180
     }
   ],
   "components": [
