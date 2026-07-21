@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "catalog_version": "2026.07.21",
+  "catalog_version": "2026.07.21.1",
   "max_selected_components": 32,
   "targets": [
     {
@@ -96,6 +96,12 @@
       "title": "视频与媒体",
       "description": "OpenWrt 官方 video feed 中的视频和媒体组件。",
       "order": 180
+    },
+    {
+      "id": "community-kiddin9",
+      "title": "社区候选库 / kiddin9（未审核）",
+      "description": "仅展示锁定元数据中的未审核候选；全部不可选，不进入构建请求，不克隆或执行社区 feed。",
+      "order": 190
     }
   ],
   "components": [

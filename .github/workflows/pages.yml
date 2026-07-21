@@ -6,11 +6,14 @@ on:
     paths:
       - 'site/**'
       - 'components/**'
+      - 'manifests/community-feeds.lock'
       - 'tests/test_pages_ui.js'
+      - 'tests/test_package_catalog.py'
       - 'tests/test_pages_policy.sh'
       - 'tests/test_component_catalog_staging.py'
       - 'devices/**'
       - 'scripts/device_metadata.py'
+      - 'scripts/generate-package-catalog.py'
       - 'scripts/generate-pages-data.py'
       - 'scripts/component_package_policy.py'
       - 'scripts/resolve-components.py'
@@ -94,6 +97,7 @@ jobs:
         run: |
           set -euo pipefail
           node tests/test_pages_ui.js
+          python3 tests/test_package_catalog.py
           python3 tests/test_component_catalog_staging.py
           bash tests/test_pages_policy.sh
       - name: Configure GitHub Pages

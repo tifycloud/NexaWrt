@@ -1,0 +1,10 @@
+# shellcheck shell=sh
+# Metadata is intentionally marked unsigned and is used only to populate the UI catalog.
+# The Git commit below identifies the candidate source snapshot only; production builds do not clone or execute it, and never use dl.openwrt.ai IPK files.
+KIDDIN9_FEED="kiddin9"
+KIDDIN9_REPO="https://github.com/kiddin9/op-packages.git"
+KIDDIN9_COMMIT="9f2092b4f204fc9948226d9a3f5166b69976af48"
+KIDDIN9_PACKAGES_URL="https://dl.openwrt.ai/releases/25.12/packages/aarch64_cortex-a53/kiddin9/Packages.gz"
+KIDDIN9_PACKAGES_SHA256="ce97a429f7fcd414a22b3ad701118d5299319a84add12c26d401216184c8bd04"
+KIDDIN9_PACKAGES_SIGNED="0"
+KIDDIN9_CATALOG_SHA256="4b14b36b0c9839f81bb6a56ffc1ac94384603c7a9c93e7f63ac48ffc4c699292"

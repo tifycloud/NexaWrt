@@ -25,7 +25,7 @@ if str(SCRIPT_DIR) not in sys.path:
 
 from component_package_policy import (
     allowed_architectures_for,
-    blocked_reason_for,
+    blocked_reason_for_record,
     risk_for,
 )
 
@@ -33,13 +33,15 @@ ROOT = Path(__file__).resolve().parent.parent
 CATALOG_PATH = ROOT / "components" / "catalog.json"
 PACKAGE_CATALOG_PATH = ROOT / "components" / "package-catalog.json"
 PACKAGE_SHARD_ROOT = ROOT / "components" / "packages"
+COMMUNITY_LOCK_PATH = ROOT / "manifests" / "community-feeds.lock"
 OPENWRT_VERSION = "25.12.5"
-REQUEST_SCHEMA_VERSION = 1
+REQUEST_SCHEMA_VERSION = 2
 REQUIRED_TARGETS = {"x86_64", "xiaomi_ax9000"}
 ALLOWED_FLAVORS = {"official", "nss"}
 MAX_COMPONENT_CATALOG_BYTES = 2 * 1024 * 1024
 MAX_PACKAGE_CATALOG_BYTES = 2 * 1024 * 1024
 MAX_PACKAGE_SHARD_BYTES = 16 * 1024 * 1024
+MAX_COMMUNITY_LOCK_BYTES = 16 * 1024
 IO_CHUNK_SIZE = 1024 * 1024
 NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
 DIRECTORY = getattr(os, "O_DIRECTORY", 0)
@@ -76,19 +78,26 @@ ID_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
 OPENWRT_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")
 CATALOG_VERSION_RE = re.compile(r"^[0-9]{4}\.[0-9]{2}\.[0-9]{2}(?:\.[0-9]+)?$")
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+GIT_COMMIT_RE = re.compile(r"^[0-9a-f]{40}$")
+LOCK_LINE_RE = re.compile(r'^([A-Z][A-Z0-9_]*)="([^"\\]*)"$')
 PACKAGE_ID_RE = re.compile(r"^pkg-[0-9a-f]{16}$")
 PACKAGE_SHARD_PATH_RE = re.compile(r"^components/packages/[a-z0-9][a-z0-9_-]{0,63}\.json$")
 PACKAGE_CATALOG_KEYS = {"schema_version", "catalog_version", "openwrt_version", "shards"}
 PACKAGE_DESCRIPTOR_KEYS = {
     "target", "flavor", "path", "sha256", "package_count", "selectable_count", "sources"
 }
-PACKAGE_SOURCE_KEYS = {"feed", "url", "sha256"}
+OFFICIAL_PACKAGE_SOURCE_KEYS = {"feed", "url", "sha256"}
+COMMUNITY_PACKAGE_SOURCE_KEYS = {
+    "feed", "url", "sha256", "metadata_format", "metadata_signed",
+    "candidate_repository", "candidate_commit", "catalog_sha256",
+}
 PACKAGE_SHARD_KEYS = {"schema_version", "catalog_version", "target", "flavor", "packages"}
 PACKAGE_RECORD_KEYS = {
-    "id", "package", "version", "description", "feed", "installed_size", "category",
+    "id", "package", "version", "description", "feed", "source", "installed_size", "category",
     "arch", "risk", "selectable", "blocked_reason"
 }
 PACKAGE_FEEDS = {"target", "base", "kmods", "luci", "packages", "routing", "telephony", "video"}
+COMMUNITY_FEED = "kiddin9"
 PACKAGE_FEED_CATEGORIES = {
     "target": "official-target",
     "base": "official-base",
@@ -98,6 +107,7 @@ PACKAGE_FEED_CATEGORIES = {
     "routing": "official-routing",
     "telephony": "official-telephony",
     "video": "official-video",
+    COMMUNITY_FEED: "community-kiddin9",
 }
 EXPECTED_PACKAGE_SHARDS = {
     ("x86_64", "official"): "components/packages/x86_64-official.json",
@@ -436,6 +446,98 @@ def _load_repository_json(
             os.close(parent_fd)
 
 
+def _load_repository_text(
+    path: Path, expected_parent: Path, context: str, maximum_bytes: int
+) -> str:
+    """Open and decode one bounded repository text file without following links."""
+    if path.parent != expected_parent or path.name in {"", ".", ".."}:
+        raise CatalogError(f"{context} is outside its repository allow-list")
+    parent_fd: int | None = None
+    descriptor: int | None = None
+    try:
+        parent_fd = os.open(expected_parent, os.O_RDONLY | DIRECTORY | NOFOLLOW)
+        parent_info = os.fstat(parent_fd)
+        if not stat.S_ISDIR(parent_info.st_mode):
+            raise CatalogError(f"{context} parent must be a real directory")
+        descriptor = os.open(path.name, os.O_RDONLY | NOFOLLOW, dir_fd=parent_fd)
+        info = os.fstat(descriptor)
+        if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+            raise CatalogError(f"{context} must be a regular, single-link file")
+        if info.st_size > maximum_bytes:
+            raise CatalogError(f"{context} exceeds the {maximum_bytes}-byte limit")
+        chunks: list[bytes] = []
+        total = 0
+        while True:
+            chunk = os.read(descriptor, min(IO_CHUNK_SIZE, maximum_bytes - total + 1))
+            if not chunk:
+                break
+            total += len(chunk)
+            if total > maximum_bytes:
+                raise CatalogError(f"{context} exceeds the {maximum_bytes}-byte limit")
+            chunks.append(chunk)
+        return b"".join(chunks).decode("utf-8")
+    except CatalogError:
+        raise
+    except (OSError, UnicodeError) as error:
+        raise CatalogError(f"unable to load {context}: {error}") from error
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+        if parent_fd is not None:
+            os.close(parent_fd)
+
+
+def _read_community_lock() -> dict[str, str]:
+    text = _load_repository_text(
+        COMMUNITY_LOCK_PATH, ROOT / "manifests", "community feed lock",
+        MAX_COMMUNITY_LOCK_BYTES,
+    )
+    values: dict[str, str] = {}
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        match = LOCK_LINE_RE.fullmatch(line)
+        if not match:
+            raise CatalogError(f"unsupported community lock syntax: {line!r}")
+        key, value = match.groups()
+        if key in values:
+            raise CatalogError(f"duplicate community lock key: {key}")
+        values[key] = value
+    required = {
+        "KIDDIN9_FEED", "KIDDIN9_REPO", "KIDDIN9_COMMIT",
+        "KIDDIN9_PACKAGES_URL", "KIDDIN9_PACKAGES_SHA256",
+        "KIDDIN9_PACKAGES_SIGNED", "KIDDIN9_CATALOG_SHA256",
+    }
+    if set(values) != required:
+        raise CatalogError("community feed lock schema mismatch")
+    if values["KIDDIN9_FEED"] != COMMUNITY_FEED:
+        raise CatalogError("unexpected community feed name in lock")
+    if values["KIDDIN9_REPO"] != "https://github.com/kiddin9/op-packages.git":
+        raise CatalogError("unexpected community repository in lock")
+    if not GIT_COMMIT_RE.fullmatch(values["KIDDIN9_COMMIT"]):
+        raise CatalogError("invalid community commit in lock")
+    _community_packages_url(values["KIDDIN9_PACKAGES_URL"], "community lock URL")
+    if not SHA256_RE.fullmatch(values["KIDDIN9_PACKAGES_SHA256"]):
+        raise CatalogError("invalid community metadata SHA256 in lock")
+    if values["KIDDIN9_PACKAGES_SIGNED"] != "0":
+        raise CatalogError("community metadata must remain explicitly unsigned")
+    if not SHA256_RE.fullmatch(values["KIDDIN9_CATALOG_SHA256"]):
+        raise CatalogError("invalid community catalog projection SHA256 in lock")
+    return values
+
+
+def _community_catalog_sha256(records: list[dict[str, Any]]) -> str:
+    ordered = sorted(
+        records,
+        key=lambda item: (item["package"], item["source"], item["version"], item["id"]),
+    )
+    payload = json.dumps(
+        ordered, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
 def _official_packages_url(value: Any, context: str) -> str:
     value = _nonempty_text(value, context, 500)
     parsed = urllib.parse.urlsplit(value)
@@ -457,17 +559,29 @@ def _official_packages_url(value: Any, context: str) -> str:
     return urllib.parse.urlunsplit(parsed)
 
 
+def _community_packages_url(value: Any, context: str) -> str:
+    value = _nonempty_text(value, context, 500)
+    expected = (
+        "https://dl.openwrt.ai/releases/25.12/packages/"
+        "aarch64_cortex-a53/kiddin9/Packages.gz"
+    )
+    if value != expected:
+        raise CatalogError(f"{context} is not the locked kiddin9 metadata URL")
+    return value
+
+
 def validate_package_catalog_index(payload: Any, catalog: dict[str, Any]) -> dict[str, Any]:
     """Validate the exact package-catalog root index."""
     if not isinstance(payload, dict):
         raise CatalogError("package catalog root must be an object")
     _exact_keys(payload, PACKAGE_CATALOG_KEYS, "package catalog")
-    if type(payload["schema_version"]) is not int or payload["schema_version"] != 1:
-        raise CatalogError("package catalog schema_version must be integer 1")
+    if type(payload["schema_version"]) is not int or payload["schema_version"] != 2:
+        raise CatalogError("package catalog schema_version must be integer 2")
     if payload["catalog_version"] != catalog["catalog_version"]:
         raise CatalogError("package catalog version differs from component catalog")
     if payload["openwrt_version"] != OPENWRT_VERSION:
         raise CatalogError(f"package catalog openwrt_version must be {OPENWRT_VERSION}")
+    community_lock = _read_community_lock()
 
     raw_shards = payload["shards"]
     if not isinstance(raw_shards, list) or len(raw_shards) != len(EXPECTED_PACKAGE_SHARDS):
@@ -510,11 +624,33 @@ def validate_package_catalog_index(payload: Any, catalog: dict[str, Any]) -> dic
             source_context = f"{context}.sources[{source_position}]"
             if not isinstance(source, dict):
                 raise CatalogError(f"{source_context} must be an object")
-            _exact_keys(source, PACKAGE_SOURCE_KEYS, source_context)
             feed = _identifier(source["feed"], f"{source_context}.feed")
-            if feed not in PACKAGE_FEEDS or feed in source_feeds:
+            if feed not in PACKAGE_FEEDS | {COMMUNITY_FEED} or feed in source_feeds:
                 raise CatalogError(f"{source_context}.feed is invalid or duplicated")
-            url = _official_packages_url(source["url"], f"{source_context}.url")
+            if feed == COMMUNITY_FEED:
+                _exact_keys(source, COMMUNITY_PACKAGE_SOURCE_KEYS, source_context)
+                if pair != ("xiaomi_ax9000", "official"):
+                    raise CatalogError("kiddin9 metadata is allowed only for AX9000 official")
+                url = _community_packages_url(source["url"], f"{source_context}.url")
+                if source["metadata_format"] != "opkg-packages-gzip":
+                    raise CatalogError(f"{source_context}.metadata_format is invalid")
+                if source["metadata_signed"] is not False:
+                    raise CatalogError(f"{source_context} must remain explicitly unsigned")
+                expected_community_source = {
+                    "feed": community_lock["KIDDIN9_FEED"],
+                    "url": community_lock["KIDDIN9_PACKAGES_URL"],
+                    "sha256": community_lock["KIDDIN9_PACKAGES_SHA256"],
+                    "metadata_format": "opkg-packages-gzip",
+                    "metadata_signed": False,
+                    "candidate_repository": community_lock["KIDDIN9_REPO"],
+                    "candidate_commit": community_lock["KIDDIN9_COMMIT"],
+                    "catalog_sha256": community_lock["KIDDIN9_CATALOG_SHA256"],
+                }
+                if source != expected_community_source:
+                    raise CatalogError(f"{source_context} differs from the reviewed community lock")
+            else:
+                _exact_keys(source, OFFICIAL_PACKAGE_SOURCE_KEYS, source_context)
+                url = _official_packages_url(source["url"], f"{source_context}.url")
             if url in source_urls:
                 raise CatalogError(f"duplicate package source URL: {url}")
             source_digest = _nonempty_text(source["sha256"], f"{source_context}.sha256", 64)
@@ -522,12 +658,13 @@ def validate_package_catalog_index(payload: Any, catalog: dict[str, Any]) -> dic
                 raise CatalogError(f"{source_context}.sha256 is invalid")
             source_feeds.add(feed)
             source_urls.add(url)
-            sources.append({"feed": feed, "url": url, "sha256": source_digest})
-        expected_feeds = (
-            {"base", "luci", "packages", "routing", "telephony", "video"}
-            if flavor == "nss"
-            else PACKAGE_FEEDS
-        )
+            sources.append(dict(source))
+        if pair == ("xiaomi_ax9000", "nss"):
+            expected_feeds = {"base", "luci", "packages", "routing", "telephony", "video"}
+        elif pair == ("xiaomi_ax9000", "official"):
+            expected_feeds = PACKAGE_FEEDS | {COMMUNITY_FEED}
+        else:
+            expected_feeds = PACKAGE_FEEDS
         if source_feeds != expected_feeds:
             raise CatalogError(f"{context}.sources feeds differ from the target/flavor contract")
         if pair in seen_pairs or path in seen_paths:
@@ -548,7 +685,7 @@ def validate_package_catalog_index(payload: Any, catalog: dict[str, Any]) -> dic
     if seen_pairs != set(EXPECTED_PACKAGE_SHARDS):
         raise CatalogError("package catalog is missing required target/flavor shards")
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "catalog_version": payload["catalog_version"],
         "openwrt_version": payload["openwrt_version"],
         "shards": descriptors,
@@ -572,8 +709,8 @@ def validate_package_shard(
     if not isinstance(payload, dict):
         raise CatalogError("package shard root must be an object")
     _exact_keys(payload, PACKAGE_SHARD_KEYS, "package shard")
-    if type(payload["schema_version"]) is not int or payload["schema_version"] != 1:
-        raise CatalogError("package shard schema_version must be integer 1")
+    if type(payload["schema_version"]) is not int or payload["schema_version"] != 2:
+        raise CatalogError("package shard schema_version must be integer 2")
     if payload["catalog_version"] != catalog["catalog_version"]:
         raise CatalogError("package shard version differs from component catalog")
     if payload["target"] != descriptor["target"] or payload["flavor"] != descriptor["flavor"]:
@@ -592,7 +729,12 @@ def validate_package_shard(
     )
     records: list[dict[str, Any]] = []
     seen_ids: set[str] = set()
-    seen_packages: set[str] = set()
+    seen_packages: set[tuple[str, str]] = set()
+    official_packages = frozenset(
+        raw.get("package")
+        for raw in raw_packages
+        if isinstance(raw, dict) and raw.get("source") == "official" and isinstance(raw.get("package"), str)
+    )
     selectable_count = 0
     for position, raw in enumerate(raw_packages):
         context = f"package shard packages[{position}]"
@@ -603,7 +745,12 @@ def validate_package_shard(
         if not PACKAGE_ID_RE.fullmatch(package_id) or package_id in bundle_ids:
             raise CatalogError(f"{context}.id is invalid")
         package = _openwrt_name(raw["package"], f"{context}.package")
-        expected_id = "pkg-" + hashlib.sha256(package.encode("utf-8")).hexdigest()[:16]
+        source = _identifier(raw["source"], f"{context}.source")
+        if source not in {"official", "kiddin9"}:
+            raise CatalogError(f"{context}.source is invalid")
+        expected_id = "pkg-" + hashlib.sha256(
+            (package if source == "official" else f"{source}\0{package}").encode("utf-8")
+        ).hexdigest()[:16]
         if package_id != expected_id:
             raise CatalogError(f"{context}.id does not match its package name")
         version = _nonempty_text(raw["version"], f"{context}.version", 160)
@@ -611,6 +758,12 @@ def validate_package_shard(
         feed = _identifier(raw["feed"], f"{context}.feed")
         if feed not in allowed_feeds:
             raise CatalogError(f"{context}.feed is not declared by the shard")
+        if (source == "kiddin9") != (feed == COMMUNITY_FEED):
+            raise CatalogError(f"{context}.source does not match its feed")
+        if source == "kiddin9" and (
+            descriptor["target"], descriptor["flavor"]
+        ) != ("xiaomi_ax9000", "official"):
+            raise CatalogError(f"{context} enables community packages outside AX9000 official")
         installed_size = raw["installed_size"]
         if type(installed_size) is not int or not 0 <= installed_size <= 2**63 - 1:
             raise CatalogError(f"{context}.installed_size is invalid")
@@ -629,7 +782,11 @@ def validate_package_shard(
         blocked_reason = _optional_text(
             raw["blocked_reason"], f"{context}.blocked_reason", 240
         )
-        expected_reason = blocked_reason_for(package)
+        expected_reason = blocked_reason_for_record(
+            package,
+            source,
+            duplicates_official=source == "kiddin9" and package in official_packages,
+        )
         expected_selectable = not expected_reason
         expected_risk = risk_for(package, feed)
         if blocked_reason != expected_reason:
@@ -644,10 +801,11 @@ def validate_package_shard(
             arch != "noarch" or feed in {"target", "kmods"}
         ):
             raise CatalogError(f"{context} violates the NSS userspace-only policy")
-        if package_id in seen_ids or package in seen_packages:
-            raise CatalogError(f"duplicate package record: {package}")
+        package_key = (source, package)
+        if package_id in seen_ids or package_key in seen_packages:
+            raise CatalogError(f"duplicate package record: {source}/{package}")
         seen_ids.add(package_id)
-        seen_packages.add(package)
+        seen_packages.add(package_key)
         selectable_count += int(selectable)
         records.append(
             {
@@ -656,6 +814,7 @@ def validate_package_shard(
                 "version": version,
                 "description": description,
                 "feed": feed,
+                "source": source,
                 "installed_size": installed_size,
                 "category": category,
                 "arch": arch,
@@ -664,13 +823,26 @@ def validate_package_shard(
                 "blocked_reason": blocked_reason,
             }
         )
-    expected_order = sorted(records, key=lambda item: (item["package"], item["version"], item["id"]))
+    expected_order = sorted(
+        records,
+        key=lambda item: (item["package"], item["source"], item["version"], item["id"]),
+    )
     if records != expected_order:
         raise CatalogError("package shard is not deterministically sorted")
+    community_source = next(
+        (source for source in descriptor["sources"] if source["feed"] == COMMUNITY_FEED),
+        None,
+    )
+    community_records = [record for record in records if record["source"] == "kiddin9"]
+    if community_source is None:
+        if community_records:
+            raise CatalogError("package shard contains undeclared community candidates")
+    elif _community_catalog_sha256(community_records) != community_source["catalog_sha256"]:
+        raise CatalogError("community candidate projection differs from its reviewed lock")
     if selectable_count != descriptor["selectable_count"]:
         raise CatalogError("package shard selectable_count differs from root index")
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "catalog_version": payload["catalog_version"],
         "target": payload["target"],
         "flavor": payload["flavor"],
@@ -787,7 +959,15 @@ def resolve_components(
     blocked = [package_index[item] for item in requested_packages if not package_index[item]["selectable"]]
     if blocked:
         details = [f"{item['package']}: {item['blocked_reason']}" for item in blocked]
-        raise RequestError(f"official package selection is blocked: {details}")
+        raise RequestError(f"package selection is blocked: {details}")
+
+    community_packages = sorted(
+        package_index[item]["package"]
+        for item in requested_packages
+        if package_index[item]["source"] == "kiddin9"
+    )
+    if community_packages and (target_id, flavor_id) != ("xiaomi_ax9000", "official"):
+        raise RequestError("community packages are supported only by AX9000 official builds")
 
     defaults = sorted(
         component["id"]
@@ -838,6 +1018,7 @@ def resolve_components(
         "default_components": defaults,
         "resolved_components": resolved_ids,
         "packages": packages,
+        "community_packages": community_packages,
     }
     canonical = json.dumps(
         hash_payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")
@@ -858,6 +1039,8 @@ def resolve_components(
         "default_components": defaults,
         "resolved_components": resolved_ids,
         "packages": packages,
+        "community_packages": community_packages,
+        "community_feed_required": bool(community_packages),
         "imagebuilder_packages": " ".join(packages),
         "kconfig_fragment": _kconfig_fragment(target, packages),
         "request_hash": request_hash,

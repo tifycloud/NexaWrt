@@ -608,10 +608,11 @@ const PACKAGE_CATALOG_ROOT_KEYS = ['schema_version', 'catalog_version', 'openwrt
 const PACKAGE_CATALOG_SHARD_INDEX_KEYS = [
   'target', 'flavor', 'path', 'sha256', 'package_count', 'selectable_count', 'sources'
 ];
-const PACKAGE_CATALOG_SOURCE_KEYS = ['feed', 'url', 'sha256'];
+const OFFICIAL_PACKAGE_SOURCE_KEYS = ['feed', 'url', 'sha256'];
+const COMMUNITY_PACKAGE_SOURCE_KEYS = ['feed', 'url', 'sha256', 'metadata_format', 'metadata_signed', 'candidate_repository', 'candidate_commit', 'catalog_sha256'];
 const PACKAGE_CATALOG_SHARD_KEYS = ['schema_version', 'catalog_version', 'target', 'flavor', 'packages'];
 const PACKAGE_RECORD_KEYS = [
-  'id', 'package', 'version', 'description', 'feed', 'installed_size', 'category',
+  'id', 'package', 'version', 'description', 'feed', 'source', 'installed_size', 'category',
   'arch', 'risk', 'selectable', 'blocked_reason'
 ];
 const SAFE_COMPONENT_ID = /^[a-z0-9][a-z0-9_-]{0,63}$/;
@@ -620,6 +621,11 @@ const SAFE_CATALOG_VERSION = /^\d{4}\.\d{2}\.\d{2}(?:\.\d+)?$/;
 const SAFE_OPENWRT_VERSION = /^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$/;
 const SAFE_SHA256 = /^[a-f0-9]{64}$/;
 const SAFE_SHARD_PATH = /^(?:components\/)?packages\/[A-Za-z0-9_.-]+\.json$/;
+const KIDDIN9_PACKAGES_URL = 'https://dl.openwrt.ai/releases/25.12/packages/aarch64_cortex-a53/kiddin9/Packages.gz';
+const KIDDIN9_PACKAGES_SHA256 = 'ce97a429f7fcd414a22b3ad701118d5299319a84add12c26d401216184c8bd04';
+const KIDDIN9_CANDIDATE_REPOSITORY = 'https://github.com/kiddin9/op-packages.git';
+const KIDDIN9_CANDIDATE_COMMIT = '9f2092b4f204fc9948226d9a3f5166b69976af48';
+const KIDDIN9_CATALOG_SHA256 = '4b14b36b0c9839f81bb6a56ffc1ac94384603c7a9c93e7f63ac48ffc4c699292';
 const REQUIRED_COMPONENT_TARGETS = new Set(['x86_64', 'xiaomi_ax9000']);
 const PACKAGE_RISKS = new Set(['standard', 'advanced', 'system']);
 const PACKAGE_ARCHITECTURES = {
@@ -754,7 +760,7 @@ function packageShardFetchUrl(path) {
 }
 
 function validatePackageCatalogRoot(root, catalog) {
-  if (!exactKeys(root, PACKAGE_CATALOG_ROOT_KEYS) || root.schema_version !== 1 ||
+  if (!exactKeys(root, PACKAGE_CATALOG_ROOT_KEYS) || root.schema_version !== 2 ||
       root.catalog_version !== catalog.catalog_version || !SAFE_CATALOG_VERSION.test(root.catalog_version) ||
       !SAFE_OPENWRT_VERSION.test(root.openwrt_version) || !Array.isArray(root.shards) ||
       root.shards.length < 1 || root.shards.length > MAX_PACKAGE_SHARDS) return false;
@@ -774,8 +780,17 @@ function validatePackageCatalogRoot(root, catalog) {
     shardKeys.add(key);
     const sourceFeeds = new Set();
     for (const source of shard.sources) {
-      if (!exactKeys(source, PACKAGE_CATALOG_SOURCE_KEYS) || !validComponentId(source.feed) ||
-          !validOfficialSourceUrl(source.url) || !SAFE_SHA256.test(source.sha256) || sourceFeeds.has(source.feed)) return false;
+      const officialSource = source.feed !== 'kiddin9';
+      if (!validComponentId(source.feed) || !SAFE_SHA256.test(source.sha256) || sourceFeeds.has(source.feed)) return false;
+      if (officialSource) {
+        if (!exactKeys(source, OFFICIAL_PACKAGE_SOURCE_KEYS) || !validOfficialSourceUrl(source.url)) return false;
+      } else if (!exactKeys(source, COMMUNITY_PACKAGE_SOURCE_KEYS) ||
+          shard.target !== 'xiaomi_ax9000' || shard.flavor !== 'official' ||
+          source.url !== KIDDIN9_PACKAGES_URL || source.sha256 !== KIDDIN9_PACKAGES_SHA256 ||
+          source.metadata_format !== 'opkg-packages-gzip' || source.metadata_signed !== false ||
+          source.candidate_repository !== KIDDIN9_CANDIDATE_REPOSITORY ||
+          source.candidate_commit !== KIDDIN9_CANDIDATE_COMMIT ||
+          source.catalog_sha256 !== KIDDIN9_CATALOG_SHA256) return false;
       sourceFeeds.add(source.feed);
     }
   }
@@ -783,7 +798,7 @@ function validatePackageCatalogRoot(root, catalog) {
 }
 
 function validatePackageCatalogShard(shard, descriptor, catalog) {
-  if (!exactKeys(shard, PACKAGE_CATALOG_SHARD_KEYS) || shard.schema_version !== 1 ||
+  if (!exactKeys(shard, PACKAGE_CATALOG_SHARD_KEYS) || shard.schema_version !== 2 ||
       shard.catalog_version !== catalog.catalog_version || shard.target !== descriptor.target ||
       shard.flavor !== descriptor.flavor || !Array.isArray(shard.packages) ||
       shard.packages.length !== descriptor.package_count || shard.packages.length > MAX_PACKAGE_RECORDS) return false;
@@ -799,14 +814,16 @@ function validatePackageCatalogShard(shard, descriptor, catalog) {
     if (!exactKeys(record, PACKAGE_RECORD_KEYS) || !validComponentId(record.id) || bundleIds.has(record.id) ||
         !SAFE_OPENWRT_TOKEN.test(record.package) || !validCatalogText(record.version, 160) ||
         !validCatalogText(record.description, 1000, true) || !allowedFeeds.has(record.feed) ||
+        !['official', 'kiddin9'].includes(record.source) ||
+        ((record.source === 'kiddin9') !== (record.feed === 'kiddin9')) ||
         !Number.isSafeInteger(record.installed_size) || record.installed_size < 0 ||
         !categories.has(record.category) || !SAFE_OPENWRT_TOKEN.test(record.arch) ||
         !allowedArchitectures.has(record.arch) || !PACKAGE_RISKS.has(record.risk) ||
         typeof record.selectable !== 'boolean' || !validCatalogText(record.blocked_reason, 240, true) ||
         (record.selectable && record.blocked_reason !== '') || (!record.selectable && record.blocked_reason === '') ||
-        ids.has(record.id) || packageNames.has(record.package)) return false;
+        ids.has(record.id) || packageNames.has(`${record.source}/${record.package}`)) return false;
     ids.add(record.id);
-    packageNames.add(record.package);
+    packageNames.add(`${record.source}/${record.package}`);
     if (record.selectable) selectableCount += 1;
   }
   return selectableCount === descriptor.selectable_count;
@@ -886,15 +903,24 @@ function resolveComponentSelection(catalog, targetId, requestedIds) {
   };
 }
 
+function selectedCommunityPackages(resolved) {
+  return resolved.requested_components
+    .map((id) => currentPackageMap.get(id))
+    .filter((record) => record?.source === 'kiddin9')
+    .map((record) => record.package)
+    .sort();
+}
+
 function componentHashPayload(catalog, targetId, flavorId, resolved) {
   return {
     catalog_version: catalog.catalog_version,
+    community_packages: selectedCommunityPackages(resolved),
     default_components: [...resolved.default_components],
     flavor: flavorId,
     packages: [...resolved.packages],
     requested_components: [...resolved.requested_components],
     resolved_components: [...resolved.resolved_components],
-    schema_version: 1,
+    schema_version: 2,
     target: targetId
   };
 }
@@ -909,9 +935,27 @@ async function sha256Hex(value) {
   return [...new Uint8Array(digest)].map((byte) => byte.toString(16).padStart(2, '0')).join('');
 }
 
+function canonicalSortedJson(value) {
+  if (Array.isArray(value)) return `[${value.map(canonicalSortedJson).join(',')}]`;
+  if (value && typeof value === 'object') {
+    return `{${Object.keys(value).sort().map((key) => `${JSON.stringify(key)}:${canonicalSortedJson(value[key])}`).join(',')}}`;
+  }
+  return JSON.stringify(value);
+}
+
+async function validCommunityCandidateProjection(shard, descriptor) {
+  const source = descriptor.sources.find((item) => item.feed === 'kiddin9');
+  const records = shard.packages.filter((record) => record.source === 'kiddin9');
+  if (!source) return records.length === 0;
+  if (source.catalog_sha256 !== KIDDIN9_CATALOG_SHA256 || records.length < 900 || records.length > 1100 ||
+      records.some((record) => record.selectable || record.feed !== 'kiddin9')) return false;
+  return await sha256Hex(canonicalSortedJson(records)) === source.catalog_sha256;
+}
+
 function normalizedBuildRequest(catalog, flavorId, resolved, requestHash) {
+  const communityPackages = selectedCommunityPackages(resolved);
   return {
-    schema_version: 1,
+    schema_version: 2,
     catalog_version: catalog.catalog_version,
     target: resolved.target,
     flavor: flavorId,
@@ -919,6 +963,8 @@ function normalizedBuildRequest(catalog, flavorId, resolved, requestHash) {
     default_components: resolved.default_components,
     resolved_components: resolved.resolved_components,
     packages: resolved.packages,
+    community_packages: communityPackages,
+    community_feed_required: communityPackages.length > 0,
     request_hash: requestHash
   };
 }
@@ -1032,7 +1078,7 @@ function makePackageOption(record) {
   titleRow.append(name, makeRiskBadge(record.risk));
   const meta = document.createElement('span');
   meta.className = 'package-meta';
-  meta.textContent = `${record.version} · ${record.arch} · ${record.feed} · ${formatInstalledSize(record.installed_size)}`;
+  meta.textContent = `${record.version} · ${record.arch} · ${record.feed} · ${record.source === 'kiddin9' ? '社区候选 / kiddin9（未审核）' : '官方'} · ${formatInstalledSize(record.installed_size)}`;
   const detail = document.createElement('small');
   detail.textContent = record.description || '暂无说明 / No description';
   copy.append(titleRow, meta, detail);
@@ -1058,7 +1104,7 @@ function renderSelectedOfficialPackages() {
   if (!selected.length) {
     const empty = document.createElement('p');
     empty.className = 'empty-state compact';
-    empty.textContent = '尚未选择官方包 / No official packages selected.';
+    empty.textContent = '尚未选择软件包 / No packages selected.';
     container.replaceChildren(empty);
     return;
   }
@@ -1070,7 +1116,7 @@ function renderSelectedOfficialPackages() {
     const name = document.createElement('strong');
     name.textContent = record.package;
     const meta = document.createElement('small');
-    meta.textContent = `${record.version} · ${record.arch} · ${record.feed} · ${formatInstalledSize(record.installed_size)}`;
+    meta.textContent = `${record.version} · ${record.arch} · ${record.feed} · ${record.source === 'kiddin9' ? '社区候选 / kiddin9（未审核）' : '官方'} · ${formatInstalledSize(record.installed_size)}`;
     copy.append(name, meta);
     const remove = document.createElement('button');
     remove.type = 'button';
@@ -1097,7 +1143,7 @@ function renderComponentChoices() {
   const fragment = document.createDocumentFragment();
   let bundleCount = 0;
 
-  if (sourceFilter !== 'official') {
+  if (!['official', 'kiddin9'].includes(sourceFilter)) {
     const componentsByCategory = new Map(componentCatalog.categories.map((category) => [category.id, []]));
     for (const component of componentCatalog.components) {
       if (!componentAvailable(component, targetId) || (categoryFilter && categoryFilter !== component.category) ||
@@ -1131,6 +1177,7 @@ function renderComponentChoices() {
       if ((!categoryFilter || record.category === categoryFilter) &&
           (!riskFilter || record.risk === riskFilter) &&
           (!feedFilter || record.feed === feedFilter) &&
+          (sourceFilter === 'all' || sourceFilter === record.source) &&
           currentPackageSearchTerms.get(record.id)?.includes(query)) {
         packageMatchCount += 1;
         if (packageMatches.length < MAX_PACKAGE_RESULTS) packageMatches.push(record);
@@ -1140,12 +1187,12 @@ function renderComponentChoices() {
       const group = document.createElement('section');
       group.className = 'component-category-group official-package-results';
       const heading = document.createElement('h3');
-      heading.textContent = 'Official packages · 官方包';
+      heading.textContent = sourceFilter === 'kiddin9' ? '社区候选库 / kiddin9（未审核）' : sourceFilter === 'official' ? 'Official packages · 官方包' : '软件包 / Packages';
       const description = document.createElement('p');
       description.className = 'component-category-description';
       description.textContent = packageMatchCount > MAX_PACKAGE_RESULTS
         ? `命中 ${packageMatchCount} 条，只显示前 ${MAX_PACKAGE_RESULTS} 条。 / ${packageMatchCount} matches; showing first ${MAX_PACKAGE_RESULTS}.`
-        : `命中 ${packageMatchCount} 条官方包。 / ${packageMatchCount} official package matches.`;
+        : `命中 ${packageMatchCount} 条软件包。 / ${packageMatchCount} package matches.`;
       group.append(heading, description);
       for (const record of packageMatches) group.append(makePackageOption(record));
       fragment.append(group);
@@ -1155,11 +1202,11 @@ function renderComponentChoices() {
   const resultStatus = document.querySelector('#component-result-status');
   if (!query && sourceFilter !== 'bundles') {
     resultStatus.textContent = currentPackageShard
-      ? '输入关键词后搜索官方包；为避免浏览器卡顿，不会一次渲染完整目录。 / Search to browse official packages.'
+      ? '输入关键词后搜索软件包；为避免浏览器卡顿，不会一次渲染完整目录。 / Search to browse packages.'
       : '官方包目录当前不可用；精选套餐仍可使用。 / Official packages unavailable; curated bundles remain available.';
   } else if (query && sourceFilter !== 'bundles') {
     resultStatus.textContent = currentPackageShard
-      ? `官方包命中 ${packageMatchCount} 条${packageMatchCount > MAX_PACKAGE_RESULTS ? `，只显示前 ${MAX_PACKAGE_RESULTS} 条` : ''}。`
+      ? `软件包命中 ${packageMatchCount} 条${packageMatchCount > MAX_PACKAGE_RESULTS ? `，只显示前 ${MAX_PACKAGE_RESULTS} 条` : ''}。`
       : '官方包目录当前不可用；仅搜索精选套餐。';
   } else {
     resultStatus.textContent = `显示 ${bundleCount} 个精选套餐。 / Showing ${bundleCount} curated bundles.`;
@@ -1168,8 +1215,8 @@ function renderComponentChoices() {
   if (!fragment.children.length) {
     const empty = document.createElement('p');
     empty.className = 'empty-state';
-    empty.textContent = !query && sourceFilter === 'official'
-      ? '输入关键词搜索官方包；完整目录不会一次性渲染。 / Enter a search term for official packages.'
+    empty.textContent = !query && ['official', 'kiddin9'].includes(sourceFilter)
+      ? '输入关键词搜索软件包；完整目录不会一次性渲染。 / Enter a search term for packages.'
       : '没有匹配当前筛选条件的组件。 / No matching components.';
     fragment.append(empty);
   }
@@ -1263,7 +1310,7 @@ function activateVerifiedPackageShard(shard, searchTerms) {
 function packageSearchTerms(shard) {
   return new Map(shard.packages.map((record) => [
     record.id,
-    `${record.package} ${record.description} ${record.version} ${record.arch} ${record.feed} ${record.category} ${record.id}`
+    `${record.package} ${record.description} ${record.version} ${record.arch} ${record.feed} ${record.source} ${record.category} ${record.id}`
       .toLocaleLowerCase('zh-CN')
   ]));
 }
@@ -1297,6 +1344,9 @@ async function loadPackageShardForSelection() {
       if (!validatePackageCatalogShard(shard, descriptor, componentCatalog)) {
         throw new Error('unexpected package shard schema');
       }
+      if (!await validCommunityCandidateProjection(shard, descriptor)) {
+        throw new Error('community candidate projection mismatch');
+      }
       verified = { shard, searchTerms: packageSearchTerms(shard) };
       verifiedPackageShardCache.set(cacheKey, verified);
     }
@@ -1310,8 +1360,10 @@ async function loadPackageShardForSelection() {
     ], '');
     document.querySelector('#component-feed').disabled = false;
     document.querySelector('#component-risk').disabled = false;
+    const communityCount = verified.shard.packages.filter((record) => record.source === 'kiddin9').length;
     setPackageCatalogStatus(
-      `OpenWrt ${packageCatalogRoot.openwrt_version} · ${descriptor.package_count} 个官方包，${descriptor.selectable_count} 个可选择 / packages verified`
+      `OpenWrt ${packageCatalogRoot.openwrt_version} · ${descriptor.package_count} 个包，${descriptor.selectable_count} 个可选择` +
+      (communityCount ? ` · 社区候选 ${communityCount}（未审核、全部不可选；仅记录锁定 Git provenance）` : '')
     );
     renderComponentChoices();
     await updateBuildRequest();
@@ -1369,7 +1421,8 @@ function setupComponentBuilder(catalog) {
   populateSelect(sourceSelect, [
     { id: 'all', title: '全部来源 / All sources' },
     { id: 'bundles', title: '精选套餐 / Curated bundles' },
-    { id: 'official', title: 'Official packages / 官方包' }
+    { id: 'official', title: 'Official packages / 官方包' },
+    { id: 'kiddin9', title: '社区候选库 / kiddin9（未审核）' }
   ], 'all');
   populateSelect(riskSelect, [
     { id: '', title: '全部风险 / All risks' },

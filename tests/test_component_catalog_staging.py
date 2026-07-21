@@ -53,33 +53,41 @@ class ComponentCatalogStagingTests(unittest.TestCase):
             source = ROOT / descriptor["path"]
             shard = load_json(source)
             if descriptor["target"] == "x86_64" and descriptor["flavor"] == "official":
-                selected = next(
+                selected_records = [next(
                     record for record in shard["packages"] if record["package"] == "base-files"
-                )
+                )]
+            elif descriptor["target"] == "xiaomi_ax9000" and descriptor["flavor"] == "official":
+                # The reviewed community projection and its duplicate-official policy
+                # are all-or-nothing, so retain the complete locked AX official shard.
+                selected_records = shard["packages"]
             else:
-                selected = shard["packages"][0]
-            selected = copy.deepcopy(selected)
-            if requires_arch and "arch" not in selected:
-                selected["arch"] = (
-                    "noarch"
-                    if descriptor["flavor"] == "nss"
-                    else "x86_64"
-                    if descriptor["target"] == "x86_64"
-                    else "aarch64_cortex-a53"
-                )
+                selected_records = [shard["packages"][0]]
+            selected_records = copy.deepcopy(selected_records)
+            for selected in selected_records:
+                if requires_arch and "arch" not in selected:
+                    selected["arch"] = (
+                        "noarch"
+                        if descriptor["flavor"] == "nss"
+                        else "x86_64"
+                        if descriptor["target"] == "x86_64"
+                        else "aarch64_cortex-a53"
+                    )
+            selected_records.sort(
+                key=lambda item: (item["package"], item["source"], item["version"], item["id"])
+            )
             minimal = {
                 "schema_version": shard["schema_version"],
                 "catalog_version": shard["catalog_version"],
                 "target": shard["target"],
                 "flavor": shard["flavor"],
-                "packages": [selected],
+                "packages": selected_records,
             }
             raw = canonical(minimal)
             name = Path(descriptor["path"]).name
             (packages_root / name).write_bytes(raw)
             descriptor["sha256"] = hashlib.sha256(raw).hexdigest()
-            descriptor["package_count"] = 1
-            descriptor["selectable_count"] = int(selected["selectable"])
+            descriptor["package_count"] = len(selected_records)
+            descriptor["selectable_count"] = sum(int(record["selectable"]) for record in selected_records)
         (cls.baseline_components / "package-catalog.json").write_bytes(canonical(index))
 
     @classmethod
@@ -189,7 +197,7 @@ class ComponentCatalogStagingTests(unittest.TestCase):
         def mutation(components: Path) -> None:
             path = components / "package-catalog.json"
             raw = path.read_text(encoding="utf-8")
-            needle = '"schema_version":1'
+            needle = '"schema_version":2'
             self.assertIn(needle, raw)
             path.write_text(raw.replace(needle, f"{needle},{needle}", 1), encoding="utf-8")
 
@@ -203,6 +211,59 @@ class ComponentCatalogStagingTests(unittest.TestCase):
             path.write_bytes(canonical(payload))
 
         self.assert_rejected("package index catalog version mismatch", mutation)
+
+    def test_rejects_community_metadata_digest_mismatch(self) -> None:
+        def mutation(components: Path) -> None:
+            path = components / "package-catalog.json"
+            payload = load_json(path)
+            descriptor = next(
+                item for item in payload["shards"]
+                if (item["target"], item["flavor"]) == ("xiaomi_ax9000", "official")
+            )
+            source = next(item for item in descriptor["sources"] if item["feed"] == "kiddin9")
+            source["sha256"] = "0" * 64
+            path.write_bytes(canonical(payload))
+
+        self.assert_rejected("community metadata digest mismatch", mutation)
+
+    def test_rejects_community_catalog_digest_mismatch(self) -> None:
+        def mutation(components: Path) -> None:
+            path = components / "package-catalog.json"
+            payload = load_json(path)
+            descriptor = next(
+                item for item in payload["shards"]
+                if (item["target"], item["flavor"]) == ("xiaomi_ax9000", "official")
+            )
+            source = next(item for item in descriptor["sources"] if item["feed"] == "kiddin9")
+            source["catalog_sha256"] = "0" * 64
+            path.write_bytes(canonical(payload))
+
+        self.assert_rejected("community catalog digest mismatch", mutation)
+
+    def test_rejects_community_candidate_relabelled_as_official(self) -> None:
+        def relabel(shard: dict[str, Any]) -> None:
+            record = next(
+                item for item in shard["packages"]
+                if item["source"] == "kiddin9" and item["package"] == "luci-app-openclash"
+            )
+            record.update({
+                "id": "pkg-" + hashlib.sha256(record["package"].encode()).hexdigest()[:16],
+                "feed": "packages",
+                "source": "official",
+                "category": "official-packages",
+                "selectable": True,
+                "blocked_reason": "",
+            })
+            shard["packages"].sort(
+                key=lambda item: (item["package"], item["source"], item["version"], item["id"])
+            )
+
+        self.assert_rejected(
+            "community candidate relabelled as official",
+            lambda components: self.mutate_shard(
+                components, ("xiaomi_ax9000", "official"), relabel
+            ),
+        )
 
     def test_rejects_shard_target_mismatch(self) -> None:
         self.assert_rejected(

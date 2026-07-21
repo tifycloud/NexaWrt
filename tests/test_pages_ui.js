@@ -156,7 +156,7 @@ function makeDom() {
 const root = path.resolve(__dirname, '..');
 const source = fs.readFileSync(path.join(root, 'site/app.js'), 'utf8');
 const testedSource = source.replace(/\nloadReleases\(\);\nloadComponentCatalog\(\);\s*$/, '\n') +
-  '\nglobalThis.hooks = { validDevice, validRelease, validReleaseGroup, validVmRelease, validVmReleaseGroup, validUtcTimestamp, compareVersions, loadReleases, generateSnippet, validateComponentCatalog, validatePackageCatalogRoot, validatePackageCatalogShard, resolveComponentSelection, componentHashPayload, canonicalJson, sha256Hex, normalizedBuildRequest, actionsInputs, loadComponentCatalog, loadPackageShardForSelection, changeComponentSelection, renderComponentChoices, setCurrentPackageRecords: (records) => { currentPackageShard = { packages: records }; currentPackageMap = new Map(records.map((record) => [record.id, record])); currentPackageSearchTerms = packageSearchTerms(currentPackageShard); }, clearVerifiedPackageShardCache: () => verifiedPackageShardCache.clear(), getCurrentPackageRecords: () => [...currentPackageMap.values()], getRequestedComponentIds: () => [...requestedComponentIds], getResolvedComponentIds: () => [...resolvedComponentIds] };\n';
+  '\nglobalThis.hooks = { validDevice, validRelease, validReleaseGroup, validVmRelease, validVmReleaseGroup, validUtcTimestamp, compareVersions, loadReleases, generateSnippet, validateComponentCatalog, validatePackageCatalogRoot, validatePackageCatalogShard, validCommunityCandidateProjection, resolveComponentSelection, componentHashPayload, canonicalJson, sha256Hex, normalizedBuildRequest, actionsInputs, loadComponentCatalog, loadPackageShardForSelection, changeComponentSelection, renderComponentChoices, setCurrentPackageRecords: (records) => { currentPackageShard = { packages: records }; currentPackageMap = new Map(records.map((record) => [record.id, record])); currentPackageSearchTerms = packageSearchTerms(currentPackageShard); }, clearVerifiedPackageShardCache: () => verifiedPackageShardCache.clear(), getCurrentPackageRecords: () => [...currentPackageMap.values()], getRequestedComponentIds: () => [...requestedComponentIds], getResolvedComponentIds: () => [...resolvedComponentIds] };\n';
 const document = makeDom();
 const loggedErrors = [];
 const context = vm.createContext({
@@ -166,7 +166,7 @@ const context = vm.createContext({
   console: { error: (...args) => loggedErrors.push(args) },
 });
 vm.runInContext(testedSource, context, { filename: 'site/app.js' });
-const { validDevice, validRelease, validReleaseGroup, validVmRelease, validVmReleaseGroup, validUtcTimestamp, compareVersions, loadReleases, generateSnippet, validateComponentCatalog, validatePackageCatalogRoot, validatePackageCatalogShard, resolveComponentSelection, componentHashPayload, canonicalJson, sha256Hex, normalizedBuildRequest, actionsInputs, loadComponentCatalog, loadPackageShardForSelection, changeComponentSelection, renderComponentChoices, setCurrentPackageRecords, clearVerifiedPackageShardCache, getCurrentPackageRecords, getRequestedComponentIds, getResolvedComponentIds } = context.hooks;
+const { validDevice, validRelease, validReleaseGroup, validVmRelease, validVmReleaseGroup, validUtcTimestamp, compareVersions, loadReleases, generateSnippet, validateComponentCatalog, validatePackageCatalogRoot, validatePackageCatalogShard, validCommunityCandidateProjection, resolveComponentSelection, componentHashPayload, canonicalJson, sha256Hex, normalizedBuildRequest, actionsInputs, loadComponentCatalog, loadPackageShardForSelection, changeComponentSelection, renderComponentChoices, setCurrentPackageRecords, clearVerifiedPackageShardCache, getCurrentPackageRecords, getRequestedComponentIds, getResolvedComponentIds } = context.hooks;
 const clone = (value) => JSON.parse(JSON.stringify(value));
 
 const index = JSON.parse(fs.readFileSync(path.join(root, 'site/releases.json'), 'utf8'));
@@ -483,7 +483,7 @@ function assertSafeEmptyState() {
 
 
 const componentCatalog = JSON.parse(fs.readFileSync(path.join(root, 'components/catalog.json'), 'utf8'));
-componentCatalog.catalog_version = '2026.07.21';
+componentCatalog.catalog_version = '2026.07.21.1';
 
 function packageRecord(id, packageName, overrides = {}) {
   return {
@@ -492,6 +492,7 @@ function packageRecord(id, packageName, overrides = {}) {
     version: '1.0.0-r1',
     description: 'Official package fixture',
     feed: 'luci',
+    source: 'official',
     installed_size: 4096,
     category: 'network',
     arch: 'x86_64',
@@ -504,7 +505,7 @@ function packageRecord(id, packageName, overrides = {}) {
 
 function makePackageShard(target, flavor, packages) {
   return {
-    schema_version: 1,
+    schema_version: 2,
     catalog_version: componentCatalog.catalog_version,
     target,
     flavor,
@@ -517,14 +518,25 @@ async function digestText(value) {
   return Buffer.from(digest).toString('hex');
 }
 
+const KIDDIN9_CATALOG_SHA256_FIXTURE = '4b14b36b0c9839f81bb6a56ffc1ac94384603c7a9c93e7f63ac48ffc4c699292';
+
 function shardSources(feeds) {
-  return feeds.map((feed) => ({
+  return feeds.map((feed) => feed === 'kiddin9' ? {
+    feed,
+    url: 'https://dl.openwrt.ai/releases/25.12/packages/aarch64_cortex-a53/kiddin9/Packages.gz',
+    sha256: 'ce97a429f7fcd414a22b3ad701118d5299319a84add12c26d401216184c8bd04',
+    metadata_format: 'opkg-packages-gzip',
+    metadata_signed: false,
+    candidate_repository: 'https://github.com/kiddin9/op-packages.git',
+    candidate_commit: '9f2092b4f204fc9948226d9a3f5166b69976af48',
+    catalog_sha256: KIDDIN9_CATALOG_SHA256_FIXTURE,
+  } : {
     feed,
     url: feed === 'base'
-      ? 'https://github.com/openwrt/openwrt'
-      : `https://github.com/openwrt/${feed}`,
+      ? 'https://downloads.openwrt.org/releases/25.12.5/targets/x86/64/packages/packages.adb'
+      : `https://downloads.openwrt.org/releases/25.12.5/packages/x86_64/${feed}/packages.adb`,
     sha256: 'a'.repeat(64),
-  }));
+  });
 }
 
 async function makePackageCatalogFixtures() {
@@ -560,11 +572,22 @@ async function makePackageCatalogFixtures() {
       installed_size: 1024 + index,
     }));
   }
+  const realAxShard = JSON.parse(
+    fs.readFileSync(path.join(root, 'components/packages/xiaomi_ax9000-official.json'), 'utf8')
+  );
+  const communityPackages = realAxShard.packages
+    .filter((record) => record.source === 'kiddin9')
+    .map((record) => clone(record));
+  assert.equal(communityPackages.length, 969);
+  assert.equal(communityPackages.some((record) => record.package === 'luci-app-openclash'), true);
+  const axOfficialPackages = [
+    packageRecord('pkg-ax-mesh', 'mesh11sd', { description: 'AX official mesh', feed: 'packages', arch: 'aarch64_cortex-a53' }),
+    // Preserve the reviewed projection order from the generated shard.
+    ...communityPackages,
+  ];
   const shards = [
     makePackageShard('x86_64', 'official', x86Packages),
-    makePackageShard('xiaomi_ax9000', 'official', [
-      packageRecord('pkg-ax-mesh', 'mesh11sd', { description: 'AX official mesh', feed: 'packages', arch: 'aarch64_cortex-a53' }),
-    ]),
+    makePackageShard('xiaomi_ax9000', 'official', axOfficialPackages),
     makePackageShard('xiaomi_ax9000', 'nss', [
       packageRecord('pkg-ax-nss-monitor', 'luci-app-nss-monitor', { description: 'AX NSS monitor', arch: 'noarch' }),
     ]),
@@ -593,7 +616,7 @@ async function makePackageCatalogFixtures() {
   }
   return {
     root: {
-      schema_version: 1,
+      schema_version: 2,
       catalog_version: componentCatalog.catalog_version,
       openwrt_version: '25.12.5',
       shards: descriptors,
@@ -666,6 +689,8 @@ async function assertFrontendBackendHashContract(target, flavor, requestedIds, p
   assert.equal(validateComponentCatalog(componentCatalog), true);
   assert.equal(validatePackageCatalogRoot(packageFixtures.root, componentCatalog), true);
   assert.equal(validatePackageCatalogShard(packageFixtures.shards[0], packageFixtures.root.shards[0], componentCatalog), true);
+  assert.equal(validatePackageCatalogShard(packageFixtures.shards[1], packageFixtures.root.shards[1], componentCatalog), true);
+  assert.equal(await validCommunityCandidateProjection(packageFixtures.shards[1], packageFixtures.root.shards[1]), true);
   const invalidRoot = clone(packageFixtures.root);
   invalidRoot.extra = true;
   assert.equal(validatePackageCatalogRoot(invalidRoot, componentCatalog), false);
@@ -708,11 +733,11 @@ async function assertFrontendBackendHashContract(target, flavor, requestedIds, p
   assert.equal(resolveComponentSelection(componentCatalog, 'xiaomi_ax9000', ['pppoe-server']).ok, false);
 
   const hashPayload = componentHashPayload(componentCatalog, 'x86_64', 'official', dependencySelection);
-  assert.equal(canonicalJson(hashPayload), '{"catalog_version":"2026.07.21","default_components":["diagnostic-tools","web-ui"],"flavor":"official","packages":["ca-bundle","curl","ethtool","iperf3","kmod-wireguard","luci-app-firewall","luci-base","luci-proto-wireguard","luci-ssl","tcpdump","wireguard-tools"],"requested_components":["wireguard"],"resolved_components":["diagnostic-tools","web-ui","wireguard"],"schema_version":1,"target":"x86_64"}');
+  assert.equal(canonicalJson(hashPayload), '{"catalog_version":"2026.07.21.1","community_packages":[],"default_components":["diagnostic-tools","web-ui"],"flavor":"official","packages":["ca-bundle","curl","ethtool","iperf3","kmod-wireguard","luci-app-firewall","luci-base","luci-proto-wireguard","luci-ssl","tcpdump","wireguard-tools"],"requested_components":["wireguard"],"resolved_components":["diagnostic-tools","web-ui","wireguard"],"schema_version":2,"target":"x86_64"}');
   const normalizedHash = await sha256Hex(canonicalJson(hashPayload));
-  assert.equal(normalizedHash, 'f970820f02af793d85983ce99376ac9d3df0e74c293a0a3810d6927d607746fb');
+  assert.equal(normalizedHash, 'cb47ea8fef1232db432d9525712c53f8256a1256a59414e5ea0cab3830b11808');
   const normalized = normalizedBuildRequest(componentCatalog, 'official', dependencySelection, normalizedHash);
-  assert.match(actionsInputs(normalized), /^target=x86_64\nflavor=official\ncomponents=wireguard\ncatalog_version=2026\.07\.21\nrequest_hash=f970820f02af793d85983ce99376ac9d3df0e74c293a0a3810d6927d607746fb$/);
+  assert.match(actionsInputs(normalized), /^target=x86_64\nflavor=official\ncomponents=wireguard\ncatalog_version=2026\.07\.21\.1\nrequest_hash=cb47ea8fef1232db432d9525712c53f8256a1256a59414e5ea0cab3830b11808$/);
 
   const delayedCrypto = {
     subtle: {
@@ -732,7 +757,7 @@ async function assertFrontendBackendHashContract(target, flavor, requestedIds, p
   assert.equal(document.querySelector('#component-status').classList.contains('error'), false);
   assert.equal(document.querySelector('#component-package-status').classList.contains('error'), false);
   assert.match(document.querySelector('#component-package-status').textContent, /OpenWrt 25\.12\.5/);
-  assert.match(document.querySelector('#component-package-status').textContent, /150 个官方包，149 个可选择/);
+  assert.match(document.querySelector('#component-package-status').textContent, /150 个包，149 个可选择/);
   assert.equal(document.querySelector('#component-target').disabled, false);
   assert.equal(document.querySelector('#component-target').value, 'x86_64');
   assert.equal(document.querySelector('#component-flavor').value, 'official');
@@ -750,7 +775,7 @@ async function assertFrontendBackendHashContract(target, flavor, requestedIds, p
   assert.equal(document.querySelector('#custom-build-workflow-link').hidden, false);
   assert.match(document.querySelector('#component-actions-inputs').textContent, /components=\n/);
   assert.equal(packageOptions().length, 0);
-  assert.match(document.querySelector('#component-result-status').textContent, /输入关键词后搜索官方包/);
+  assert.match(document.querySelector('#component-result-status').textContent, /输入关键词后搜索软件包/);
   assert.match(flattenedText('#component-list'), /精选套餐/);
 
   document.querySelector('#component-search').value = 'demo-search';
@@ -802,8 +827,37 @@ async function assertFrontendBackendHashContract(target, flavor, requestedIds, p
   document.querySelector('#component-target').dispatchEvent({ type: 'change' });
   await new Promise((resolve) => setTimeout(resolve, 30));
   assert.equal(getRequestedComponentIds().includes('pkg-firewall-plus'), false);
-  assert.deepEqual([...getCurrentPackageRecords()].map((record) => record.id), ['pkg-ax-mesh']);
+  assert.equal(
+    getCurrentPackageRecords().length,
+    970,
+    `${document.querySelector('#component-package-status').textContent} ${JSON.stringify(loggedErrors.slice(-3))}`
+  );
+  const openClashCandidate = getCurrentPackageRecords().find(
+    (record) => record.source === 'kiddin9' && record.package === 'luci-app-openclash'
+  );
+  assert.ok(openClashCandidate);
+  assert.equal(openClashCandidate.selectable, false);
   assert.equal(initialCalls.includes('components/packages/xiaomi_ax9000-official.json'), true);
+
+  document.querySelector('#component-search').value = 'openclash';
+  document.querySelector('#component-source').value = 'kiddin9';
+  document.querySelector('#component-category').value = '';
+  document.querySelector('#component-risk').value = '';
+  document.querySelector('#component-feed').value = 'kiddin9';
+  renderComponentChoices();
+  const openClashOptions = packageOptions();
+  assert.equal(openClashOptions.length, 1);
+  assert.match(flattenedText('#component-list'), /luci-app-openclash/);
+  assert.match(flattenedText('#component-list'), /kiddin9/);
+  assert.equal(openClashOptions[0].children[0].disabled, true);
+  await changeComponentSelection(openClashCandidate.id, true);
+  assert.equal(getRequestedComponentIds().includes(openClashCandidate.id), false);
+
+  document.querySelector('#component-search').value = '';
+  document.querySelector('#component-source').value = '';
+  document.querySelector('#component-category').value = '';
+  document.querySelector('#component-risk').value = '';
+  document.querySelector('#component-feed').value = '';
   document.querySelector('#component-flavor').value = 'nss';
   document.querySelector('#component-flavor').dispatchEvent({ type: 'change' });
   await new Promise((resolve) => setTimeout(resolve, 30));
@@ -839,6 +893,46 @@ async function assertFrontendBackendHashContract(target, flavor, requestedIds, p
   assert.equal(getCurrentPackageRecords().length, 0);
   assert.equal(document.querySelector('#custom-build-workflow-link').hidden, false);
   assert.deepEqual([...getResolvedComponentIds()].sort(), ['diagnostic-tools', 'web-ui']);
+
+  for (const field of ['sha256', 'catalog_sha256']) {
+    clearVerifiedPackageShardCache();
+    const forgedFixtures = {
+      ...packageFixtures,
+      root: clone(packageFixtures.root),
+    };
+    const communityDescriptor = forgedFixtures.root.shards.find(
+      (item) => item.target === 'xiaomi_ax9000' && item.flavor === 'official'
+    );
+    communityDescriptor.sources.find((source) => source.feed === 'kiddin9')[field] = '0'.repeat(64);
+    await loadCatalogWith(fixtureFetch(forgedFixtures, []));
+    assert.equal(document.querySelector('#component-package-status').classList.contains('error'), true);
+    assert.equal(getCurrentPackageRecords().length, 0);
+  }
+
+  clearVerifiedPackageShardCache();
+  const projectionFixtures = {
+    root: clone(packageFixtures.root),
+    shards: clone(packageFixtures.shards),
+    rawByPath: new Map(packageFixtures.rawByPath),
+  };
+  const axProjectionShard = projectionFixtures.shards.find(
+    (item) => item.target === 'xiaomi_ax9000' && item.flavor === 'official'
+  );
+  axProjectionShard.packages.find(
+    (record) => record.source === 'kiddin9' && record.package === 'luci-app-openclash'
+  ).description += ' tampered';
+  const axProjectionPath = 'components/packages/xiaomi_ax9000-official.json';
+  const axProjectionRaw = JSON.stringify(axProjectionShard);
+  projectionFixtures.rawByPath.set(axProjectionPath, axProjectionRaw);
+  projectionFixtures.root.shards.find(
+    (item) => item.target === 'xiaomi_ax9000' && item.flavor === 'official'
+  ).sha256 = await digestText(axProjectionRaw);
+  await loadCatalogWith(fixtureFetch(projectionFixtures, []));
+  document.querySelector('#component-target').value = 'xiaomi_ax9000';
+  await loadPackageShardForSelection();
+  assert.equal(document.querySelector('#component-package-status').classList.contains('error'), true);
+  assert.match(document.querySelector('#component-package-status').textContent, /官方包校验失败/);
+  assert.equal(getCurrentPackageRecords().length, 0);
 
   await loadCatalogWith(async (url, options) => {
     assert.equal(options.cache, 'no-store');
