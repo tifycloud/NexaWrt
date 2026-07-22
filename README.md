@@ -177,8 +177,9 @@ NEXAWRT_FLAVOR=nss ./scripts/build.sh
 构建不会再让 OpenWrt 在源码顶层随机生成 APK 私钥，也不会把长期私钥交给联网的第三方构建机。
 当前 initramfs 构建采用**仅公钥信任身份**：仓库提交 `manifests/apk-signing-public.pem`，其规范化
 SubjectPublicKeyInfo DER SHA-256 由 `manifests/apk-signing.lock` 锁定；OpenWrt 只嵌入该受信公钥，构建期
-临时 package index 保持未签名并以显式 `--allow-untrusted` 安装。未来若发布可更新 APK 仓库，必须在受控、
-离线的签名环境中使用仓库外私钥单独签署 index，不能把私钥注入固件构建工作流。
+临时 package index 保持未签名并以显式 `--allow-untrusted` 安装。对外软件库使用另一套独立 P-256 身份：
+固件只内置仓库公钥和 `packages.adb` URL，受保护的 `package-repository` GitHub Environment 只在受信任的
+`main` 发布 job 中临时提供仓库外私钥，用它单独签署 index，随后删除；私钥不会进入固件构建、artifact、日志或 Pages。
 
 生产构建使用已提交的公钥：
 
@@ -212,6 +213,12 @@ macOS 自带的 Bash、Make 和默认大小写不敏感文件系统通常不满�
 工作流会执行两个隔离的干净构建、校验 GitHub provenance 和字节级可复现性；成功后在本次运行页面
 **Artifacts** 区域下载 `NexaWrt-AX9000-<flavor>-verified-dist-<commit>`。该下载仍是 RAM-only
 真机测试候选，不是可直接写入闪存的生产刷机包。
+
+### 自建签名 APK 软件库
+
+OpenWrt 25.12 已使用 APK，不再使用 OPKG/IPK。NexaWrt 会把 testing 仓库 URL 和独立公钥直接编译进 AX9000 rootfs；启动后可直接执行 `apk update`、`apk search` 和 `apk add`。GitHub Actions 从固定源码构建审核包，签署 `packages.adb`，创建不可覆盖的版本 Release；Pages 再根据 GitHub asset digest 和归档内摘要安全发布到 `https://tifycloud.github.io/NexaWrt/packages/25.12/testing/aarch64_cortex-a53/`。
+
+当前仓库基础设施已经按 `manifests/package-repository.lock` 和 `manifests/package-repository-packages.txt` 锁定，但频道仍是 `testing`。社区组件目录不会自动进入受信软件库；每个软件必须完成源码固定、许可证和构建脚本审查、APK 构建及安装测试。AX9000 当前仍是 RAM-only，运行时安装的软件重启后不会持久保存。设计、命令和 stable 门禁见 [docs/PACKAGE-REPOSITORY.md](docs/PACKAGE-REPOSITORY.md)。
 
 ### 浏览器自选组件云编译
 

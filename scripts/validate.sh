@@ -11,6 +11,9 @@ source "$ROOT_DIR/scripts/lock-file-policy.sh"
 # shellcheck source=../manifests/upstream.lock
 nexawrt_validate_lock_file "$ROOT_DIR/manifests/upstream.lock" upstream
 source "$ROOT_DIR/manifests/upstream.lock"
+# shellcheck source=../manifests/package-repository.lock
+nexawrt_validate_lock_file "$ROOT_DIR/manifests/package-repository.lock" package-repository
+source "$ROOT_DIR/manifests/package-repository.lock"
 KERNEL_BUILD_IDENTITY_CHECKER="$ROOT_DIR/scripts/check-kernel-build-identity.sh"
 NEXAWRT_FLAVOR="${NEXAWRT_FLAVOR:-official}"
 SOURCE_DIR=""
@@ -593,6 +596,8 @@ assert_common_config() {
     grep -Fq "CONFIG_PACKAGE_${package}=y" "$config" ||
       fail "$description lost required package: $package"
   done
+  grep -Fq 'CONFIG_PACKAGE_nexawrt-repository=m' "$config" ||
+    fail "$description does not build the NexaWrt repository bootstrap APK as a module"
 
   grep -Fq 'CONFIG_PACKAGE_uboot-envtools=y' "$config" ||
     fail "$description lost the read-only fw_printenv/fw_printsys package"
@@ -605,6 +610,71 @@ assert_common_config() {
     grep -Fq "$command is disabled" "$guard" || fail "RAM-only runtime guard is malformed: $command"
     grep -Fq 'exit 74' "$guard" || fail "RAM-only runtime guard is forceable: $command"
   done
+}
+
+assert_package_repository_inputs() {
+  local package_set="$ROOT_DIR/manifests/package-repository-packages.txt"
+  local public_key="$ROOT_DIR/manifests/package-repository-public.pem"
+  local package_source="$ROOT_DIR/packages/nexawrt-repository"
+  local package_set_sha public_sha
+
+  [[ -f "$package_set" && ! -L "$package_set" ]] ||
+    fail "package repository package set is missing or unsafe"
+  [[ -f "$public_key" && ! -L "$public_key" ]] ||
+    fail "package repository public key is missing or unsafe"
+  [[ -f "$package_source/Makefile" && ! -L "$package_source/Makefile" ]] ||
+    fail "package repository bootstrap source is missing or unsafe"
+  if find "$package_source" \( -type l -o -type f -links +1 \) -print -quit | grep -q .; then
+    fail "package repository bootstrap source contains a symbolic or hard link"
+  fi
+  package_set_sha="$(if command -v sha256sum >/dev/null 2>&1; then sha256sum -- "$package_set"; else shasum -a 256 -- "$package_set"; fi | awk '{print $1}')"
+  [[ "$package_set_sha" == "$NEXAWRT_REPOSITORY_PACKAGE_SET_SHA256" ]] ||
+    fail "package repository package set differs from its lock"
+  public_sha="$(openssl pkey -pubin -in "$public_key" -outform DER 2>/dev/null |
+    { if command -v sha256sum >/dev/null 2>&1; then sha256sum; else shasum -a 256; fi; } | awk '{print $1}')"
+  [[ "$public_sha" == "$NEXAWRT_REPOSITORY_PUBLIC_SHA256" ]] ||
+    fail "package repository public key differs from its lock"
+  "$ROOT_DIR/scripts/package-repository-key.sh" public >/dev/null
+  grep -Fxq 'nexawrt-repository' "$package_set" ||
+    fail "package repository package set lost the bootstrap package"
+  cmp -s "$package_source/files/repository.conf" <(cat <<EOF_REPOSITORY
+schema=$NEXAWRT_REPOSITORY_SCHEMA
+series=$NEXAWRT_REPOSITORY_SERIES
+release=$NEXAWRT_REPOSITORY_RELEASE
+channel=$NEXAWRT_REPOSITORY_CHANNEL
+architecture=$NEXAWRT_REPOSITORY_ARCH
+index_url=$NEXAWRT_REPOSITORY_INDEX_URL
+public_sha256=$NEXAWRT_REPOSITORY_PUBLIC_SHA256
+EOF_REPOSITORY
+  ) || fail "package repository bootstrap metadata differs from its lock"
+  if grep -RIEq --include='*.conf' --include='*.list' --include='*.lock' \
+      '(^|/)(Packages\.gz|[^[:space:]]+\.ipk)([/?#[:space:]]|$)|/etc/opkg|customfeeds\.conf' \
+      "$ROOT_DIR/manifests/package-repository.lock" "$ROOT_DIR/packages/nexawrt-repository"; then
+    fail "package repository configuration regressed to OPKG/IPK instead of APK"
+  fi
+}
+
+assert_prepared_package_repository() {
+  local source="$1"
+  local prepared_key="$source/files/etc/apk/keys/nexawrt-repository.pem"
+  local prepared_list="$source/files/etc/apk/repositories.d/nexawrt.list"
+  local prepared_package="$source/package/nexawrt-repository"
+
+  [[ -f "$prepared_key" && ! -L "$prepared_key" ]] ||
+    fail "prepared source lost the NexaWrt repository public key"
+  cmp -s "$ROOT_DIR/manifests/package-repository-public.pem" "$prepared_key" ||
+    fail "prepared NexaWrt repository public key differs from policy"
+  [[ -f "$prepared_list" && ! -L "$prepared_list" ]] ||
+    fail "prepared source lost the NexaWrt APK repository list"
+  cmp -s "$prepared_list" <(printf '%s\n' "$NEXAWRT_REPOSITORY_INDEX_URL") ||
+    fail "prepared NexaWrt APK repository URL differs from the lock"
+  [[ -d "$prepared_package" && ! -L "$prepared_package" ]] ||
+    fail "prepared source lost the NexaWrt repository bootstrap package"
+  if find "$prepared_package" \( -type l -o -type f -links +1 \) -print -quit | grep -q .; then
+    fail "prepared NexaWrt repository package contains a symbolic or hard link"
+  fi
+  diff -ruN --exclude='.git' "$ROOT_DIR/packages/nexawrt-repository" "$prepared_package" >/dev/null ||
+    fail "prepared NexaWrt repository package differs from policy"
 }
 
 assert_flavor_config() {
@@ -645,6 +715,8 @@ assert_flavor_config() {
     fail "$description enabled a forbidden first-stage package"
   fi
 }
+
+assert_package_repository_inputs
 
 if [[ "$NEXAWRT_FLAVOR" == official ]]; then
   assert_official_nss_matcher
@@ -1030,6 +1102,7 @@ PY
     "target-specific 30_uboot-envtools source"
 
   validate_feed_policy "$SOURCE_DIR"
+  assert_prepared_package_repository "$SOURCE_DIR"
 
   for command in sysupgrade firstboot jffs2reset jffs2mark factoryreset mount_root; do
     prepared_guard="$SOURCE_DIR/files/sbin/$command"
@@ -1085,6 +1158,14 @@ PY
   ((${#rootfs_dirs[@]} == 1)) && [[ -d "${rootfs_dirs[0]}" ]] ||
     fail "expected exactly one final qualcommax rootfs staging directory"
   rootfs_dir="${rootfs_dirs[0]}"
+  [[ -f "$rootfs_dir/etc/apk/repositories.d/nexawrt.list" && ! -L "$rootfs_dir/etc/apk/repositories.d/nexawrt.list" ]] ||
+    fail "final rootfs lost the NexaWrt APK repository list"
+  cmp -s "$rootfs_dir/etc/apk/repositories.d/nexawrt.list" <(printf '%s\n' "$NEXAWRT_REPOSITORY_INDEX_URL") ||
+    fail "final rootfs NexaWrt APK repository URL differs from the lock"
+  [[ -f "$rootfs_dir/etc/apk/keys/nexawrt-repository.pem" && ! -L "$rootfs_dir/etc/apk/keys/nexawrt-repository.pem" ]] ||
+    fail "final rootfs lost the NexaWrt repository public key"
+  cmp -s "$ROOT_DIR/manifests/package-repository-public.pem" "$rootfs_dir/etc/apk/keys/nexawrt-repository.pem" ||
+    fail "final rootfs NexaWrt repository public key differs from policy"
   for command in sysupgrade firstboot jffs2reset jffs2mark factoryreset mount_root; do
     [[ -x "$rootfs_dir/sbin/$command" ]] || fail "final rootfs lost runtime guard: $command"
     cmp -s "$ROOT_DIR/files/sbin/$command" "$rootfs_dir/sbin/$command" ||

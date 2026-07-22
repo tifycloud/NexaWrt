@@ -45,11 +45,16 @@ mkdir -p \
   "$POLICY_REPO/manifests" \
   "$POLICY_REPO/configs" \
   "$POLICY_REPO/files" \
+  "$POLICY_REPO/packages" \
   "$POLICY_REPO/patches"
 cp "$ROOT_DIR/scripts/prepare.sh" "$POLICY_REPO/scripts/prepare.sh"
 cp "$ROOT_DIR/scripts/sanitize-git-environment.sh" "$POLICY_REPO/scripts/sanitize-git-environment.sh"
 cp "$ROOT_DIR/scripts/git-metadata-policy.sh" "$POLICY_REPO/scripts/git-metadata-policy.sh"
 cp "$ROOT_DIR/scripts/lock-file-policy.sh" "$POLICY_REPO/scripts/lock-file-policy.sh"
+cp "$ROOT_DIR/manifests/package-repository.lock" "$POLICY_REPO/manifests/package-repository.lock"
+cp "$ROOT_DIR/manifests/package-repository-public.pem" "$POLICY_REPO/manifests/package-repository-public.pem"
+cp "$ROOT_DIR/manifests/package-repository-packages.txt" "$POLICY_REPO/manifests/package-repository-packages.txt"
+cp -R "$ROOT_DIR/packages/nexawrt-repository" "$POLICY_REPO/packages/nexawrt-repository"
 cat > "$POLICY_REPO/manifests/upstream.lock" <<LOCK
 OPENWRT_REPO="https://example.invalid/openwrt.git"
 OPENWRT_TAG="fixture"

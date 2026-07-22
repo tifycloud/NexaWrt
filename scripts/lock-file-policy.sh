@@ -35,6 +35,14 @@ schemas = {
         "KIDDIN9_PACKAGES_URL", "KIDDIN9_PACKAGES_SHA256",
         "KIDDIN9_PACKAGES_SIGNED", "KIDDIN9_CATALOG_SHA256",
     },
+    "package-repository": {
+        "NEXAWRT_REPOSITORY_SCHEMA", "NEXAWRT_REPOSITORY_CHANNEL",
+        "NEXAWRT_REPOSITORY_SERIES", "NEXAWRT_REPOSITORY_RELEASE",
+        "NEXAWRT_REPOSITORY_ARCH", "NEXAWRT_REPOSITORY_BASE_URL",
+        "NEXAWRT_REPOSITORY_INDEX_URL", "NEXAWRT_REPOSITORY_RELEASE_TAG",
+        "NEXAWRT_REPOSITORY_ASSET", "NEXAWRT_REPOSITORY_PUBLIC_SHA256",
+        "NEXAWRT_REPOSITORY_PACKAGE_SET_SHA256",
+    },
 }
 if schema not in schemas:
     raise SystemExit(f"unknown lock schema: {schema}")
@@ -77,6 +85,26 @@ elif schema == "nss":
     require("NSS_OPENWRT_BRANCH", r"[A-Za-z0-9._/-]+")
     require("NSS_PACKAGES_FEED", r"[a-z0-9_]+")
     require("NSS_SQM_FEED", r"[a-z0-9_]+")
+elif schema == "package-repository":
+    require("NEXAWRT_REPOSITORY_SCHEMA", r"1")
+    require("NEXAWRT_REPOSITORY_CHANNEL", r"testing|stable")
+    require("NEXAWRT_REPOSITORY_SERIES", r"[0-9]{2}\.[0-9]{2}")
+    require("NEXAWRT_REPOSITORY_RELEASE", r"[0-9]{2}\.[0-9]{2}\.[0-9]+-r[1-9][0-9]*")
+    require("NEXAWRT_REPOSITORY_ARCH", r"aarch64_cortex-a53|x86_64")
+    require("NEXAWRT_REPOSITORY_BASE_URL", r"https://tifycloud\.github\.io/NexaWrt/packages/[0-9]{2}\.[0-9]{2}/(testing|stable)/(aarch64_cortex-a53|x86_64)")
+    require("NEXAWRT_REPOSITORY_INDEX_URL", r"https://tifycloud\.github\.io/NexaWrt/packages/[0-9]{2}\.[0-9]{2}/(testing|stable)/(aarch64_cortex-a53|x86_64)/packages\.adb")
+    require("NEXAWRT_REPOSITORY_RELEASE_TAG", r"package-repository-v[0-9]{2}\.[0-9]{2}\.[0-9]+-r[1-9][0-9]*")
+    require("NEXAWRT_REPOSITORY_ASSET", r"nexawrt-apk-repository-[0-9]{2}\.[0-9]{2}\.[0-9]+-r[1-9][0-9]*\.tar\.gz")
+    require("NEXAWRT_REPOSITORY_PUBLIC_SHA256", r"[0-9a-f]{64}")
+    require("NEXAWRT_REPOSITORY_PACKAGE_SET_SHA256", r"[0-9a-f]{64}")
+    expected_base = (
+        f"https://tifycloud.github.io/NexaWrt/packages/{values['NEXAWRT_REPOSITORY_SERIES']}/"
+        f"{values['NEXAWRT_REPOSITORY_CHANNEL']}/{values['NEXAWRT_REPOSITORY_ARCH']}"
+    )
+    if values["NEXAWRT_REPOSITORY_BASE_URL"] != expected_base:
+        raise SystemExit(f"package repository base URL fields are inconsistent: {path}")
+    if values["NEXAWRT_REPOSITORY_INDEX_URL"] != expected_base + "/packages.adb":
+        raise SystemExit(f"package repository index URL fields are inconsistent: {path}")
 else:
     require("KIDDIN9_FEED", r"[a-z0-9_]+")
     require("KIDDIN9_PACKAGES_URL", r"https://dl\.openwrt\.ai/releases/25\.12/packages/aarch64_cortex-a53/kiddin9/Packages\.gz")
