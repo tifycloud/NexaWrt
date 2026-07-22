@@ -11,6 +11,9 @@ source "$ROOT_DIR/scripts/git-metadata-policy.sh"
 # shellcheck source=../manifests/upstream.lock
 nexawrt_validate_lock_file "$ROOT_DIR/manifests/upstream.lock" upstream
 source "$ROOT_DIR/manifests/upstream.lock"
+# shellcheck source=../manifests/package-repository.lock
+nexawrt_validate_lock_file "$ROOT_DIR/manifests/package-repository.lock" package-repository
+source "$ROOT_DIR/manifests/package-repository.lock"
 NEXAWRT_FLAVOR="${NEXAWRT_FLAVOR:-official}"
 WITH_FEEDS=1
 CLEAN=0
@@ -702,6 +705,34 @@ rsync -a "$ROOT_DIR/files/" files/
 if [[ "$NEXAWRT_FLAVOR" == nss && -d "$ROOT_DIR/files-nss" ]]; then
   rsync -a "$ROOT_DIR/files-nss/" files/
 fi
+
+repository_public_key="$ROOT_DIR/manifests/package-repository-public.pem"
+repository_package_set="$ROOT_DIR/manifests/package-repository-packages.txt"
+repository_package_source="$ROOT_DIR/packages/nexawrt-repository"
+for required in "$repository_public_key" "$repository_package_set" "$repository_package_source/Makefile"; do
+  [[ -f "$required" && ! -L "$required" ]] || {
+    echo "NexaWrt package repository input is missing or unsafe: $required" >&2
+    exit 1
+  }
+done
+if find "$repository_package_source" \( -type l -o -type f -links +1 \) -print -quit | grep -q .; then
+  echo "NexaWrt package repository source must not contain symbolic or hard links" >&2
+  exit 1
+fi
+repository_package_set_sha="$(if command -v sha256sum >/dev/null 2>&1; then sha256sum -- "$repository_package_set"; else shasum -a 256 -- "$repository_package_set"; fi | awk '{print $1}')"
+[[ "$repository_package_set_sha" == "$NEXAWRT_REPOSITORY_PACKAGE_SET_SHA256" ]] || {
+  echo "NexaWrt package repository package set differs from its lock" >&2
+  exit 1
+}
+repository_public_sha="$(openssl pkey -pubin -in "$repository_public_key" -outform DER 2>/dev/null |   { if command -v sha256sum >/dev/null 2>&1; then sha256sum; else shasum -a 256; fi; } | awk '{print $1}')"
+[[ "$repository_public_sha" == "$NEXAWRT_REPOSITORY_PUBLIC_SHA256" ]] || {
+  echo "NexaWrt package repository public key differs from its lock" >&2
+  exit 1
+}
+mkdir -p files/etc/apk/keys files/etc/apk/repositories.d package/nexawrt-repository
+install -m 0644 "$repository_public_key" files/etc/apk/keys/nexawrt-repository.pem
+printf '%s\n' "$NEXAWRT_REPOSITORY_INDEX_URL" > files/etc/apk/repositories.d/nexawrt.list
+rsync -a --delete "$repository_package_source/" package/nexawrt-repository/
 cp "$SEED_CONFIG" .config
 
 assert_existing_feed_checkouts_have_no_history_overrides || exit 1

@@ -85,6 +85,7 @@ mkdir -p \
   "$POLICY_REPO/manifests" \
   "$POLICY_REPO/configs" \
   "$POLICY_REPO/files" \
+  "$POLICY_REPO/packages" \
   "$POLICY_REPO/patches" \
   "$POLICY_REPO/patches/packages"
 cp "$ROOT_DIR/scripts/prepare.sh" "$POLICY_REPO/scripts/prepare.sh"
@@ -93,6 +94,10 @@ cp "$ROOT_DIR/scripts/complete-git-worktree-diff.sh" \
 cp "$ROOT_DIR/scripts/sanitize-git-environment.sh" "$POLICY_REPO/scripts/sanitize-git-environment.sh"
 cp "$ROOT_DIR/scripts/git-metadata-policy.sh" "$POLICY_REPO/scripts/git-metadata-policy.sh"
 cp "$ROOT_DIR/scripts/lock-file-policy.sh" "$POLICY_REPO/scripts/lock-file-policy.sh"
+cp "$ROOT_DIR/manifests/package-repository.lock" "$POLICY_REPO/manifests/package-repository.lock"
+cp "$ROOT_DIR/manifests/package-repository-public.pem" "$POLICY_REPO/manifests/package-repository-public.pem"
+cp "$ROOT_DIR/manifests/package-repository-packages.txt" "$POLICY_REPO/manifests/package-repository-packages.txt"
+cp -R "$ROOT_DIR/packages/nexawrt-repository" "$POLICY_REPO/packages/nexawrt-repository"
 printf 'fixture package patched\n' > "$FEED_REPO/pkg/Makefile"
 "$REAL_GIT" -C "$FEED_REPO" diff --binary --no-ext-diff -- pkg/Makefile \
   > "$PACKAGES_POLICY_PATCH"
@@ -275,9 +280,15 @@ cp "$ROOT_DIR/scripts/sanitize-git-environment.sh" "$VALIDATE_POLICY_REPO/script
 cp "$ROOT_DIR/scripts/git-metadata-policy.sh" "$VALIDATE_POLICY_REPO/scripts/git-metadata-policy.sh"
 cp "$ROOT_DIR/scripts/lock-file-policy.sh" "$VALIDATE_POLICY_REPO/scripts/lock-file-policy.sh"
 cp "$ROOT_DIR/manifests/upstream.lock" "$VALIDATE_POLICY_REPO/manifests/upstream.lock"
+cp "$ROOT_DIR/scripts/package-repository-key.sh" "$VALIDATE_POLICY_REPO/scripts/package-repository-key.sh"
+cp "$ROOT_DIR/manifests/package-repository.lock" "$VALIDATE_POLICY_REPO/manifests/package-repository.lock"
+cp "$ROOT_DIR/manifests/package-repository-public.pem" "$VALIDATE_POLICY_REPO/manifests/package-repository-public.pem"
+cp "$ROOT_DIR/manifests/package-repository-packages.txt" "$VALIDATE_POLICY_REPO/manifests/package-repository-packages.txt"
+mkdir -p "$VALIDATE_POLICY_REPO/packages"
+cp -R "$ROOT_DIR/packages/nexawrt-repository" "$VALIDATE_POLICY_REPO/packages/nexawrt-repository"
 printf 'packages %s %s\n' "$FEED_REPO" "$FEED_COMMIT" \
   > "$VALIDATE_POLICY_REPO/manifests/feeds.lock"
-chmod +x "$VALIDATE_POLICY_REPO/scripts/validate.sh"
+chmod +x "$VALIDATE_POLICY_REPO/scripts/validate.sh" "$VALIDATE_POLICY_REPO/scripts/package-repository-key.sh"
 NEXAWRT_FLAVOR=official "$VALIDATE_POLICY_REPO/scripts/validate.sh" \
   --source "$REUSE_WORK" --feed-policy-only >/dev/null
 mkdir -p "$REUSE_WORK/feeds/packages/.git/refs/replace"

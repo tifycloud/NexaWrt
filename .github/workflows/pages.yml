@@ -7,6 +7,10 @@ on:
       - 'site/**'
       - 'components/**'
       - 'manifests/community-feeds.lock'
+      - 'manifests/package-repository.lock'
+      - 'manifests/package-repository-public.pem'
+      - 'scripts/stage-package-repository.py'
+      - 'tests/test_package_repository.py'
       - 'tests/test_pages_ui.js'
       - 'tests/test_package_catalog.py'
       - 'tests/test_pages_policy.sh'
@@ -24,7 +28,7 @@ on:
       - 'evidence/vm-esxi/**'
       - '.github/workflows/pages.yml'
   workflow_run:
-    workflows: ['NexaWrt AX9000 reproducible RAM-test release', 'NexaWrt x86_64 VM release', 'Promote ESXi-accepted VM RC']
+    workflows: ['NexaWrt AX9000 reproducible RAM-test release', 'NexaWrt x86_64 VM release', 'Promote ESXi-accepted VM RC', 'NexaWrt signed APK package repository']
     types: [completed]
   schedule:
     - cron: '17 */6 * * *'
@@ -91,6 +95,68 @@ jobs:
             --site-root site/components
           if find site/components \( -type l -o -type f -links +1 \) -print -quit | grep -q .; then
             echo 'The staged component catalogs must not contain symbolic or hard links.' >&2
+            exit 1
+          fi
+      - name: Download, verify, and stage the signed APK repository
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          source scripts/lock-file-policy.sh
+          nexawrt_validate_lock_file manifests/package-repository.lock package-repository
+          source manifests/package-repository.lock
+          release_json=.pages-index/package-repository-release.json
+          release_error=.pages-index/package-repository-release.error
+          if ! gh api \
+              -H 'Accept: application/vnd.github+json' \
+              -H 'X-GitHub-Api-Version: 2026-03-10' \
+              "repos/$GITHUB_REPOSITORY/releases/tags/$NEXAWRT_REPOSITORY_RELEASE_TAG" \
+              > "$release_json" 2> "$release_error"; then
+            if grep -Fq 'HTTP 404' "$release_error"; then
+              echo "Signed APK repository $NEXAWRT_REPOSITORY_RELEASE_TAG is not published; refusing to deploy Pages without the locked repository." >&2
+              rm -f "$release_json" "$release_error"
+              exit 1
+            fi
+            cat "$release_error" >&2
+            exit 1
+          fi
+          rm -f "$release_error"
+          read -r asset_id asset_digest < <(python3 - "$release_json" "$NEXAWRT_REPOSITORY_ASSET" <<'PYDATA'
+          import json
+          import re
+          import sys
+
+          release = json.load(open(sys.argv[1], encoding='utf-8'))
+          if release.get('draft') is not False:
+              raise SystemExit('package repository release must be published')
+          assets = [item for item in release.get('assets', []) if item.get('name') == sys.argv[2]]
+          if len(assets) != 1:
+              raise SystemExit('package repository release must contain exactly one locked archive')
+          asset = assets[0]
+          digest = asset.get('digest')
+          if not isinstance(asset.get('id'), int) or not isinstance(digest, str) or not re.fullmatch(r'sha256:[0-9a-f]{64}', digest):
+              raise SystemExit('package repository release asset lacks a valid GitHub digest')
+          print(asset['id'], digest.removeprefix('sha256:'))
+          PYDATA
+          )
+          mkdir -p .pages-index/package-repository
+          archive=.pages-index/package-repository/$NEXAWRT_REPOSITORY_ASSET
+          gh api \
+            -H 'Accept: application/octet-stream' \
+            -H 'X-GitHub-Api-Version: 2026-03-10' \
+            "repos/$GITHUB_REPOSITORY/releases/assets/$asset_id" > "$archive"
+          archive_sha="$(sha256sum "$archive" | awk '{print $1}')"
+          [[ "$archive_sha" == "$asset_digest" ]] || {
+            echo 'Downloaded package repository archive differs from the GitHub asset digest.' >&2
+            exit 1
+          }
+          python3 scripts/stage-package-repository.py stage-pages \
+            --archive "$archive" \
+            --archive-sha256 "$archive_sha" \
+            --github-asset-json "$release_json" \
+            --site-dir site
+          if find site/packages \( -type l -o -type f -links +1 \) -print -quit | grep -q .; then
+            echo 'The staged APK repository must not contain symbolic or hard links.' >&2
             exit 1
           fi
       - name: Test Pages UI and policy

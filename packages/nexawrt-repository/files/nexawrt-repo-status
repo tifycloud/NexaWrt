@@ -1,0 +1,14 @@
+#!/bin/sh
+set -eu
+
+repo_file=/etc/apk/repositories.d/nexawrt.list
+key_file=/etc/apk/keys/nexawrt-repository.pem
+
+[ -r "$repo_file" ] || { echo "NexaWrt repository configuration is missing" >&2; exit 1; }
+[ -r "$key_file" ] || { echo "NexaWrt repository public key is missing" >&2; exit 1; }
+
+printf 'repository=%s\n' "$(sed -n '1p' "$repo_file")"
+printf 'public_key=%s\n' "$key_file"
+if [ "${1:-}" = update ]; then
+  exec apk update
+fi

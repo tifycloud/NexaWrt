@@ -1,0 +1,3 @@
+# Packages built into the signed NexaWrt testing repository.
+# One exact OpenWrt package name per line; additions require source review.
+nexawrt-repository
