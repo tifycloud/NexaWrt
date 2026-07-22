@@ -74,6 +74,54 @@ grep -Fq "github.event_name != 'pull_request'" "$workflow" || fail 'untrusted pu
 grep -Fq "github.ref == 'refs/heads/main'" "$workflow" || fail 'repository publishing is not restricted to main'
 grep -Fq 'secrets.NEXAWRT_REPOSITORY_SIGNING_PRIVATE_KEY' "$workflow" || fail 'repository signing secret is not wired explicitly'
 grep -Fq 'NEXAWRT_APK_PUBLIC_ONLY=1' "$workflow" || fail 'package build is not public-key-only'
+python3 - "$workflow" <<'PY_BUILD_ORDER' || fail 'package build prerequisites are missing, duplicated, or out of order'
+import pathlib
+import re
+import sys
+
+lines = pathlib.Path(sys.argv[1]).read_text().splitlines()
+step_name = 'Build the locked APK package set without a private key'
+publish_start = lines.index('  publish:')
+publish_end = next(
+    (index for index in range(publish_start + 1, len(lines))
+     if re.match(r'^  [A-Za-z0-9_-]+:\s*$', lines[index])),
+    len(lines),
+)
+step_starts = [
+    index for index in range(publish_start, publish_end)
+    if lines[index] == f'      - name: {step_name}'
+]
+if len(step_starts) != 1:
+    raise SystemExit(f'expected exactly one publish step named: {step_name}')
+
+step_start = step_starts[0]
+step_end = next(
+    (index for index in range(step_start + 1, publish_end)
+     if lines[index].startswith('      - ')),
+    publish_end,
+)
+step_lines = lines[step_start:step_end]
+if any(re.match(r'''^ {8}(?:if|["']if["'])\s*:''', line) for line in step_lines):
+    raise SystemExit('package build step must not be conditionally skipped')
+run_starts = [index for index, line in enumerate(step_lines) if line == '        run: |']
+if len(run_starts) != 1:
+    raise SystemExit('package build step must contain exactly one literal run block')
+run_lines = [line.strip() for line in step_lines[run_starts[0] + 1:]]
+required = [
+    'set -euo pipefail',
+    'make -C "$WORK_DIR" -j"$(nproc)" V=s tools/install',
+    'test -x "$WORK_DIR/staging_dir/host/bin/libdeflate-gzip"',
+    'make -C "$WORK_DIR" -j"$(nproc)" V=s toolchain/install',
+    'package/nexawrt-repository/compile',
+]
+positions = []
+for command in required:
+    if run_lines.count(command) != 1:
+        raise SystemExit(f'expected exactly one package build command: {command}')
+    positions.append(run_lines.index(command))
+if positions != sorted(positions) or len(set(positions)) != len(positions):
+    raise SystemExit('OpenWrt build prerequisites are not ordered inside the package build step')
+PY_BUILD_ORDER
 # The dollar expression is intentionally matched literally in workflow YAML.
 # shellcheck disable=SC2016
 grep -Fq -- '--public-key "$GITHUB_WORKSPACE/manifests/package-repository-public.pem"' "$workflow" || fail 'workflow does not pass the committed repository public key to the signed index builder'
