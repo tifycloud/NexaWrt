@@ -25,6 +25,7 @@ MAX_SHARDS = 3
 MAX_CURATED_CATALOG_BYTES = 2 * 1024 * 1024
 MAX_PACKAGE_INDEX_BYTES = 2 * 1024 * 1024
 MAX_PACKAGE_SHARD_BYTES = 16 * 1024 * 1024
+MAX_PACKAGE_PURPOSE_BYTES = 8 * 1024 * 1024
 READ_CHUNK_BYTES = 1024 * 1024
 SAFE_SHARD_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}\.json$")
 
@@ -323,6 +324,10 @@ def validate_and_stage(repo_root: Path, components_root: Path, site_root: Path) 
     _require_real_directory(package_root, "package shard source directory")
 
     resolver = _load_module(repo_root / "scripts" / "resolve-components.py", "nexawrt_component_resolver")
+    purpose_module = _load_module(repo_root / "scripts" / "package_purpose_zh.py", "nexawrt_package_purpose_zh")
+    validate_purposes = getattr(purpose_module, "validate_purpose_catalog", None)
+    if not callable(validate_purposes):
+        raise StagingError("package purpose module does not expose validate_purpose_catalog")
     expected_shards = getattr(resolver, "EXPECTED_PACKAGE_SHARDS", None)
     if not isinstance(expected_shards, dict) or len(expected_shards) != MAX_SHARDS:
         raise StagingError(f"backend must define exactly MAX_SHARDS={MAX_SHARDS} package shards")
@@ -365,6 +370,7 @@ def validate_and_stage(repo_root: Path, components_root: Path, site_root: Path) 
     _write_validated_file(staged_root / "package-catalog.json", staged_root, index_raw)
 
     blocked_reason, package_risk, allowed_architectures = _policy_functions(repo_root, resolver)
+    expected_purpose_keys: set[str] = set()
     for descriptor in index["shards"]:
         relative_name = descriptor["path"].removeprefix("components/packages/")
         if not SAFE_SHARD_NAME_RE.fullmatch(relative_name):
@@ -387,8 +393,27 @@ def validate_and_stage(repo_root: Path, components_root: Path, site_root: Path) 
         _validate_policy(
             shard, descriptor, resolver, blocked_reason, package_risk, allowed_architectures
         )
+        expected_purpose_keys.update(
+            f"{record['source']}/{record['package']}" for record in shard["packages"]
+        )
         _write_validated_file(staged_packages / relative_name, staged_packages, shard_raw)
         del shard_payload, shard, shard_raw
+
+    purpose_descriptor = index["purpose_catalog"]
+    purpose_path = components_root / Path(purpose_descriptor["path"]).name
+    purpose_raw = _read_regular_file(
+        purpose_path, components_root, MAX_PACKAGE_PURPOSE_BYTES, "Chinese package purpose catalog"
+    )
+    if hashlib.sha256(purpose_raw).hexdigest() != purpose_descriptor["sha256"]:
+        raise StagingError("SHA-256 mismatch for the Chinese package purpose catalog")
+    purpose_payload = _parse_json(purpose_raw, purpose_path, resolver)
+    try:
+        validate_purposes(purpose_payload, catalog["catalog_version"], expected_purpose_keys)
+    except Exception as error:
+        raise StagingError(f"Chinese package purpose catalog failed validation: {error}") from error
+    if purpose_payload["package_count"] != purpose_descriptor["package_count"]:
+        raise StagingError("Chinese package purpose count differs from its descriptor")
+    _write_validated_file(staged_root / purpose_path.name, staged_root, purpose_raw)
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -406,7 +431,7 @@ def main(argv: list[str] | None = None) -> int:
     except StagingError as error:
         print(f"component catalog staging rejected: {error}", file=sys.stderr)
         return 1
-    print(f"validated and staged exactly {MAX_SHARDS} component package shards")
+    print(f"validated and staged exactly {MAX_SHARDS} component package shards plus the Chinese purpose catalog")
     return 0
 
 

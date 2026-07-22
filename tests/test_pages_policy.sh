@@ -14,11 +14,13 @@ CATALOG_STAGER="$ROOT_DIR/scripts/validate-component-catalogs.py"
 CATALOG_STAGING_TEST="$ROOT_DIR/tests/test_component_catalog_staging.py"
 PACKAGE_CATALOG_GENERATOR="$ROOT_DIR/scripts/generate-package-catalog.py"
 PACKAGE_CATALOG_TEST="$ROOT_DIR/tests/test_package_catalog.py"
+PACKAGE_PURPOSE_GENERATOR="$ROOT_DIR/scripts/package_purpose_zh.py"
+PACKAGE_PURPOSE_TEST="$ROOT_DIR/tests/test_package_purpose_zh.py"
 COMMUNITY_FEED_LOCK="$ROOT_DIR/manifests/community-feeds.lock"
 SITE="$ROOT_DIR/site"
 CATALOG="$ROOT_DIR/components/catalog.json"
 
-for path in "$WORKFLOW" "$GENERATOR" "$PROOF_VERIFIER" "$PROOF_TEST" "$DEVICE_VALIDATOR" "$DEVICE_METADATA" "$DEVICE_TEST" "$UI_TEST" "$CATALOG_STAGER" "$CATALOG_STAGING_TEST" "$PACKAGE_CATALOG_GENERATOR" "$PACKAGE_CATALOG_TEST" "$COMMUNITY_FEED_LOCK" "$CATALOG" "$SITE/index.html" "$SITE/styles.css" "$SITE/app.js" "$SITE/favicon.svg" "$SITE/releases.json" "$SITE/.nojekyll"; do
+for path in "$WORKFLOW" "$GENERATOR" "$PROOF_VERIFIER" "$PROOF_TEST" "$DEVICE_VALIDATOR" "$DEVICE_METADATA" "$DEVICE_TEST" "$UI_TEST" "$CATALOG_STAGER" "$CATALOG_STAGING_TEST" "$PACKAGE_CATALOG_GENERATOR" "$PACKAGE_CATALOG_TEST" "$PACKAGE_PURPOSE_GENERATOR" "$PACKAGE_PURPOSE_TEST" "$COMMUNITY_FEED_LOCK" "$CATALOG" "$SITE/index.html" "$SITE/styles.css" "$SITE/app.js" "$SITE/favicon.svg" "$SITE/releases.json" "$SITE/.nojekyll"; do
   test -f "$path" || { echo "missing Pages file: $path" >&2; exit 1; }
 done
 
@@ -31,10 +33,13 @@ test -x "$CATALOG_STAGER"
 test -x "$CATALOG_STAGING_TEST"
 test -x "$PACKAGE_CATALOG_GENERATOR"
 test -x "$PACKAGE_CATALOG_TEST"
-python3 -m py_compile "$GENERATOR" "$PROOF_VERIFIER" "$PROOF_TEST" "$DEVICE_VALIDATOR" "$DEVICE_TEST" "$CATALOG_STAGER" "$CATALOG_STAGING_TEST" "$PACKAGE_CATALOG_GENERATOR" "$PACKAGE_CATALOG_TEST"
+test -x "$PACKAGE_PURPOSE_GENERATOR"
+test -x "$PACKAGE_PURPOSE_TEST"
+python3 -m py_compile "$GENERATOR" "$PROOF_VERIFIER" "$PROOF_TEST" "$DEVICE_VALIDATOR" "$DEVICE_TEST" "$CATALOG_STAGER" "$CATALOG_STAGING_TEST" "$PACKAGE_CATALOG_GENERATOR" "$PACKAGE_CATALOG_TEST" "$PACKAGE_PURPOSE_GENERATOR" "$PACKAGE_PURPOSE_TEST"
 python3 "$PROOF_TEST"
 python3 "$DEVICE_TEST"
 python3 "$CATALOG_STAGING_TEST"
+python3 "$PACKAGE_PURPOSE_TEST"
 python3 "$DEVICE_VALIDATOR" --device xiaomi-ax9000 --flavor official --channel ram-test >/dev/null
 python3 "$DEVICE_VALIDATOR" --device xiaomi-ax9000 --flavor nss --channel ram-test >/dev/null
 if python3 "$DEVICE_VALIDATOR" --device xiaomi-ax9000 --flavor official --channel stable >/dev/null 2>&1; then
@@ -201,14 +206,17 @@ grep -Fq -- "- 'components/**'" "$WORKFLOW"
 grep -Fq -- "- 'manifests/community-feeds.lock'" "$WORKFLOW"
 grep -Fq -- "- 'tests/test_pages_ui.js'" "$WORKFLOW"
 grep -Fq -- "- 'tests/test_package_catalog.py'" "$WORKFLOW"
+grep -Fq -- "- 'tests/test_package_purpose_zh.py'" "$WORKFLOW"
 grep -Fq -- "- 'tests/test_pages_policy.sh'" "$WORKFLOW"
 grep -Fq -- "- 'tests/test_component_catalog_staging.py'" "$WORKFLOW"
 grep -Fq -- "- 'scripts/component_package_policy.py'" "$WORKFLOW"
 grep -Fq -- "- 'scripts/generate-package-catalog.py'" "$WORKFLOW"
+grep -Fq -- "- 'scripts/package_purpose_zh.py'" "$WORKFLOW"
 grep -Fq -- "- 'scripts/resolve-components.py'" "$WORKFLOW"
 grep -Fq -- "- 'scripts/validate-component-catalogs.py'" "$WORKFLOW"
 grep -Fq 'node tests/test_pages_ui.js' "$WORKFLOW"
 grep -Fq 'python3 tests/test_package_catalog.py' "$WORKFLOW"
+grep -Fq 'python3 tests/test_package_purpose_zh.py' "$WORKFLOW"
 grep -Fq 'bash tests/test_pages_policy.sh' "$WORKFLOW"
 # Pages imports the backend contract instead of maintaining a weaker YAML copy.
 grep -Fq 'python3 scripts/validate-component-catalogs.py' "$WORKFLOW"

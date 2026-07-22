@@ -6,6 +6,7 @@ unset GITHUB_ACTIONS GITHUB_REF GITHUB_REPOSITORY GITHUB_RUN_ATTEMPT \
   GITHUB_RUN_ID GITHUB_SHA GITHUB_WORKFLOW_REF GITHUB_WORKFLOW_SHA
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 python3 "$ROOT_DIR/tests/test_component_catalog.py"
+python3 "$ROOT_DIR/tests/test_package_purpose_zh.py"
 "$ROOT_DIR/tests/test_custom_build_policy.sh"
 python3 "$ROOT_DIR/tests/test_custom_artifacts.py"
 

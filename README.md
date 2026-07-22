@@ -226,6 +226,8 @@ GitHub Pages 的 **组件 / Components** 区域读取仓库审核过的 `compone
 
 登录 GitHub 后打开 **Actions → NexaWrt custom component build → Run workflow**，按页面给出的 `target`、`flavor` 和 `components` 输入启动构建。空 `components` 表示仅使用目标默认组件；非空值只能是目录中的组件 ID。构建成功后从该次运行的 **Artifacts** 下载带 `custom-build-manifest.json` 和 `SHA256SUMS` 的产物。自定义产物是按需构建结果，不会自动冒充正式 Release；AX9000 产物仍受 RAM-only/真机门禁约束。
 
+软件包选择器同时加载 SHA-256 绑定的中文用途目录，为全部官方与社区候选包提供中文用途说明，并保留上游英文描述供核对。这里的 **100% 覆盖** 包含人工整理的 `exact`、按软件家族规则生成的 `family` 和按分类保守概述的 `category`，不代表每一条都经过逐包人工审阅。生成、验证、质量层级和维护规则见 [docs/PACKAGE-PURPOSES-ZH.md](docs/PACKAGE-PURPOSES-ZH.md)。
+
 两个 flavor 的安全构建流程都只允许 AX9000 single-large-UBI initramfs profile，artifact 名
 必须能追溯到 flavor，镜像文件名必须能追溯到 profile。当前 profile 明确关闭 sysupgrade 和
 factory 产物，产物门检会拒绝任何可刷写镜像。

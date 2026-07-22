@@ -35,6 +35,10 @@ from component_package_policy import (
     blocked_reason_for_record,
     risk_for,
 )
+from package_purpose_zh import (
+    build_purpose_catalog,
+    canonical_json as canonical_purpose_json,
+)
 
 ROOT = Path(__file__).resolve().parent.parent
 VM_LOCK_PATH = ROOT / "manifests" / "vm.lock"
@@ -936,11 +940,16 @@ def _fetch_sources(
     return package_sets, sources
 
 
-def _write_catalog(output_root: Path, shards: list[dict[str, Any]]) -> None:
+def _write_catalog(
+    output_root: Path,
+    shards: list[dict[str, Any]],
+    purpose_descriptor: dict[str, Any],
+) -> None:
     root_payload = {
-        "schema_version": 2,
+        "schema_version": 3,
         "catalog_version": CATALOG_VERSION,
         "openwrt_version": OPENWRT_VERSION,
+        "purpose_catalog": purpose_descriptor,
         "shards": shards,
     }
     _safe_write_output(
@@ -962,6 +971,7 @@ def generate(output_root: Path) -> dict[str, Any]:
         )
         source_cache: dict[tuple[tuple[str, str], ...], tuple[list[tuple[str, list[dict[str, Any]]]], list[dict[str, Any]]]] = {}
         shard_descriptors: list[dict[str, Any]] = []
+        purpose_records: dict[str, list[dict[str, Any]]] = {}
         for target, flavor, relative_path in SHARD_SPECS:
             repositories = x86_repositories if target == "x86_64" else ax_repositories
             if flavor == "nss":
@@ -996,6 +1006,7 @@ def generate(output_root: Path) -> dict[str, Any]:
                     )
                 )
                 sources = [*sources, _community_source(community_lock)]
+            purpose_records[f"{target}/{flavor}"] = records
             shard_payload = {
                 "schema_version": 2,
                 "catalog_version": CATALOG_VERSION,
@@ -1017,10 +1028,22 @@ def generate(output_root: Path) -> dict[str, Any]:
                 }
             )
 
-        _write_catalog(output_root, shard_descriptors)
+        purpose_payload = build_purpose_catalog(purpose_records, CATALOG_VERSION)
+        purpose_bytes = canonical_purpose_json(purpose_payload)
+        purpose_path = "components/package-purpose-zh.json"
+        _safe_write_output(output_root, purpose_path, purpose_bytes)
+        purpose_descriptor = {
+            "locale": "zh-CN",
+            "path": purpose_path,
+            "sha256": _sha256_bytes(purpose_bytes),
+            "package_count": purpose_payload["package_count"],
+        }
+        _write_catalog(output_root, shard_descriptors, purpose_descriptor)
         return {
+            "schema_version": 3,
             "catalog_version": CATALOG_VERSION,
             "openwrt_version": OPENWRT_VERSION,
+            "purpose_catalog": purpose_descriptor,
             "shards": shard_descriptors,
         }
 

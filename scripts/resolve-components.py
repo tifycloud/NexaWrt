@@ -41,6 +41,7 @@ ALLOWED_FLAVORS = {"official", "nss"}
 MAX_COMPONENT_CATALOG_BYTES = 2 * 1024 * 1024
 MAX_PACKAGE_CATALOG_BYTES = 2 * 1024 * 1024
 MAX_PACKAGE_SHARD_BYTES = 16 * 1024 * 1024
+MAX_PACKAGE_RECORDS = 50000
 MAX_COMMUNITY_LOCK_BYTES = 16 * 1024
 IO_CHUNK_SIZE = 1024 * 1024
 NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
@@ -82,7 +83,9 @@ GIT_COMMIT_RE = re.compile(r"^[0-9a-f]{40}$")
 LOCK_LINE_RE = re.compile(r'^([A-Z][A-Z0-9_]*)="([^"\\]*)"$')
 PACKAGE_ID_RE = re.compile(r"^pkg-[0-9a-f]{16}$")
 PACKAGE_SHARD_PATH_RE = re.compile(r"^components/packages/[a-z0-9][a-z0-9_-]{0,63}\.json$")
-PACKAGE_CATALOG_KEYS = {"schema_version", "catalog_version", "openwrt_version", "shards"}
+PACKAGE_CATALOG_KEYS = {"schema_version", "catalog_version", "openwrt_version", "purpose_catalog", "shards"}
+PACKAGE_PURPOSE_DESCRIPTOR_KEYS = {"locale", "path", "sha256", "package_count"}
+PACKAGE_PURPOSE_CATALOG_RELATIVE_PATH = "components/package-purpose-zh.json"
 PACKAGE_DESCRIPTOR_KEYS = {
     "target", "flavor", "path", "sha256", "package_count", "selectable_count", "sources"
 }
@@ -575,13 +578,26 @@ def validate_package_catalog_index(payload: Any, catalog: dict[str, Any]) -> dic
     if not isinstance(payload, dict):
         raise CatalogError("package catalog root must be an object")
     _exact_keys(payload, PACKAGE_CATALOG_KEYS, "package catalog")
-    if type(payload["schema_version"]) is not int or payload["schema_version"] != 2:
-        raise CatalogError("package catalog schema_version must be integer 2")
+    if type(payload["schema_version"]) is not int or payload["schema_version"] != 3:
+        raise CatalogError("package catalog schema_version must be integer 3")
     if payload["catalog_version"] != catalog["catalog_version"]:
         raise CatalogError("package catalog version differs from component catalog")
     if payload["openwrt_version"] != OPENWRT_VERSION:
         raise CatalogError(f"package catalog openwrt_version must be {OPENWRT_VERSION}")
     community_lock = _read_community_lock()
+
+    purpose = payload["purpose_catalog"]
+    if not isinstance(purpose, dict):
+        raise CatalogError("package purpose descriptor must be an object")
+    _exact_keys(purpose, PACKAGE_PURPOSE_DESCRIPTOR_KEYS, "package purpose descriptor")
+    if purpose["locale"] != "zh-CN" or purpose["path"] != PACKAGE_PURPOSE_CATALOG_RELATIVE_PATH:
+        raise CatalogError("package purpose descriptor identity is invalid")
+    purpose_digest = _nonempty_text(purpose["sha256"], "package purpose descriptor.sha256", 64)
+    if not SHA256_RE.fullmatch(purpose_digest):
+        raise CatalogError("package purpose descriptor.sha256 is invalid")
+    purpose_count = purpose["package_count"]
+    if type(purpose_count) is not int or purpose_count < 1 or purpose_count > MAX_PACKAGE_RECORDS:
+        raise CatalogError("package purpose descriptor.package_count is invalid")
 
     raw_shards = payload["shards"]
     if not isinstance(raw_shards, list) or len(raw_shards) != len(EXPECTED_PACKAGE_SHARDS):
@@ -610,8 +626,8 @@ def validate_package_catalog_index(payload: Any, catalog: dict[str, Any]) -> dic
             raise CatalogError(f"{context}.sha256 is invalid")
         package_count = raw["package_count"]
         selectable_count = raw["selectable_count"]
-        if type(package_count) is not int or not 1 <= package_count <= 50000:
-            raise CatalogError(f"{context}.package_count must be an integer from 1 to 50000")
+        if type(package_count) is not int or not 1 <= package_count <= MAX_PACKAGE_RECORDS:
+            raise CatalogError(f"{context}.package_count must be an integer from 1 to MAX_PACKAGE_RECORDS")
         if type(selectable_count) is not int or not 0 <= selectable_count <= package_count:
             raise CatalogError(f"{context}.selectable_count is invalid")
         raw_sources = raw["sources"]
@@ -685,9 +701,15 @@ def validate_package_catalog_index(payload: Any, catalog: dict[str, Any]) -> dic
     if seen_pairs != set(EXPECTED_PACKAGE_SHARDS):
         raise CatalogError("package catalog is missing required target/flavor shards")
     return {
-        "schema_version": 2,
+        "schema_version": 3,
         "catalog_version": payload["catalog_version"],
         "openwrt_version": payload["openwrt_version"],
+        "purpose_catalog": {
+            "locale": "zh-CN",
+            "path": PACKAGE_PURPOSE_CATALOG_RELATIVE_PATH,
+            "sha256": purpose_digest,
+            "package_count": purpose_count,
+        },
         "shards": descriptors,
     }
 
@@ -718,8 +740,8 @@ def validate_package_shard(
     raw_packages = payload["packages"]
     if not isinstance(raw_packages, list) or len(raw_packages) != descriptor["package_count"]:
         raise CatalogError("package shard package_count differs from root index")
-    if len(raw_packages) > 50000:
-        raise CatalogError("package shard exceeds 50000 records")
+    if len(raw_packages) > MAX_PACKAGE_RECORDS:
+        raise CatalogError(f"package shard exceeds {MAX_PACKAGE_RECORDS} records")
 
     category_ids = {category["id"] for category in catalog["categories"]}
     bundle_ids = {component["id"] for component in catalog["components"]}

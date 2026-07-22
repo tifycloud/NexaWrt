@@ -604,13 +604,18 @@ const COMPONENT_KEYS = [
   'id', 'name', 'description', 'category', 'packages', 'depends', 'conflicts',
   'supported_targets', 'default_for'
 ];
-const PACKAGE_CATALOG_ROOT_KEYS = ['schema_version', 'catalog_version', 'openwrt_version', 'shards'];
+const PACKAGE_CATALOG_ROOT_KEYS = ['schema_version', 'catalog_version', 'openwrt_version', 'purpose_catalog', 'shards'];
+const PACKAGE_PURPOSE_DESCRIPTOR_KEYS = ['locale', 'path', 'sha256', 'package_count'];
+const PACKAGE_PURPOSE_CATALOG_PATH = 'components/package-purpose-zh.json';
 const PACKAGE_CATALOG_SHARD_INDEX_KEYS = [
   'target', 'flavor', 'path', 'sha256', 'package_count', 'selectable_count', 'sources'
 ];
 const OFFICIAL_PACKAGE_SOURCE_KEYS = ['feed', 'url', 'sha256'];
 const COMMUNITY_PACKAGE_SOURCE_KEYS = ['feed', 'url', 'sha256', 'metadata_format', 'metadata_signed', 'candidate_repository', 'candidate_commit', 'catalog_sha256'];
 const PACKAGE_CATALOG_SHARD_KEYS = ['schema_version', 'catalog_version', 'target', 'flavor', 'packages'];
+const PACKAGE_PURPOSE_CATALOG_KEYS = ['schema_version', 'catalog_version', 'package_count', 'quality_counts', 'purposes'];
+const PACKAGE_PURPOSE_QUALITY_KEYS = ['exact', 'family', 'category'];
+const PACKAGE_PURPOSE_ENTRY_KEYS = ['purpose', 'quality'];
 const PACKAGE_RECORD_KEYS = [
   'id', 'package', 'version', 'description', 'feed', 'source', 'installed_size', 'category',
   'arch', 'risk', 'selectable', 'blocked_reason'
@@ -628,6 +633,13 @@ const KIDDIN9_CANDIDATE_COMMIT = '9f2092b4f204fc9948226d9a3f5166b69976af48';
 const KIDDIN9_CATALOG_SHA256 = '4b14b36b0c9839f81bb6a56ffc1ac94384603c7a9c93e7f63ac48ffc4c699292';
 const REQUIRED_COMPONENT_TARGETS = new Set(['x86_64', 'xiaomi_ax9000']);
 const PACKAGE_RISKS = new Set(['standard', 'advanced', 'system']);
+const PACKAGE_PURPOSE_QUALITIES = new Set(PACKAGE_PURPOSE_QUALITY_KEYS);
+const PACKAGE_PURPOSE_QUALITY_LABELS = {
+  exact: '人工精确',
+  family: '家族规则生成',
+  category: '分类概述，具体用途请核对上游'
+};
+const MAX_PACKAGE_PURPOSE_LENGTH = 360;
 const PACKAGE_ARCHITECTURES = {
   'x86_64/official': new Set(['x86_64', 'noarch']),
   'xiaomi_ax9000/official': new Set(['aarch64_cortex-a53', 'noarch']),
@@ -643,6 +655,8 @@ const CUSTOM_BUILD_FLAVORS = {
 };
 let componentCatalog = null;
 let packageCatalogRoot = null;
+let packagePurposeCatalog = null;
+let packagePurposeMap = new Map();
 let currentPackageShard = null;
 let currentPackageMap = new Map();
 let currentPackageSearchTerms = new Map();
@@ -658,6 +672,12 @@ let packageBrowseSignature = '';
 function validCatalogText(value, maxLength, allowEmpty = false) {
   return typeof value === 'string' && value === value.trim() && value.length <= maxLength &&
     (allowEmpty || value.length > 0) && !/[\u0000-\u001f\u007f]/.test(value);
+}
+
+function validPackagePurposeText(value) {
+  return typeof value === 'string' && value === value.trim() && value.length > 0 &&
+    [...value].length <= MAX_PACKAGE_PURPOSE_LENGTH && !/[\p{Cc}\p{Cf}]/u.test(value) &&
+    /[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]/.test(value);
 }
 
 function validComponentId(value) {
@@ -762,9 +782,14 @@ function packageShardFetchUrl(path) {
 }
 
 function validatePackageCatalogRoot(root, catalog) {
-  if (!exactKeys(root, PACKAGE_CATALOG_ROOT_KEYS) || root.schema_version !== 2 ||
+  if (!exactKeys(root, PACKAGE_CATALOG_ROOT_KEYS) || root.schema_version !== 3 ||
       root.catalog_version !== catalog.catalog_version || !SAFE_CATALOG_VERSION.test(root.catalog_version) ||
-      !SAFE_OPENWRT_VERSION.test(root.openwrt_version) || !Array.isArray(root.shards) ||
+      !SAFE_OPENWRT_VERSION.test(root.openwrt_version) ||
+      !exactKeys(root.purpose_catalog, PACKAGE_PURPOSE_DESCRIPTOR_KEYS) ||
+      root.purpose_catalog.locale !== 'zh-CN' || root.purpose_catalog.path !== PACKAGE_PURPOSE_CATALOG_PATH ||
+      !SAFE_SHA256.test(root.purpose_catalog.sha256) ||
+      !Number.isSafeInteger(root.purpose_catalog.package_count) || root.purpose_catalog.package_count < 1 ||
+      root.purpose_catalog.package_count > MAX_PACKAGE_RECORDS || !Array.isArray(root.shards) ||
       root.shards.length < 1 || root.shards.length > MAX_PACKAGE_SHARDS) return false;
   const targetIds = new Set(catalog.targets.map((target) => target.id));
   const shardKeys = new Set();
@@ -797,6 +822,60 @@ function validatePackageCatalogRoot(root, catalog) {
     }
   }
   return true;
+}
+
+function validatePackagePurposeCatalog(value, catalog, descriptor) {
+  if (!exactKeys(value, PACKAGE_PURPOSE_CATALOG_KEYS) || value.schema_version !== 1 ||
+      value.catalog_version !== catalog.catalog_version || value.package_count !== descriptor.package_count ||
+      !Number.isSafeInteger(value.package_count) ||
+      value.package_count < 1 || value.package_count > MAX_PACKAGE_RECORDS ||
+      !exactKeys(value.quality_counts, PACKAGE_PURPOSE_QUALITY_KEYS) ||
+      !value.purposes || typeof value.purposes !== 'object' || Array.isArray(value.purposes) ||
+      Object.keys(value.purposes).length !== value.package_count) return false;
+  const counted = { exact: 0, family: 0, category: 0 };
+  for (const [key, entry] of Object.entries(value.purposes)) {
+    const slash = key.indexOf('/');
+    const source = key.slice(0, slash);
+    const packageName = key.slice(slash + 1);
+    if (slash < 1 || !['official', 'kiddin9'].includes(source) || !SAFE_OPENWRT_TOKEN.test(packageName) ||
+        !exactKeys(entry, PACKAGE_PURPOSE_ENTRY_KEYS) || !validPackagePurposeText(entry.purpose) ||
+        !PACKAGE_PURPOSE_QUALITIES.has(entry.quality)) return false;
+    counted[entry.quality] += 1;
+  }
+  return PACKAGE_PURPOSE_QUALITY_KEYS.every((quality) =>
+    Number.isSafeInteger(value.quality_counts[quality]) && value.quality_counts[quality] >= 0 &&
+    value.quality_counts[quality] === counted[quality]
+  ) && Object.values(counted).reduce((total, count) => total + count, 0) === value.package_count;
+}
+
+function packagePurposeKey(record) {
+  return `${record.source}/${record.package}`;
+}
+
+function packagePurposeEntry(record) {
+  return packagePurposeMap.get(packagePurposeKey(record)) || {
+    purpose: packagePurposeFallback(record),
+    quality: 'category'
+  };
+}
+
+function packagePurposeFor(record) {
+  return packagePurposeEntry(record).purpose;
+}
+
+function packagePurposeQualityLabel(record) {
+  return PACKAGE_PURPOSE_QUALITY_LABELS[packagePurposeEntry(record).quality];
+}
+
+function packagePurposeQualitySummary() {
+  if (!packagePurposeCatalog) return '';
+  const counts = packagePurposeCatalog.quality_counts;
+  return `中文目录完整性已验证：${packagePurposeCatalog.package_count} 条` +
+    `（人工精确 ${counts.exact} / 家族规则 ${counts.family} / 分类概述 ${counts.category}）`;
+}
+
+function purposeCatalogCoversShard(shard) {
+  return packagePurposeCatalog !== null && shard.packages.every((record) => packagePurposeMap.has(packagePurposeKey(record)));
 }
 
 function validatePackageCatalogShard(shard, descriptor, catalog) {
@@ -1099,8 +1178,11 @@ function makePackageOption(record) {
   meta.textContent = `${record.version} · ${record.arch} · ${record.feed} · ${record.source === 'kiddin9' ? '社区候选 / kiddin9（未审核）' : '官方'} · ${formatInstalledSize(record.installed_size)}`;
   const detail = document.createElement('small');
   detail.className = 'component-purpose';
-  detail.textContent = `用途 / Purpose：${record.description || packagePurposeFallback(record)}`;
-  copy.append(titleRow, meta, detail);
+  detail.textContent = `中文用途（${packagePurposeQualityLabel(record)}）：${packagePurposeFor(record)}`;
+  const upstream = document.createElement('small');
+  upstream.className = 'component-upstream-description';
+  upstream.textContent = `上游说明 / Upstream：${record.description || '上游未提供说明 / No upstream description'}`;
+  copy.append(titleRow, meta, detail, upstream);
   if (!record.selectable) {
     const blocked = document.createElement('small');
     blocked.className = 'package-blocked-reason';
@@ -1360,7 +1442,7 @@ function activateVerifiedPackageShard(shard, searchTerms) {
 function packageSearchTerms(shard) {
   return new Map(shard.packages.map((record) => [
     record.id,
-    `${record.package} ${record.description} ${record.version} ${record.arch} ${record.feed} ${record.source} ${record.category} ${record.id}`
+    `${record.package} ${packagePurposeFor(record)} ${record.description} ${record.version} ${record.arch} ${record.feed} ${record.source} ${record.category} ${record.id}`
       .toLocaleLowerCase('zh-CN')
   ]));
 }
@@ -1394,6 +1476,9 @@ async function loadPackageShardForSelection() {
       if (!validatePackageCatalogShard(shard, descriptor, componentCatalog)) {
         throw new Error('unexpected package shard schema');
       }
+      if (!purposeCatalogCoversShard(shard)) {
+        throw new Error('Chinese package purpose catalog does not cover this shard');
+      }
       if (!await validCommunityCandidateProjection(shard, descriptor)) {
         throw new Error('community candidate projection mismatch');
       }
@@ -1413,6 +1498,7 @@ async function loadPackageShardForSelection() {
     const communityCount = verified.shard.packages.filter((record) => record.source === 'kiddin9').length;
     setPackageCatalogStatus(
       `OpenWrt ${packageCatalogRoot.openwrt_version} · ${descriptor.package_count} 个包，${descriptor.selectable_count} 个可选择` +
+      ` · ${packagePurposeQualitySummary()}` +
       (communityCount ? ` · 社区候选 ${communityCount}（未审核、全部不可选；仅记录锁定 Git provenance）` : '')
     );
     renderComponentChoices();
@@ -1451,6 +1537,8 @@ function resetComponentsForTarget() {
 function setupComponentBuilder(catalog) {
   componentCatalog = catalog;
   packageCatalogRoot = null;
+  packagePurposeCatalog = null;
+  packagePurposeMap = new Map();
   currentPackageShard = null;
   currentPackageMap = new Map();
   currentPackageSearchTerms = new Map();
@@ -1522,16 +1610,32 @@ async function loadPackageCatalogRoot(catalog) {
     if (!response.ok) throw new Error(`HTTP ${response.status}`);
     const root = await response.json();
     if (!validatePackageCatalogRoot(root, catalog)) throw new Error('unexpected package catalog root schema');
+
+    const purposeResponse = await fetch(packageShardFetchUrl(root.purpose_catalog.path), { cache: 'no-store', credentials: 'same-origin' });
+    if (!purposeResponse.ok) throw new Error(`Chinese purpose catalog HTTP ${purposeResponse.status}`);
+    const purposeRaw = await purposeResponse.text();
+    if (await sha256Hex(purposeRaw) !== root.purpose_catalog.sha256) {
+      throw new Error('Chinese purpose catalog sha256 mismatch');
+    }
+    const purposes = JSON.parse(purposeRaw);
+    if (!validatePackagePurposeCatalog(purposes, catalog, root.purpose_catalog)) {
+      throw new Error('unexpected Chinese package purpose catalog schema');
+    }
+
     packageCatalogRoot = root;
-    setPackageCatalogStatus(`OpenWrt ${root.openwrt_version} · 官方包根索引已验证 / Package index verified`);
+    packagePurposeCatalog = purposes;
+    packagePurposeMap = new Map(Object.entries(purposes.purposes));
+    setPackageCatalogStatus(`OpenWrt ${root.openwrt_version} · ${packagePurposeQualitySummary()}`);
     return loadPackageShardForSelection();
   } catch (error) {
     packageCatalogRoot = null;
+    packagePurposeCatalog = null;
+    packagePurposeMap = new Map();
     clearOfficialPackageSelections();
-    setPackageCatalogStatus('官方包索引不可用；精选套餐仍可使用。 / Official packages disabled.', true);
+    setPackageCatalogStatus('官方包或中文用途目录不可用；精选套餐仍可使用。 / Official packages disabled.', true);
     renderComponentChoices();
     await updateBuildRequest();
-    console.error('Unable to load the official package catalog root:', error);
+    console.error('Unable to load the official package catalog root and Chinese purposes:', error);
   }
 }
 
@@ -1549,6 +1653,8 @@ async function loadComponentCatalog() {
   } catch (error) {
     componentCatalog = null;
     packageCatalogRoot = null;
+    packagePurposeCatalog = null;
+    packagePurposeMap = new Map();
     currentPackageShard = null;
     currentPackageMap = new Map();
     requestedComponentIds.clear();

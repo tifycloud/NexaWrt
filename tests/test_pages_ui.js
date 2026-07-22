@@ -156,7 +156,7 @@ function makeDom() {
 const root = path.resolve(__dirname, '..');
 const source = fs.readFileSync(path.join(root, 'site/app.js'), 'utf8');
 const testedSource = source.replace(/\nloadReleases\(\);\nloadComponentCatalog\(\);\s*$/, '\n') +
-  '\nglobalThis.hooks = { validDevice, validRelease, validReleaseGroup, validVmRelease, validVmReleaseGroup, validUtcTimestamp, compareVersions, loadReleases, generateSnippet, validateComponentCatalog, validatePackageCatalogRoot, validatePackageCatalogShard, validCommunityCandidateProjection, resolveComponentSelection, componentHashPayload, canonicalJson, sha256Hex, normalizedBuildRequest, actionsInputs, loadComponentCatalog, loadPackageShardForSelection, changeComponentSelection, renderComponentChoices, setCurrentPackageRecords: (records) => { currentPackageShard = { packages: records }; currentPackageMap = new Map(records.map((record) => [record.id, record])); currentPackageSearchTerms = packageSearchTerms(currentPackageShard); }, clearVerifiedPackageShardCache: () => verifiedPackageShardCache.clear(), getCurrentPackageRecords: () => [...currentPackageMap.values()], getRequestedComponentIds: () => [...requestedComponentIds], getResolvedComponentIds: () => [...resolvedComponentIds] };\n';
+  '\nglobalThis.hooks = { validDevice, validRelease, validReleaseGroup, validVmRelease, validVmReleaseGroup, validUtcTimestamp, compareVersions, loadReleases, generateSnippet, validateComponentCatalog, validatePackageCatalogRoot, validatePackagePurposeCatalog, validatePackageCatalogShard, validCommunityCandidateProjection, resolveComponentSelection, componentHashPayload, canonicalJson, sha256Hex, normalizedBuildRequest, actionsInputs, loadComponentCatalog, loadPackageShardForSelection, changeComponentSelection, renderComponentChoices, setCurrentPackageRecords: (records) => { currentPackageShard = { packages: records }; currentPackageMap = new Map(records.map((record) => [record.id, record])); currentPackageSearchTerms = packageSearchTerms(currentPackageShard); }, clearVerifiedPackageShardCache: () => verifiedPackageShardCache.clear(), getCurrentPackageRecords: () => [...currentPackageMap.values()], getRequestedComponentIds: () => [...requestedComponentIds], getResolvedComponentIds: () => [...resolvedComponentIds] };\n';
 const document = makeDom();
 const loggedErrors = [];
 const context = vm.createContext({
@@ -166,7 +166,7 @@ const context = vm.createContext({
   console: { error: (...args) => loggedErrors.push(args) },
 });
 vm.runInContext(testedSource, context, { filename: 'site/app.js' });
-const { validDevice, validRelease, validReleaseGroup, validVmRelease, validVmReleaseGroup, validUtcTimestamp, compareVersions, loadReleases, generateSnippet, validateComponentCatalog, validatePackageCatalogRoot, validatePackageCatalogShard, validCommunityCandidateProjection, resolveComponentSelection, componentHashPayload, canonicalJson, sha256Hex, normalizedBuildRequest, actionsInputs, loadComponentCatalog, loadPackageShardForSelection, changeComponentSelection, renderComponentChoices, setCurrentPackageRecords, clearVerifiedPackageShardCache, getCurrentPackageRecords, getRequestedComponentIds, getResolvedComponentIds } = context.hooks;
+const { validDevice, validRelease, validReleaseGroup, validVmRelease, validVmReleaseGroup, validUtcTimestamp, compareVersions, loadReleases, generateSnippet, validateComponentCatalog, validatePackageCatalogRoot, validatePackagePurposeCatalog, validatePackageCatalogShard, validCommunityCandidateProjection, resolveComponentSelection, componentHashPayload, canonicalJson, sha256Hex, normalizedBuildRequest, actionsInputs, loadComponentCatalog, loadPackageShardForSelection, changeComponentSelection, renderComponentChoices, setCurrentPackageRecords, clearVerifiedPackageShardCache, getCurrentPackageRecords, getRequestedComponentIds, getResolvedComponentIds } = context.hooks;
 const clone = (value) => JSON.parse(JSON.stringify(value));
 
 const index = JSON.parse(fs.readFileSync(path.join(root, 'site/releases.json'), 'utf8'));
@@ -565,7 +565,7 @@ async function makePackageCatalogFixtures() {
   for (let index = 0; index < 147; index += 1) {
     const serial = String(index).padStart(3, '0');
     x86Packages.push(packageRecord(`pkg-demo-${serial}`, `luci-app-demo-${serial}`, {
-      description: `demo-search package ${serial}`,
+      description: index === 1 ? '' : `demo-search package ${serial}`,
       feed: index % 2 ? 'packages' : 'luci',
       category: index % 3 ? 'services' : 'network',
       risk: index % 5 ? 'standard' : 'advanced',
@@ -614,14 +614,59 @@ async function makePackageCatalogFixtures() {
       sources: shardSources(feeds),
     });
   }
+
+  const purposes = {};
+  const qualityCounts = { exact: 0, family: 0, category: 0 };
+  for (const shard of shards) {
+    for (const record of shard.packages) {
+      const key = `${record.source}/${record.package}`;
+      if (Object.hasOwn(purposes, key)) continue;
+      let purpose = `用于管理或扩展 ${record.package} 相关功能。`;
+      let quality = 'category';
+      if (key === 'official/luci-app-firewall-plus') {
+        purpose = '防火墙网页管理、访问控制和规则配置。';
+        quality = 'exact';
+      } else if (key === 'official/block-mount-extra') {
+        purpose = '提供存储挂载相关软件包家族功能。';
+        quality = 'family';
+      } else if (key === 'official/luci-app-demo-042') {
+        purpose = '中文搜索测试：演示网页组件与服务管理。';
+        quality = 'exact';
+      } else if (key === 'kiddin9/luci-app-openclash') {
+        purpose = '代理管理、策略分流与订阅配置。';
+        quality = 'exact';
+      }
+      purposes[key] = { purpose, quality };
+      qualityCounts[quality] += 1;
+    }
+  }
+  const purposeCatalog = {
+    schema_version: 1,
+    catalog_version: componentCatalog.catalog_version,
+    package_count: Object.keys(purposes).length,
+    quality_counts: qualityCounts,
+    purposes,
+  };
+  const purposePath = 'components/package-purpose-zh.json';
+  const purposeRaw = JSON.stringify(purposeCatalog);
+  rawByPath.set(purposePath, purposeRaw);
+
   return {
     root: {
-      schema_version: 2,
+      schema_version: 3,
       catalog_version: componentCatalog.catalog_version,
       openwrt_version: '25.12.5',
+      purpose_catalog: {
+        locale: 'zh-CN',
+        path: purposePath,
+        sha256: await digestText(purposeRaw),
+        package_count: purposeCatalog.package_count,
+      },
       shards: descriptors,
     },
     shards,
+    purposeCatalog,
+    purposePath,
     rawByPath,
   };
 }
@@ -688,6 +733,23 @@ async function assertFrontendBackendHashContract(target, flavor, requestedIds, p
   const packageFixtures = await makePackageCatalogFixtures();
   assert.equal(validateComponentCatalog(componentCatalog), true);
   assert.equal(validatePackageCatalogRoot(packageFixtures.root, componentCatalog), true);
+  assert.equal(
+    validatePackagePurposeCatalog(packageFixtures.purposeCatalog, componentCatalog, packageFixtures.root.purpose_catalog),
+    true
+  );
+  const purposeTextBoundary = clone(packageFixtures.purposeCatalog);
+  purposeTextBoundary.purposes['official/luci-app-firewall-plus'].purpose = '中'.repeat(359);
+  assert.equal(validatePackagePurposeCatalog(purposeTextBoundary, componentCatalog, packageFixtures.root.purpose_catalog), true);
+  purposeTextBoundary.purposes['official/luci-app-firewall-plus'].purpose = '中'.repeat(360);
+  assert.equal(validatePackagePurposeCatalog(purposeTextBoundary, componentCatalog, packageFixtures.root.purpose_catalog), true);
+  purposeTextBoundary.purposes['official/luci-app-firewall-plus'].purpose = '中'.repeat(361);
+  assert.equal(validatePackagePurposeCatalog(purposeTextBoundary, componentCatalog, packageFixtures.root.purpose_catalog), false);
+  purposeTextBoundary.purposes['official/luci-app-firewall-plus'].purpose = '兼容汉字：豈';
+  assert.equal(validatePackagePurposeCatalog(purposeTextBoundary, componentCatalog, packageFixtures.root.purpose_catalog), true);
+  purposeTextBoundary.purposes['official/luci-app-firewall-plus'].purpose = '包含双向控制符：‮';
+  assert.equal(validatePackagePurposeCatalog(purposeTextBoundary, componentCatalog, packageFixtures.root.purpose_catalog), false);
+  purposeTextBoundary.purposes['official/luci-app-firewall-plus'].purpose = '   ';
+  assert.equal(validatePackagePurposeCatalog(purposeTextBoundary, componentCatalog, packageFixtures.root.purpose_catalog), false);
   assert.equal(validatePackageCatalogShard(packageFixtures.shards[0], packageFixtures.root.shards[0], componentCatalog), true);
   assert.equal(validatePackageCatalogShard(packageFixtures.shards[1], packageFixtures.root.shards[1], componentCatalog), true);
   assert.equal(await validCommunityCandidateProjection(packageFixtures.shards[1], packageFixtures.root.shards[1]), true);
@@ -752,11 +814,18 @@ async function assertFrontendBackendHashContract(target, flavor, requestedIds, p
   assert.deepEqual(initialCalls, [
     'components/catalog.json',
     'components/package-catalog.json',
+    'components/package-purpose-zh.json',
     'components/packages/x86_64-official.json',
   ]);
   assert.equal(document.querySelector('#component-status').classList.contains('error'), false);
   assert.equal(document.querySelector('#component-package-status').classList.contains('error'), false);
   assert.match(document.querySelector('#component-package-status').textContent, /OpenWrt 25\.12\.5/);
+  assert.match(document.querySelector('#component-package-status').textContent, /中文目录完整性已验证/);
+  assert.match(
+    document.querySelector('#component-package-status').textContent,
+    new RegExp(`人工精确 ${packageFixtures.purposeCatalog.quality_counts.exact} / 家族规则 ${packageFixtures.purposeCatalog.quality_counts.family} / 分类概述 ${packageFixtures.purposeCatalog.quality_counts.category}`)
+  );
+  assert.equal(initialCalls.includes('components/package-purpose-zh.json'), true);
   assert.match(document.querySelector('#component-package-status').textContent, /150 个包，149 个可选择/);
   assert.equal(document.querySelector('#component-target').disabled, false);
   assert.equal(document.querySelector('#component-target').value, 'x86_64');
@@ -778,6 +847,8 @@ async function assertFrontendBackendHashContract(target, flavor, requestedIds, p
   assert.match(document.querySelector('#component-result-status').textContent, /无需搜索即可浏览：共 150 个软件包，当前显示第 1–100 个/);
   assert.match(flattenedText('#component-list'), /精选套餐/);
   assert.match(flattenedText('#component-list'), /用途 \/ Purpose：/);
+  assert.match(flattenedText('#component-list'), /中文用途（人工精确）：防火墙网页管理、访问控制和规则配置。/);
+  assert.match(flattenedText('#component-list'), /上游说明 \/ Upstream：filter-probe/);
   assert.match(flattenedText('#component-list'), /第 1 \/ 2 页/);
   const nextPage = flattenChildren(document.querySelector('#component-list'))
     .find((item) => item.getAttribute('data-package-page-next') === 'true');
@@ -794,8 +865,25 @@ async function assertFrontendBackendHashContract(target, flavor, requestedIds, p
   document.querySelector('#component-search').value = 'demo-search';
   renderComponentChoices();
   assert.equal(packageOptions().length, 100);
-  assert.match(document.querySelector('#component-result-status').textContent, /共 147 个软件包，当前显示第 1–100 个/);
+  assert.match(document.querySelector('#component-result-status').textContent, /共 146 个软件包，当前显示第 1–100 个/);
   assert.match(flattenedText('#component-list'), /第 1 \/ 2 页/);
+
+  document.querySelector('#component-search').value = '中文搜索测试';
+  renderComponentChoices();
+  assert.equal(packageOptions().length, 1);
+  assert.match(flattenedText('#component-list'), /luci-app-demo-042/);
+  assert.match(flattenedText('#component-list'), /中文用途（人工精确）：中文搜索测试：演示网页组件与服务管理。/);
+
+  document.querySelector('#component-search').value = 'block-mount-extra';
+  renderComponentChoices();
+  assert.equal(packageOptions().length, 1);
+  assert.match(flattenedText('#component-list'), /中文用途（家族规则生成）：提供存储挂载相关软件包家族功能。/);
+
+  document.querySelector('#component-search').value = 'luci-app-demo-001';
+  renderComponentChoices();
+  assert.equal(packageOptions().length, 1);
+  assert.match(flattenedText('#component-list'), /中文用途（分类概述，具体用途请核对上游）：用于管理或扩展 luci-app-demo-001 相关功能。/);
+  assert.match(flattenedText('#component-list'), /上游说明 \/ Upstream：上游未提供说明 \/ No upstream description/);
 
   document.querySelector('#component-source').value = 'official';
   document.querySelector('#component-search').value = 'filter-probe';
@@ -895,6 +983,42 @@ async function assertFrontendBackendHashContract(target, flavor, requestedIds, p
   assert.equal(document.querySelector('#component-target').value, 'x86_64');
   assert.equal(getCurrentPackageRecords().length, 150);
   assert.match(document.querySelector('#component-package-status').textContent, /10947|150/);
+
+  clearVerifiedPackageShardCache();
+  const purposeShaCalls = [];
+  const tamperedPurpose = new Map([[
+    packageFixtures.purposePath,
+    `${packageFixtures.rawByPath.get(packageFixtures.purposePath)} `,
+  ]]);
+  await loadCatalogWith(fixtureFetch(packageFixtures, purposeShaCalls, tamperedPurpose));
+  assert.equal(document.querySelector('#component-package-status').classList.contains('error'), true);
+  assert.match(document.querySelector('#component-package-status').textContent, /中文用途目录不可用/);
+  assert.equal(getCurrentPackageRecords().length, 0);
+  assert.equal(purposeShaCalls.includes('components/packages/x86_64-official.json'), false);
+  assert.match(loggedErrors.at(-1)[1].message, /purpose catalog sha256 mismatch/);
+
+  clearVerifiedPackageShardCache();
+  const missingPurposeFixtures = {
+    root: clone(packageFixtures.root),
+    shards: clone(packageFixtures.shards),
+    purposeCatalog: clone(packageFixtures.purposeCatalog),
+    purposePath: packageFixtures.purposePath,
+    rawByPath: new Map(packageFixtures.rawByPath),
+  };
+  const missingPurposeKey = 'official/luci-app-firewall-plus';
+  const missingPurposeQuality = missingPurposeFixtures.purposeCatalog.purposes[missingPurposeKey].quality;
+  delete missingPurposeFixtures.purposeCatalog.purposes[missingPurposeKey];
+  missingPurposeFixtures.purposeCatalog.package_count -= 1;
+  missingPurposeFixtures.purposeCatalog.quality_counts[missingPurposeQuality] -= 1;
+  const missingPurposeRaw = JSON.stringify(missingPurposeFixtures.purposeCatalog);
+  missingPurposeFixtures.rawByPath.set(missingPurposeFixtures.purposePath, missingPurposeRaw);
+  missingPurposeFixtures.root.purpose_catalog.package_count = missingPurposeFixtures.purposeCatalog.package_count;
+  missingPurposeFixtures.root.purpose_catalog.sha256 = await digestText(missingPurposeRaw);
+  await loadCatalogWith(fixtureFetch(missingPurposeFixtures, []));
+  assert.equal(document.querySelector('#component-package-status').classList.contains('error'), true);
+  assert.match(document.querySelector('#component-package-status').textContent, /官方包校验失败/);
+  assert.equal(getCurrentPackageRecords().length, 0);
+  assert.match(loggedErrors.at(-1)[1].message, /does not cover this shard/);
 
   clearVerifiedPackageShardCache();
   const mismatchCalls = [];
@@ -1086,7 +1210,7 @@ async function assertFrontendBackendHashContract(target, flavor, requestedIds, p
   assertSafeEmptyState();
   assert.equal(loggedErrors.length >= 5, true);
 
-  console.log('Pages UI policy: release rendering plus fail-closed catalog selector, dependency/conflict resolution, normalized request hashing, and authenticated Actions handoff');
+  console.log('Pages UI policy: release rendering plus fail-closed package and Chinese-purpose catalogs, Chinese search, normalized request hashing, and authenticated Actions handoff');
 })().catch((error) => {
   console.error(error);
   process.exitCode = 1;

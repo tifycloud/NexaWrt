@@ -410,6 +410,7 @@ footer p { margin: 0; text-align: center; }
 .package-option-blocked:hover { border-color: #303940; }
 .package-blocked-reason { color: #ffaaa4 !important; }
 .component-purpose { color: #d8e0e4 !important; line-height: 1.55; }
+.component-upstream-description { color: #87939b !important; font-size: .7rem; line-height: 1.5; }
 .component-package-list { color: var(--muted); overflow-wrap: anywhere; }
 .package-pagination {
   display: flex;
