@@ -115,6 +115,7 @@ raise SystemExit(99)
         *arguments: object,
         expected: int = 0,
         extra_env: dict[str, str] | None = None,
+        cwd: Path | None = None,
     ) -> subprocess.CompletedProcess[str]:
         command = [sys.executable, str(SCRIPT), "--lock", str(self.lock), *(str(item) for item in arguments)]
         environment = os.environ.copy()
@@ -126,7 +127,7 @@ raise SystemExit(99)
         )
         if extra_env:
             environment.update(extra_env)
-        result = subprocess.run(command, text=True, capture_output=True, check=False, env=environment)
+        result = subprocess.run(command, text=True, capture_output=True, check=False, env=environment, cwd=cwd)
         self.assertEqual(
             result.returncode,
             expected,
@@ -140,8 +141,10 @@ raise SystemExit(99)
         self,
         *,
         public_key: Path | None = None,
+        apk_executable: Path | None = None,
         expected: int = 0,
         extra_env: dict[str, str] | None = None,
+        cwd: Path | None = None,
     ) -> tuple[Path, Path, subprocess.CompletedProcess[str]]:
         output = self.root / "repository"
         archive = self.root / self.asset_name
@@ -158,9 +161,10 @@ raise SystemExit(99)
             "--public-key",
             public_key or self.public_key,
             "--apk-executable",
-            self.fake_apk,
+            apk_executable or self.fake_apk,
             expected=expected,
             extra_env=extra_env,
+            cwd=cwd,
         )
         return output, archive, result
 
@@ -251,6 +255,40 @@ raise SystemExit(99)
         self.stage(archive)
         staged = self.root / "site/packages" / self.directory
         self.assertTrue((staged / "packages.adb").is_file())
+
+    def test_build_accepts_relative_apk_executable_when_subprocess_changes_directory(self) -> None:
+        relative_apk = Path(os.path.relpath(self.fake_apk, Path.cwd()))
+        self.assertFalse(relative_apk.is_absolute())
+        output, archive, _ = self.build(apk_executable=relative_apk)
+        self.assertTrue((output / "packages.adb").is_file())
+        self.assertTrue(archive.is_file())
+        self.assertEqual(len(self.fake_apk_calls()), 2)
+
+    def test_build_resolves_bare_apk_executable_from_path(self) -> None:
+        bin_dir = self.root / "bin"
+        bin_dir.mkdir()
+        path_apk = bin_dir / "apk"
+        path_apk.write_bytes(self.fake_apk.read_bytes())
+        path_apk.chmod(0o755)
+        caller = self.root / "caller"
+        caller.mkdir()
+        (caller / "apk").write_text("not executable\n", encoding="ascii")
+        output, archive, _ = self.build(
+            apk_executable=Path("apk"),
+            extra_env={"PATH": f"{bin_dir}{os.pathsep}{os.environ['PATH']}"},
+            cwd=caller,
+        )
+        self.assertTrue((output / "packages.adb").is_file())
+        self.assertTrue(archive.is_file())
+        self.assertEqual(len(self.fake_apk_calls()), 2)
+
+    def test_build_rejects_non_executable_apk_path_before_staging(self) -> None:
+        non_executable = self.root / "not-executable-apk"
+        non_executable.write_text("#!/bin/sh\nexit 0\n", encoding="ascii")
+        output, archive, result = self.build(apk_executable=non_executable, expected=1)
+        self.assertIn("apk executable is not executable", result.stderr.lower())
+        self.assertFalse(output.exists())
+        self.assertFalse(archive.exists())
 
     def test_build_rejects_wrong_locked_public_key(self) -> None:
         wrong_private = self.root / "wrong-private.pem"

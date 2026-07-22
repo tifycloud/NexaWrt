@@ -374,6 +374,23 @@ def _load_locked_public_key(
     return public_key_data
 
 
+def _resolve_executable(path: Path, context: str) -> Path:
+    candidate = path
+    if not candidate.is_absolute() and len(candidate.parts) == 1:
+        located = shutil.which(str(candidate))
+        if located is None:
+            fail(f"unable to locate {context}")
+        candidate = Path(located)
+    try:
+        resolved = candidate.resolve(strict=True)
+    except OSError as error:
+        fail(f"unable to canonicalize {context}: {error}")
+    _regular_file(resolved, context)
+    if not os.access(resolved, os.X_OK):
+        fail(f"{context} is not executable")
+    return resolved
+
+
 def _verify_signed_index(
     apk_executable: Path,
     repository: Path,
@@ -425,6 +442,7 @@ def _archive_repository(source: Path, archive: Path, repository_directory: str) 
 
 def command_build(args: argparse.Namespace) -> None:
     config = repository_config(args.lock)
+    apk_executable = _resolve_executable(args.apk_executable, "apk executable")
     input_dir = _real_directory(args.input_dir, "APK input directory")
     output_dir = _safe_existing_parent(args.output_dir, "repository output directory")
     archive = _safe_existing_parent(args.archive, "repository archive")
@@ -460,7 +478,7 @@ def command_build(args: argparse.Namespace) -> None:
             digest, size = copy_regular(source, temporary / source.name, config["max_member_bytes"])
             package_records.append({"filename": source.name, "sha256": digest, "size": size})
         command = [
-            str(args.apk_executable),
+            str(apk_executable),
             "mkndx",
             "--allow-untrusted",
             "--sign",
@@ -491,7 +509,7 @@ def command_build(args: argparse.Namespace) -> None:
         index_path = temporary / "packages.adb"
         _regular_file(index_path, "packages.adb", config["max_member_bytes"])
         _verify_signed_index(
-            args.apk_executable,
+            apk_executable,
             temporary,
             public_key_data,
             args.apk_timeout,
