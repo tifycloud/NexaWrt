@@ -774,15 +774,28 @@ async function assertFrontendBackendHashContract(target, flavor, requestedIds, p
   assert.equal(document.querySelector('#custom-build-workflow-link').href, 'https://github.com/tifycloud/NexaWrt/actions/workflows/custom-build.yml');
   assert.equal(document.querySelector('#custom-build-workflow-link').hidden, false);
   assert.match(document.querySelector('#component-actions-inputs').textContent, /components=\n/);
-  assert.equal(packageOptions().length, 0);
-  assert.match(document.querySelector('#component-result-status').textContent, /输入关键词后搜索软件包/);
+  assert.equal(packageOptions().length, 100);
+  assert.match(document.querySelector('#component-result-status').textContent, /无需搜索即可浏览：共 150 个软件包，当前显示第 1–100 个/);
   assert.match(flattenedText('#component-list'), /精选套餐/);
+  assert.match(flattenedText('#component-list'), /用途 \/ Purpose：/);
+  assert.match(flattenedText('#component-list'), /第 1 \/ 2 页/);
+  const nextPage = flattenChildren(document.querySelector('#component-list'))
+    .find((item) => item.getAttribute('data-package-page-next') === 'true');
+  assert.ok(nextPage);
+  nextPage.dispatchEvent({ type: 'click' });
+  assert.equal(packageOptions().length, 50);
+  assert.match(document.querySelector('#component-result-status').textContent, /当前显示第 101–150 个/);
+  assert.match(flattenedText('#component-list'), /第 2 \/ 2 页/);
+  await changeComponentSelection('pkg-demo-100', true);
+  assert.equal(packageOptions().length, 50);
+  assert.match(document.querySelector('#component-result-status').textContent, /当前显示第 101–150 个/);
+  await changeComponentSelection('pkg-demo-100', false);
 
   document.querySelector('#component-search').value = 'demo-search';
   renderComponentChoices();
   assert.equal(packageOptions().length, 100);
-  assert.match(document.querySelector('#component-result-status').textContent, /命中 147 条，只显示前 100 条/);
-  assert.match(flattenedText('#component-list'), /只显示前 100 条/);
+  assert.match(document.querySelector('#component-result-status').textContent, /共 147 个软件包，当前显示第 1–100 个/);
+  assert.match(flattenedText('#component-list'), /第 1 \/ 2 页/);
 
   document.querySelector('#component-source').value = 'official';
   document.querySelector('#component-search').value = 'filter-probe';
@@ -825,6 +838,8 @@ async function assertFrontendBackendHashContract(target, flavor, requestedIds, p
 
   document.querySelector('#component-target').value = 'xiaomi_ax9000';
   document.querySelector('#component-target').dispatchEvent({ type: 'change' });
+  assert.equal(getCurrentPackageRecords().length, 0);
+  assert.equal(packageOptions().length, 0);
   await new Promise((resolve) => setTimeout(resolve, 30));
   assert.equal(getRequestedComponentIds().includes('pkg-firewall-plus'), false);
   assert.equal(

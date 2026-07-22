@@ -636,7 +636,7 @@ const PACKAGE_ARCHITECTURES = {
 const MAX_CATALOG_ITEMS = 256;
 const MAX_PACKAGE_SHARDS = 32;
 const MAX_PACKAGE_RECORDS = 20000;
-const MAX_PACKAGE_RESULTS = 100;
+const PACKAGE_RESULTS_PAGE_SIZE = 100;
 const CUSTOM_BUILD_FLAVORS = {
   official: { id: 'official', label: 'Official · 官方' },
   nss: { id: 'nss', label: 'NSS · 实验性' }
@@ -652,6 +652,8 @@ let resolvedComponentIds = new Set();
 let componentRequestSequence = 0;
 let packageShardRequestSequence = 0;
 let componentSearchTimer = null;
+let currentPackagePage = 0;
+let packageBrowseSignature = '';
 
 function validCatalogText(value, maxLength, allowEmpty = false) {
   return typeof value === 'string' && value === value.trim() && value.length <= maxLength &&
@@ -1053,11 +1055,27 @@ function makeBundleOption(component) {
   source.className = 'component-source-label';
   source.textContent = '精选套餐 / Curated bundle';
   const detail = document.createElement('small');
-  detail.textContent = `${component.description} · ${component.packages.join(', ')}`;
-  copy.append(name, source, detail);
+  detail.className = 'component-purpose';
+  detail.textContent = `用途 / Purpose：${component.description}`;
+  const packageList = document.createElement('small');
+  packageList.className = 'component-package-list';
+  packageList.textContent = `包含 / Includes：${component.packages.join(', ')}`;
+  copy.append(name, source, detail, packageList);
   label.append(checkbox, copy);
   checkbox.addEventListener('change', () => changeComponentSelection(component.id, checkbox.checked));
   return label;
+}
+
+function packagePurposeFallback(record) {
+  const name = record.package;
+  if (name.startsWith('luci-app-')) return `为 ${name.slice(9)} 提供 LuCI 网页管理界面。`;
+  if (name.startsWith('luci-i18n-')) return `为 ${name.slice(10)} 提供 LuCI 界面语言包。`;
+  if (name.startsWith('luci-proto-')) return `为 ${name.slice(11)} 网络协议提供 LuCI 配置支持。`;
+  if (name.startsWith('kmod-')) return `提供 ${name.slice(5)} 相关的 Linux 内核模块。`;
+  if (name.startsWith('python3-')) return `提供 ${name.slice(8)} 的 Python 3 模块或工具。`;
+  if (name.startsWith('perl-')) return `提供 ${name.slice(5)} 的 Perl 模块或工具。`;
+  const category = record.category || record.feed || 'OpenWrt';
+  return `${category} 分类的软件包；上游目录暂未提供更详细说明。`;
 }
 
 function makePackageOption(record) {
@@ -1080,7 +1098,8 @@ function makePackageOption(record) {
   meta.className = 'package-meta';
   meta.textContent = `${record.version} · ${record.arch} · ${record.feed} · ${record.source === 'kiddin9' ? '社区候选 / kiddin9（未审核）' : '官方'} · ${formatInstalledSize(record.installed_size)}`;
   const detail = document.createElement('small');
-  detail.textContent = record.description || '暂无说明 / No description';
+  detail.className = 'component-purpose';
+  detail.textContent = `用途 / Purpose：${record.description || packagePurposeFallback(record)}`;
   copy.append(titleRow, meta, detail);
   if (!record.selectable) {
     const blocked = document.createElement('small');
@@ -1134,12 +1153,17 @@ function renderComponentChoices() {
     list.replaceChildren();
     return;
   }
-  const { targetId } = selectedTargetAndFlavor();
+  const { targetId, flavorId } = selectedTargetAndFlavor();
   const query = document.querySelector('#component-search').value.trim().toLocaleLowerCase('zh-CN');
   const categoryFilter = document.querySelector('#component-category').value;
   const sourceFilter = document.querySelector('#component-source').value;
   const riskFilter = document.querySelector('#component-risk').value;
   const feedFilter = document.querySelector('#component-feed').value;
+  const browseSignature = [targetId, flavorId, query, categoryFilter, sourceFilter, riskFilter, feedFilter].join('\u0000');
+  if (browseSignature !== packageBrowseSignature) {
+    packageBrowseSignature = browseSignature;
+    currentPackagePage = 0;
+  }
   const fragment = document.createDocumentFragment();
   let bundleCount = 0;
 
@@ -1172,15 +1196,17 @@ function renderComponentChoices() {
 
   const packageMatches = [];
   let packageMatchCount = 0;
-  if (query && sourceFilter !== 'bundles' && currentPackageShard) {
+  const packagePageStart = currentPackagePage * PACKAGE_RESULTS_PAGE_SIZE;
+  if (sourceFilter !== 'bundles' && currentPackageShard) {
     for (const record of currentPackageShard.packages) {
       if ((!categoryFilter || record.category === categoryFilter) &&
           (!riskFilter || record.risk === riskFilter) &&
           (!feedFilter || record.feed === feedFilter) &&
           (sourceFilter === 'all' || sourceFilter === record.source) &&
-          currentPackageSearchTerms.get(record.id)?.includes(query)) {
+          (!query || currentPackageSearchTerms.get(record.id)?.includes(query))) {
+        const matchIndex = packageMatchCount;
         packageMatchCount += 1;
-        if (packageMatches.length < MAX_PACKAGE_RESULTS) packageMatches.push(record);
+        if (matchIndex >= packagePageStart && packageMatches.length < PACKAGE_RESULTS_PAGE_SIZE) packageMatches.push(record);
       }
     }
     if (packageMatchCount) {
@@ -1190,24 +1216,50 @@ function renderComponentChoices() {
       heading.textContent = sourceFilter === 'kiddin9' ? '社区候选库 / kiddin9（未审核）' : sourceFilter === 'official' ? 'Official packages · 官方包' : '软件包 / Packages';
       const description = document.createElement('p');
       description.className = 'component-category-description';
-      description.textContent = packageMatchCount > MAX_PACKAGE_RESULTS
-        ? `命中 ${packageMatchCount} 条，只显示前 ${MAX_PACKAGE_RESULTS} 条。 / ${packageMatchCount} matches; showing first ${MAX_PACKAGE_RESULTS}.`
-        : `命中 ${packageMatchCount} 条软件包。 / ${packageMatchCount} package matches.`;
+      const pageEnd = packagePageStart + packageMatches.length;
+      description.textContent = `共 ${packageMatchCount} 个软件包，当前显示第 ${packagePageStart + 1}–${pageEnd} 个；每个条目均包含用途说明。 / Showing ${packagePageStart + 1}–${pageEnd} of ${packageMatchCount}.`;
       group.append(heading, description);
       for (const record of packageMatches) group.append(makePackageOption(record));
+      if (packageMatchCount > PACKAGE_RESULTS_PAGE_SIZE) {
+        const controls = document.createElement('div');
+        controls.className = 'package-pagination';
+        const previous = document.createElement('button');
+        previous.type = 'button';
+        previous.disabled = currentPackagePage === 0;
+        previous.setAttribute('data-package-page-previous', 'true');
+        previous.textContent = '上一页 / Previous';
+        previous.addEventListener('click', () => {
+          if (currentPackagePage === 0) return;
+          currentPackagePage -= 1;
+          renderComponentChoices();
+          list.scrollTop = 0;
+        });
+        const progress = document.createElement('span');
+        const pageCount = Math.ceil(packageMatchCount / PACKAGE_RESULTS_PAGE_SIZE);
+        progress.textContent = `第 ${currentPackagePage + 1} / ${pageCount} 页`;
+        const next = document.createElement('button');
+        next.type = 'button';
+        next.disabled = pageEnd >= packageMatchCount;
+        next.setAttribute('data-package-page-next', 'true');
+        next.textContent = '下一页 / Next';
+        next.addEventListener('click', () => {
+          if (pageEnd >= packageMatchCount) return;
+          currentPackagePage += 1;
+          renderComponentChoices();
+          list.scrollTop = 0;
+        });
+        controls.append(previous, progress, next);
+        group.append(controls);
+      }
       fragment.append(group);
     }
   }
 
   const resultStatus = document.querySelector('#component-result-status');
-  if (!query && sourceFilter !== 'bundles') {
+  if (sourceFilter !== 'bundles') {
     resultStatus.textContent = currentPackageShard
-      ? '输入关键词后搜索软件包；为避免浏览器卡顿，不会一次渲染完整目录。 / Search to browse packages.'
+      ? `无需搜索即可浏览：共 ${packageMatchCount} 个软件包，当前显示第 ${packageMatchCount ? packagePageStart + 1 : 0}–${packagePageStart + packageMatches.length} 个；可分页浏览全部。 / Search is optional.`
       : '官方包目录当前不可用；精选套餐仍可使用。 / Official packages unavailable; curated bundles remain available.';
-  } else if (query && sourceFilter !== 'bundles') {
-    resultStatus.textContent = currentPackageShard
-      ? `软件包命中 ${packageMatchCount} 条${packageMatchCount > MAX_PACKAGE_RESULTS ? `，只显示前 ${MAX_PACKAGE_RESULTS} 条` : ''}。`
-      : '官方包目录当前不可用；仅搜索精选套餐。';
   } else {
     resultStatus.textContent = `显示 ${bundleCount} 个精选套餐。 / Showing ${bundleCount} curated bundles.`;
   }
@@ -1215,9 +1267,7 @@ function renderComponentChoices() {
   if (!fragment.children.length) {
     const empty = document.createElement('p');
     empty.className = 'empty-state';
-    empty.textContent = !query && ['official', 'kiddin9'].includes(sourceFilter)
-      ? '输入关键词搜索软件包；完整目录不会一次性渲染。 / Enter a search term for packages.'
-      : '没有匹配当前筛选条件的组件。 / No matching components.';
+    empty.textContent = '没有匹配当前筛选条件的组件。 / No matching components.';
     fragment.append(empty);
   }
   list.replaceChildren(fragment);
@@ -1404,6 +1454,8 @@ function setupComponentBuilder(catalog) {
   currentPackageShard = null;
   currentPackageMap = new Map();
   currentPackageSearchTerms = new Map();
+  currentPackagePage = 0;
+  packageBrowseSignature = '';
   requestedComponentIds.clear();
   resolvedComponentIds.clear();
   const targetSelect = document.querySelector('#component-target');
@@ -1439,11 +1491,13 @@ function setupComponentBuilder(catalog) {
     packageShardRequestSequence += 1;
     const available = flavorsForTarget(targetSelect.value);
     populateSelect(flavorSelect, available, available[0].id);
+    clearOfficialPackageSelections();
     await resetComponentsForTarget();
     return loadPackageShardForSelection();
   }
   async function updateFlavorSelection() {
     packageShardRequestSequence += 1;
+    clearOfficialPackageSelections();
     await resetComponentsForTarget();
     return loadPackageShardForSelection();
   }
