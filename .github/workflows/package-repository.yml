@@ -127,6 +127,12 @@ jobs:
         run: |
           set -euo pipefail
           public_key="$GITHUB_WORKSPACE/manifests/package-repository-public.pem"
+          # A package-only target does not imply OpenWrt's host tools or target
+          # toolchain. Build both explicitly without preparing target/linux;
+          # archive extraction depends on staging_dir/host/bin/libdeflate-gzip.
+          make -C "$WORK_DIR" -j"$(nproc)" V=s tools/install
+          test -x "$WORK_DIR/staging_dir/host/bin/libdeflate-gzip"
+          make -C "$WORK_DIR" -j"$(nproc)" V=s toolchain/install
           make -C "$WORK_DIR" -j"$(nproc)" V=s \
             NEXAWRT_APK_PUBLIC_ONLY=1 \
             BUILD_KEY_APK_PUB="$public_key" \
