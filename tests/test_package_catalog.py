@@ -18,6 +18,7 @@ ROOT = Path(__file__).resolve().parent.parent
 RESOLVER_PATH = ROOT / "scripts" / "resolve-components.py"
 GENERATOR_PATH = ROOT / "scripts" / "generate-package-catalog.py"
 POLICY_PATH = ROOT / "scripts" / "component_package_policy.py"
+PURPOSE_PATH = ROOT / "scripts" / "package_purpose_zh.py"
 
 
 def load_module(name: str, path: Path):
@@ -32,11 +33,12 @@ def load_module(name: str, path: Path):
 resolver = load_module("package_catalog_resolver", RESOLVER_PATH)
 generator = load_module("package_catalog_generator", GENERATOR_PATH)
 policy = load_module("component_package_policy_test", POLICY_PATH)
+purpose = load_module("package_purpose_zh_test", PURPOSE_PATH)
 catalog = resolver.load_catalog()
 index = resolver.load_package_catalog_index(catalog)
 
-assert set(index) == {"schema_version", "catalog_version", "openwrt_version", "shards"}
-assert index["schema_version"] == 2
+assert set(index) == {"schema_version", "catalog_version", "openwrt_version", "purpose_catalog", "shards"}
+assert index["schema_version"] == 3
 assert index["catalog_version"] == "2026.07.21.1"
 assert index["openwrt_version"] == "25.12.5"
 assert [(item["target"], item["flavor"]) for item in index["shards"]] == [
@@ -50,7 +52,8 @@ assert [item["path"] for item in index["shards"]] == [
     "components/packages/xiaomi_ax9000-nss.json",
 ]
 
-ROOT_KEYS = {"schema_version", "catalog_version", "openwrt_version", "shards"}
+ROOT_KEYS = {"schema_version", "catalog_version", "openwrt_version", "purpose_catalog", "shards"}
+PURPOSE_DESCRIPTOR_KEYS = {"locale", "path", "sha256", "package_count"}
 DESCRIPTOR_KEYS = {
     "target", "flavor", "path", "sha256", "package_count", "selectable_count", "sources"
 }
@@ -67,8 +70,19 @@ RECORD_KEYS = {
 TOKEN_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")
 SHA_RE = re.compile(r"^[0-9a-f]{64}$")
 assert set(json.loads((ROOT / "components/package-catalog.json").read_text())) == ROOT_KEYS
+purpose_descriptor = index["purpose_catalog"]
+assert set(purpose_descriptor) == PURPOSE_DESCRIPTOR_KEYS
+assert purpose_descriptor["locale"] == "zh-CN"
+assert purpose_descriptor["path"] == "components/package-purpose-zh.json"
+assert SHA_RE.fullmatch(purpose_descriptor["sha256"])
+purpose_path = ROOT / purpose_descriptor["path"]
+purpose_raw = purpose_path.read_bytes()
+assert hashlib.sha256(purpose_raw).hexdigest() == purpose_descriptor["sha256"]
+purpose_payload = json.loads(purpose_raw)
+assert purpose_raw == purpose.canonical_json(purpose_payload)
 
 shards = {}
+all_purpose_keys = set()
 for descriptor in index["shards"]:
     assert set(descriptor) == DESCRIPTOR_KEYS
     assert SHA_RE.fullmatch(descriptor["sha256"])
@@ -151,7 +165,15 @@ for descriptor in index["shards"]:
         if record["package"].startswith("kmod-"):
             assert descriptor["flavor"] == "official"
             assert record["risk"] == "advanced"
+        all_purpose_keys.add(f"{record['source']}/{record['package']}")
     shards[(descriptor["target"], descriptor["flavor"])] = shard
+
+purpose.validate_purpose_catalog(
+    purpose_payload, index["catalog_version"], expected_keys=all_purpose_keys
+)
+assert purpose_payload["package_count"] == purpose_descriptor["package_count"]
+assert purpose_payload["package_count"] == len(all_purpose_keys)
+assert sum(purpose_payload["quality_counts"].values()) == len(all_purpose_keys)
 
 x86 = shards[("x86_64", "official")]
 ax_official = shards[("xiaomi_ax9000", "official")]
@@ -496,7 +518,7 @@ with tempfile.TemporaryDirectory() as temporary:
     victim = root / "victim.json"
     victim.write_text("do-not-overwrite", encoding="utf-8")
     (root / "components/package-catalog.json").symlink_to(victim)
-    expect_generation_rejected(lambda: generator._write_catalog(root, []), "target symlink")
+    expect_generation_rejected(lambda: generator._write_catalog(root, [], {"locale": "zh-CN", "path": "components/package-purpose-zh.json", "sha256": "0" * 64, "package_count": 1}), "target symlink")
     assert victim.read_text(encoding="utf-8") == "do-not-overwrite"
 
 with tempfile.TemporaryDirectory() as temporary:
@@ -505,7 +527,7 @@ with tempfile.TemporaryDirectory() as temporary:
     victim = root / "victim.json"
     victim.write_text("do-not-replace", encoding="utf-8")
     os.link(victim, root / "components/package-catalog.json")
-    expect_generation_rejected(lambda: generator._write_catalog(root, []), "target hard link")
+    expect_generation_rejected(lambda: generator._write_catalog(root, [], {"locale": "zh-CN", "path": "components/package-purpose-zh.json", "sha256": "0" * 64, "package_count": 1}), "target hard link")
     assert victim.read_text(encoding="utf-8") == "do-not-replace"
 
 with tempfile.TemporaryDirectory() as temporary:
@@ -524,7 +546,7 @@ with tempfile.TemporaryDirectory() as temporary:
 with tempfile.TemporaryDirectory() as temporary:
     root = Path(temporary)
     (root / "components/package-catalog.json").mkdir(parents=True)
-    expect_generation_rejected(lambda: generator._write_catalog(root, []), "directory target")
+    expect_generation_rejected(lambda: generator._write_catalog(root, [], {"locale": "zh-CN", "path": "components/package-purpose-zh.json", "sha256": "0" * 64, "package_count": 1}), "directory target")
 
 # Archive member validation permits only directories and ordinary files.
 assert generator._validate_archive_members(

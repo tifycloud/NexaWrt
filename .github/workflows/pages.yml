@@ -13,11 +13,13 @@ on:
       - 'tests/test_package_repository.py'
       - 'tests/test_pages_ui.js'
       - 'tests/test_package_catalog.py'
+      - 'tests/test_package_purpose_zh.py'
       - 'tests/test_pages_policy.sh'
       - 'tests/test_component_catalog_staging.py'
       - 'devices/**'
       - 'scripts/device_metadata.py'
       - 'scripts/generate-package-catalog.py'
+      - 'scripts/package_purpose_zh.py'
       - 'scripts/generate-pages-data.py'
       - 'scripts/component_package_policy.py'
       - 'scripts/resolve-components.py'
@@ -164,6 +166,7 @@ jobs:
           set -euo pipefail
           node tests/test_pages_ui.js
           python3 tests/test_package_catalog.py
+          python3 tests/test_package_purpose_zh.py
           python3 tests/test_component_catalog_staging.py
           bash tests/test_pages_policy.sh
       - name: Configure GitHub Pages

@@ -18,6 +18,7 @@ from typing import Any, Callable
 ROOT = Path(__file__).resolve().parent.parent
 VALIDATOR = ROOT / "scripts" / "validate-component-catalogs.py"
 SOURCE_COMPONENTS = ROOT / "components"
+PURPOSE_MODULE = ROOT / "scripts" / "package_purpose_zh.py"
 
 
 def canonical(value: Any) -> bytes:
@@ -47,8 +48,14 @@ class ComponentCatalogStagingTests(unittest.TestCase):
         resolver = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(resolver)
         requires_arch = "arch" in resolver.PACKAGE_RECORD_KEYS
+        purpose_spec = importlib.util.spec_from_file_location("staging_test_purpose", PURPOSE_MODULE)
+        if purpose_spec is None or purpose_spec.loader is None:
+            raise RuntimeError("unable to load purpose catalog contract for staging tests")
+        purpose = importlib.util.module_from_spec(purpose_spec)
+        purpose_spec.loader.exec_module(purpose)
 
         index = load_json(SOURCE_COMPONENTS / "package-catalog.json")
+        purpose_records: dict[str, list[dict[str, Any]]] = {}
         for descriptor in index["shards"]:
             source = ROOT / descriptor["path"]
             shard = load_json(source)
@@ -88,6 +95,16 @@ class ComponentCatalogStagingTests(unittest.TestCase):
             descriptor["sha256"] = hashlib.sha256(raw).hexdigest()
             descriptor["package_count"] = len(selected_records)
             descriptor["selectable_count"] = sum(int(record["selectable"]) for record in selected_records)
+            purpose_records[f"{descriptor['target']}/{descriptor['flavor']}"] = selected_records
+        purpose_payload = purpose.build_purpose_catalog(purpose_records, index["catalog_version"])
+        purpose_raw = purpose.canonical_json(purpose_payload)
+        (cls.baseline_components / "package-purpose-zh.json").write_bytes(purpose_raw)
+        index["purpose_catalog"] = {
+            "locale": "zh-CN",
+            "path": "components/package-purpose-zh.json",
+            "sha256": hashlib.sha256(purpose_raw).hexdigest(),
+            "package_count": purpose_payload["package_count"],
+        }
         (cls.baseline_components / "package-catalog.json").write_bytes(canonical(index))
 
     @classmethod
@@ -181,6 +198,10 @@ class ComponentCatalogStagingTests(unittest.TestCase):
                 (staged / "package-catalog.json").read_bytes(),
                 (components / "package-catalog.json").read_bytes(),
             )
+            self.assertEqual(
+                (staged / "package-purpose-zh.json").read_bytes(),
+                (components / "package-purpose-zh.json").read_bytes(),
+            )
         finally:
             temporary.cleanup()
 
@@ -197,7 +218,7 @@ class ComponentCatalogStagingTests(unittest.TestCase):
         def mutation(components: Path) -> None:
             path = components / "package-catalog.json"
             raw = path.read_text(encoding="utf-8")
-            needle = '"schema_version":2'
+            needle = '"schema_version":3'
             self.assertIn(needle, raw)
             path.write_text(raw.replace(needle, f"{needle},{needle}", 1), encoding="utf-8")
 
@@ -348,6 +369,55 @@ class ComponentCatalogStagingTests(unittest.TestCase):
                 components, ("x86_64", "official"), reclassify
             ),
         )
+
+    def test_rejects_missing_purpose_catalog(self) -> None:
+        self.assert_rejected(
+            "missing purpose catalog",
+            lambda components: (components / "package-purpose-zh.json").unlink(),
+        )
+
+    def test_rejects_purpose_catalog_sha_mismatch(self) -> None:
+        def mutation(components: Path) -> None:
+            with (components / "package-purpose-zh.json").open("ab") as handle:
+                handle.write(b" ")
+
+        self.assert_rejected("purpose catalog SHA mismatch", mutation)
+
+    def test_rejects_missing_purpose_entry_even_with_updated_sha(self) -> None:
+        def mutation(components: Path) -> None:
+            purpose_path = components / "package-purpose-zh.json"
+            payload = load_json(purpose_path)
+            payload["purposes"].pop(next(iter(payload["purposes"])))
+            payload["package_count"] -= 1
+            quality = next(name for name, count in payload["quality_counts"].items() if count)
+            payload["quality_counts"][quality] -= 1
+            raw = canonical(payload)
+            purpose_path.write_bytes(raw)
+            index_path = components / "package-catalog.json"
+            index = load_json(index_path)
+            index["purpose_catalog"]["sha256"] = hashlib.sha256(raw).hexdigest()
+            index["purpose_catalog"]["package_count"] = payload["package_count"]
+            index_path.write_bytes(canonical(index))
+
+        self.assert_rejected("missing purpose entry", mutation)
+
+    def test_rejects_symlinked_purpose_catalog(self) -> None:
+        def mutation(components: Path) -> None:
+            source = components / "package-purpose-zh.json"
+            victim = components.parent / "purpose-victim.json"
+            source.replace(victim)
+            source.symlink_to(victim)
+
+        self.assert_rejected("symlinked purpose catalog", mutation)
+
+    def test_rejects_hardlinked_purpose_catalog(self) -> None:
+        def mutation(components: Path) -> None:
+            source = components / "package-purpose-zh.json"
+            victim = components.parent / "purpose-hardlink-victim.json"
+            source.replace(victim)
+            os.link(victim, source)
+
+        self.assert_rejected("hardlinked purpose catalog", mutation)
 
     def test_rejects_hardlinked_source_shard(self) -> None:
         def mutation(components: Path) -> None:
