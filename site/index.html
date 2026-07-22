@@ -204,7 +204,7 @@
           </div>
           <div class="field-grid">
             <label>搜索 / Search
-              <input id="component-search" type="search" maxlength="80" autocomplete="off" placeholder="套餐、包名、说明、版本">
+              <input id="component-search" type="search" maxlength="80" autocomplete="off" placeholder="可选：套餐、包名、用途、版本">
             </label>
             <label>来源 / Source
               <select id="component-source" disabled></select>
@@ -223,7 +223,7 @@
           </div>
           <p id="component-package-status" class="component-message package-catalog-status" role="status">正在读取软件包索引… / Loading package index…</p>
           <p class="component-message">社区候选库使用锁定但未签名的 Packages.gz 元数据，仅用于展示 provenance；候选包全部不可选，生产构建不会克隆或执行该 feed，也不会下载或安装 dl.openwrt.ai 的 IPK。</p>
-          <p id="component-result-status" class="component-result-status" aria-live="polite">输入关键词后搜索软件包；精选套餐会直接显示。</p>
+          <p id="component-result-status" class="component-result-status" aria-live="polite">全部软件包会直接分页显示，并标注用途；搜索仅用于快速筛选。</p>
           <p id="component-error" class="component-message" role="alert" hidden></p>
           <div class="selected-packages-panel" aria-labelledby="selected-packages-title">
             <div class="selected-packages-heading">

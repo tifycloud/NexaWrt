@@ -409,6 +409,29 @@ footer p { margin: 0; text-align: center; }
 .package-option-blocked { opacity: .72; cursor: not-allowed; }
 .package-option-blocked:hover { border-color: #303940; }
 .package-blocked-reason { color: #ffaaa4 !important; }
+.component-purpose { color: #d8e0e4 !important; line-height: 1.55; }
+.component-package-list { color: var(--muted); overflow-wrap: anywhere; }
+.package-pagination {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  align-items: center;
+  padding: 14px;
+  border: 1px solid var(--line);
+  background: #090c0e;
+  color: var(--muted);
+  font-size: .72rem;
+}
+.package-pagination button {
+  padding: 8px 12px;
+  border: 1px solid rgba(201, 255, 61, .5);
+  color: var(--accent);
+  background: transparent;
+  cursor: pointer;
+  font: inherit;
+}
+.package-pagination button:hover:not(:disabled) { background: rgba(201, 255, 61, .08); }
+.package-pagination button:disabled { opacity: .45; cursor: not-allowed; }
 .component-result-status { margin: 12px 0 0; color: var(--muted); font-size: .74rem; }
 .package-catalog-status { margin-top: 16px; }
 .selected-packages-panel {
@@ -482,6 +505,7 @@ footer p { margin: 0; text-align: center; }
   .component-option { padding: 11px; }
   .package-filter-grid { grid-template-columns: 1fr; }
   .selected-packages-heading { display: grid; }
+  .package-pagination { align-items: stretch; flex-direction: column; }
 }
 
 /* Prevent long package lists and request hashes from widening mobile layouts. */
