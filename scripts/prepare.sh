@@ -54,6 +54,14 @@ case "$NEXAWRT_FLAVOR" in
     ;;
 esac
 WORK_DIR="${WORK_DIR:-$DEFAULT_WORK_DIR}"
+# Keep the source checkout path stable after this script changes directory into
+# it. Relative WORK_DIR values are common in GitHub Actions; without converting
+# them once at entry, later `git -C "$WORK_DIR"` checks would resolve the path a
+# second time from inside the checkout and reject the otherwise canonical
+# origin.
+if [[ "$WORK_DIR" != /* ]]; then
+  WORK_DIR="$(pwd -P)/$WORK_DIR"
+fi
 
 usage() {
   cat <<USAGE

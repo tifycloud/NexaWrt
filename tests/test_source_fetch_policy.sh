@@ -173,6 +173,24 @@ run_prepare "$REUSE_WORK" "$REUSE_FETCH_LOG" 1 >/dev/null
 cmp -s -- "$REUSE_WORK/version" <(printf 'r0-%s\n' "${SOURCE_COMMIT:0:8}")
 echo 'complete canonical source offline reuse replaces ignored stale revision: OK'
 
+# GitHub Actions commonly supplies a repository-relative WORK_DIR. The prepare
+# script changes into that checkout, so it must canonicalize the path before
+# later git -C checks rather than resolving the same relative path twice.
+RELATIVE_PARENT="$TMP_DIR/relative-parent"
+RELATIVE_WORK="$RELATIVE_PARENT/.work/relative-work"
+RELATIVE_FETCH_LOG="$TMP_DIR/relative-fetch.log"
+mkdir -p "$RELATIVE_PARENT"
+(
+  cd "$RELATIVE_PARENT"
+  run_prepare '.work/relative-work' "$RELATIVE_FETCH_LOG" 0 >/dev/null
+)
+[[ "$("$REAL_GIT" -C "$RELATIVE_WORK" rev-parse HEAD)" == "$SOURCE_COMMIT" ]]
+[[ "$("$REAL_GIT" -C "$RELATIVE_WORK" config --get-all remote.origin.url)" == "$FIXTURE_REPO" ]]
+! "$REAL_GIT" -C "$RELATIVE_WORK" config --get-all remote.origin.pushurl >/dev/null 2>&1
+[[ "$(cat "$RELATIVE_WORK/tracked.txt")" == prepared ]]
+cmp -s -- "$RELATIVE_WORK/version" <(printf 'r0-%s\n' "${SOURCE_COMMIT:0:8}")
+echo 'repository-relative source work directory remains canonical after chdir: OK'
+
 
 assert_source_history_override_rejected() {
   local description="$1"
